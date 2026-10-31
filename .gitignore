@@ -1,0 +1,29 @@
+# Build output
+/.build/
+/build/
+/dist/
+/.swiftpm/
+/scripts/node_modules/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+*.xcarchive
+
+# Release signing material
+*.p12
+*.pfx
+*.key
+*.keychain-db
+*.pem
+sparkle_private_key*
+.env*
+
+# Local builds and logs
+*.log
+/coverage/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

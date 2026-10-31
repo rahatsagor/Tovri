@@ -1,0 +1,23 @@
+Installing Tovri
+================
+
+1. Drag Tovri into the Applications folder.
+
+2. Tovri is free and open source, and it is not signed with a paid Apple
+   Developer ID, so macOS blocks it the first time. Open Terminal and run:
+
+       xattr -dr com.apple.quarantine /Applications/Tovri.app
+
+   Or open Tovri once, then go to System Settings → Privacy & Security and
+   click "Open Anyway" next to the message about Tovri.
+
+3. Open Tovri. To open files from Terminal, choose
+   Tovri → Install "tovri" Command… in the menu bar.
+
+Updates install from inside the app, so you only do this once.
+
+Homebrew users can instead run:
+
+    brew install --cask rahatsagor/tap/tovri
+
+Source code, help and release notes: https://github.com/rahatsagor/Tovri

@@ -1,0 +1,15 @@
+{
+  "name": "tovri-release-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint release-notes.ts tests",
+    "typecheck": "tsc -p .",
+    "test": "bun test ./tests"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "oxlint": "^1.90.0",
+    "typescript": "^7.0.2"
+  }
+}

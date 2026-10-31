@@ -1,0 +1,20 @@
+{
+  // The release scripts run on Bun. `bun install` in scripts/ fetches the
+  // TypeScript and Bun types they are checked with.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "typeRoots": ["./node_modules/@types"],
+    "types": ["bun"]
+  },
+  "include": ["*.ts", "tests/*.ts"]
+}

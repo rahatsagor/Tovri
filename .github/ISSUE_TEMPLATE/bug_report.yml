@@ -1,0 +1,51 @@
+name: Something isn't working
+description: Report a bug in Tovri.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tovri version
+      description: Tovri → About Tovri.
+      placeholder: "0.1.0 (100)"
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS version
+      placeholder: MacBook Air M2, macOS 26.1
+    validations:
+      required: true
+  - type: textarea
+    id: file
+    attributes:
+      label: The file or folder
+      description: >
+        The language or file type, roughly how large the file is, and whether the
+        folder is a Git repository. If you can, attach a small file that shows the
+        problem. Leave out anything private.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a 50 MB log file
+        2. Press ⌘F and search for "error"
+        3. ...
+  - type: textarea
+    id: details
+    attributes:
+      label: Anything else
+      description: >
+        Settings you changed, the theme, or a crash report from Console.app
+        (Crash Reports → Tovri). For slow typing or scrolling, the timings from
+        `open --env TOVRI_PERF=1 --stderr /tmp/tovri.log -a Tovri` help a lot.
+      render: text

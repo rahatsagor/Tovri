@@ -1,0 +1,127 @@
+#!/bin/bash
+# Tovri command line launcher.
+usage() {
+    cat <<'USAGE'
+Usage: tovri [options] [path[:line[:column]] ...]
+
+Open files and folders in Tovri. Paths that don't exist open as new, unsaved files.
+
+Options:
+  -n, --new-window   Open in a new window
+  -w, --wait         Wait until the opened files are closed (e.g. git config core.editor "tovri -w")
+  -                  Read text from standard input into a new tab (also used when input is piped)
+  -h, --help         Show this help
+
+Examples:
+  tovri .                     open the current folder
+  tovri src/main.go:42        open a file at line 42
+  git diff | tovri            view piped text
+USAGE
+}
+
+hex() { printf '%s' "$1" | xxd -p | tr -d '\n'; }
+
+NEW=0
+WAIT=0
+STDIN=0
+PATHS=()
+for arg in "$@"; do
+    case "$arg" in
+        -n|--new-window) NEW=1 ;;
+        -w|--wait) WAIT=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -) STDIN=1 ;;
+        -*) echo "tovri: unknown option $arg" >&2; usage >&2; exit 2 ;;
+        *) PATHS+=("$arg") ;;
+    esac
+done
+if [ ${#PATHS[@]} -eq 0 ] && [ $STDIN -eq 0 ] && { [ -p /dev/stdin ] || [ -f /dev/stdin ]; }; then STDIN=1; fi
+
+BUNDLE="app.tovri.Tovri"
+is_tovri() { [ -d "$1" ] && [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null)" = "$BUNDLE" ]; }
+# Send to the Tovri this user is already running; otherwise to the app this launcher lives in.
+APP=""
+PID=$(pgrep -x -U "$(id -u)" Tovri 2>/dev/null | head -1)
+if [ -n "$PID" ]; then
+    COMM=$(ps -o comm= -p "$PID" 2>/dev/null)
+    case "$COMM" in */Contents/MacOS/Tovri) APP="${COMM%/Contents/MacOS/Tovri}" ;; esac
+    is_tovri "$APP" || APP=""
+fi
+if [ -z "$APP" ]; then
+    SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    case "$SELF" in */Contents/Resources/tovri) APP="${SELF%/Contents/Resources/tovri}" ;; esac
+    is_tovri "$APP" || APP=""
+fi
+launch() { if [ -n "$APP" ]; then open -a "$APP" "$@"; else open -b "$BUNDLE" "$@"; fi; }
+WAITDIR="$HOME/Library/Application Support/Tovri/Wait"
+URLS=()
+MARKERS=()
+
+add_wait() {
+    if [ $WAIT -eq 1 ]; then
+        mkdir -p "$WAITDIR"
+        local id
+        id=$(uuidgen)
+        : > "$WAITDIR/$id"
+        MARKERS+=("$WAITDIR/$id")
+        QUERY+="&wait=$id"
+    fi
+}
+
+# Tovri only acts on requests stored in files this user created, so web pages can't drive it.
+add_request() {
+    local req
+    req=$(mktemp -t tovri-req)
+    printf '%s' "$QUERY" > "$req"
+    URLS+=("tovri://open?req=$(hex "$req")")
+}
+
+if [ $STDIN -eq 1 ]; then
+    TMP=$(mktemp -t tovri-stdin)
+    cat > "$TMP"
+    QUERY="stdin=$(hex "$TMP")"
+    [ $NEW -eq 1 ] && QUERY+="&new=1" && NEW=0
+    add_wait
+    add_request
+fi
+
+for p in "${PATHS[@]}"; do
+    line=""
+    col=""
+    if [ ! -e "$p" ]; then
+        if [[ "$p" =~ ^(.+):([0-9]+):([0-9]+)$ ]] && [ -e "${BASH_REMATCH[1]}" ]; then
+            p="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"; col="${BASH_REMATCH[3]}"
+        elif [[ "$p" =~ ^(.+):([0-9]+)$ ]]; then
+            p="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
+        fi
+    fi
+    [[ "$p" == /* ]] || p="$PWD/$p"
+    QUERY="path=$(hex "$p")"
+    [ -n "$line" ] && QUERY+="&line=$line"
+    [ -n "$col" ] && QUERY+="&col=$col"
+    [ $NEW -eq 1 ] && QUERY+="&new=1" && NEW=0
+    add_wait
+    add_request
+done
+
+if [ ${#URLS[@]} -eq 0 ]; then
+    if [ $NEW -eq 1 ]; then QUERY="new=1"; add_request; launch "${URLS[@]}"; exit $?; fi
+    launch; exit $?
+fi
+
+launch "${URLS[@]}" || exit $?
+
+if [ $WAIT -eq 1 ]; then
+    ticks=0
+    for m in "${MARKERS[@]}"; do
+        while [ -e "$m" ]; do
+            sleep 0.2
+            ticks=$((ticks + 1))
+            # Give Tovri time to launch, then stop waiting if it quit or crashed.
+            if [ $ticks -gt 50 ] && [ $((ticks % 10)) -eq 0 ] && ! pgrep -x -U "$(id -u)" Tovri >/dev/null; then
+                rm -f "${MARKERS[@]}"
+                exit 0
+            fi
+        done
+    done
+fi

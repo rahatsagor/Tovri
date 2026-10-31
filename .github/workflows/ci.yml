@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Every commit on main keeps its result; superseded pull request runs are cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  app:
+    name: Mac app
+    # GitHub currently provides the stable Xcode 27 compiler on this preview image.
+    runs-on: xcode-27
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: latest-stable
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Install build tools
+        run: |
+          brew update
+          brew install actionlint
+          brew upgrade actionlint
+      - name: Check release tooling and workflows
+        run: |
+          actionlint
+          cd scripts
+          bun install --frozen-lockfile
+          bun run lint
+          bun run typecheck
+          bun run test
+      - name: Test
+        run: |
+          mkdir -p build
+          swift test 2>&1 | tee build/swift-test.log
+      - name: Build release app
+        run: scripts/build.sh
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mac-app-diagnostics
+          path: build/*.log
+          retention-days: 7
+          if-no-files-found: ignore

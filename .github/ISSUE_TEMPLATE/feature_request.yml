@@ -1,0 +1,20 @@
+name: Idea or request
+description: Suggest something Tovri should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the situation, not only the feature. It helps find the best way to solve it.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: How do other editors handle it?
+      description: Optional. If another editor does this well, say which one and how.
