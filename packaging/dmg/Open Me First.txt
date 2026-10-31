@@ -20,4 +20,5 @@ Homebrew users can instead run:
 
     brew install --cask rahatsagor/tap/tovri
 
+Website: https://tovri.rsapplication.com
 Source code, help and release notes: https://github.com/rahatsagor/Tovri

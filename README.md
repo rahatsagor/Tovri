@@ -15,12 +15,15 @@ agent just changed.<br />
 
 <a href="https://github.com/rahatsagor/Tovri/releases/latest/download/Tovri.dmg"><img src="https://img.shields.io/badge/Download_for_Mac-242424?style=for-the-badge&logo=apple&logoColor=white" alt="Download for Mac" height="36" /></a>
 
+<sub>Or try a live Tovri window at <a href="https://tovri.rsapplication.com"><strong>tovri.rsapplication.com</strong></a></sub>
+
 <br />
 
 [![Latest release](https://img.shields.io/github/v/release/rahatsagor/Tovri?style=flat-square&label=release&color=242424)](https://github.com/rahatsagor/Tovri/releases/latest)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-1f1f1f?style=flat-square&logo=apple)](#requirements)
 [![Apple silicon](https://img.shields.io/badge/Apple%20silicon-native-1f1f1f?style=flat-square)](#requirements)
 [![AGPL-3.0 License](https://img.shields.io/badge/license-AGPL--3.0-1f1f1f?style=flat-square)](LICENSE)
+[![Website](https://img.shields.io/badge/website-tovri.rsapplication.com-1f1f1f?style=flat-square)](https://tovri.rsapplication.com)
 
 <br />
 
@@ -304,5 +307,7 @@ code.
 <br />
 <img src="Resources/AppIcon.svg" width="40" height="40" alt="" />
 <br />
+<a href="https://tovri.rsapplication.com"><strong>tovri.rsapplication.com</strong></a>
+·
 <a href="https://github.com/rahatsagor/Tovri"><strong>github.com/rahatsagor/Tovri</strong></a>
 </div>
