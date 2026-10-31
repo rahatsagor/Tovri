@@ -273,8 +273,13 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     private(set) var editorConfig = EditorConfig.Properties()
 
-    var trimsTrailingWhitespaceOnSave: Bool { editorConfig.trimTrailingWhitespace ?? Settings.shared.trimTrailingWhitespace }
-    var insertsFinalNewlineOnSave: Bool { editorConfig.insertFinalNewline ?? Settings.shared.ensureNewlineAtEOF }
+    /// The cleanups for saving to `target` (the file's own location when nil), so Save As follows
+    /// the `.editorconfig` of the folder it saves into.
+    func saveCleanups(to target: URL? = nil) -> (trimTrailingWhitespace: Bool, insertFinalNewline: Bool) {
+        let ec = target.map { EditorConfig.properties(for: $0) } ?? editorConfig
+        return (ec.trimTrailingWhitespace ?? Settings.shared.trimTrailingWhitespace,
+                ec.insertFinalNewline ?? Settings.shared.ensureNewlineAtEOF)
+    }
 
     /// Indentation always follows the project; line endings and charset only apply to files that
     /// have no content yet, so opening a file never rewrites it.

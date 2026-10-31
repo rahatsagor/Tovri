@@ -10,6 +10,7 @@ Options:
   -n, --new-window   Open in a new window
   -w, --wait         Wait until the opened files are closed (e.g. git config core.editor "tovri -w")
   -                  Read text from standard input into a new tab (also used when input is piped)
+  --                 Treat every following argument as a path, even one starting with -
   -h, --help         Show this help
 
 Examples:
@@ -25,8 +26,11 @@ NEW=0
 WAIT=0
 STDIN=0
 PATHS=()
+OPTIONS=1
 for arg in "$@"; do
+    if [ $OPTIONS -eq 0 ]; then PATHS+=("$arg"); continue; fi
     case "$arg" in
+        --) OPTIONS=0 ;;
         -n|--new-window) NEW=1 ;;
         -w|--wait) WAIT=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -91,7 +95,7 @@ for p in "${PATHS[@]}"; do
     if [ ! -e "$p" ]; then
         if [[ "$p" =~ ^(.+):([0-9]+):([0-9]+)$ ]] && [ -e "${BASH_REMATCH[1]}" ]; then
             p="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"; col="${BASH_REMATCH[3]}"
-        elif [[ "$p" =~ ^(.+):([0-9]+)$ ]]; then
+        elif [[ "$p" =~ ^(.+):([0-9]+)$ ]] && [ -e "${BASH_REMATCH[1]}" ]; then
             p="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
         fi
     fi

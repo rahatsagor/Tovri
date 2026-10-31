@@ -9,6 +9,51 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-01
+
+### Changed
+
+- **Find in Files** skips files that Git ignores (`.gitignore` and your
+  global ignore file) when it searches a Git repository, as well as the
+  folders listed in **Settings → Files**.
+- **Title Case** capitalizes the first letter of each word and leaves the
+  rest alone, so `NASA` and `McDonald` keep their capitals.
+- `tovri file:12` only reads `:12` as a line number when `file` exists.
+  Otherwise it creates a new file with exactly the name you typed, the same
+  rule `tovri file:12:3` already followed.
+
+### Fixed
+
+- **View → Sidebar** was greyed out, so the sidebar couldn't be shown or
+  hidden from the menu or with ⌘B. **Next Tab** and **Previous Tab** had the
+  same problem.
+- Opening a file from Finder or with `tovri` while no window is open no
+  longer brings back the folder of the window you closed. That window still
+  comes back if it has unsaved changes.
+- With hot exit on, unsaved changes in a closed window are no longer lost
+  when you open another window before quitting.
+- **Save As** now trims trailing whitespace and adds the final newline when
+  your settings or the destination folder's `.editorconfig` ask for it, and
+  offers to save as UTF-8 when the text doesn't fit the file's encoding,
+  like **Save** does.
+- Read-only tabs, such as Find Results and Git changes, no longer offer
+  editing commands like Sort Lines, the case commands or Trim Trailing
+  Whitespace in the menus. **Convert Indentation** no longer changes the
+  tab's indentation setting there.
+- A Git command that hangs, for example on a stalled network volume, is
+  stopped after 30 seconds instead of waiting forever.
+- Deleting or moving a folder's `.git` now removes its Git markers, instead
+  of keeping them until Tovri restarts.
+- **Snake Case** no longer doubles underscores ("Hello World" gave
+  `hello__world`) and keeps acronyms together (`parseHTTPResponse` becomes
+  `parse_http_response`). **Camel Case** keeps the word breaks of names that
+  are already camel or Pascal case (`FooBar` becomes `fooBar`, not `foobar`).
+  Both keep each line's indentation.
+- **Revert to Saved** asks before throwing away unsaved changes, since they
+  can't be undone afterwards.
+- The sidebar's Git markers are right for files renamed in the work tree
+  (`git add -N`) or copied, instead of showing a stray entry for the old name.
+- `tovri -- -file.txt` opens a file whose name starts with a dash.
 ## [0.1.0] - 2026-11-01
 
 The first public release. Tovri is a fast, lightweight editor for reading
@@ -100,5 +145,6 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rahatsagor/Tovri/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rahatsagor/Tovri/releases/tag/v0.1.0

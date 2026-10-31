@@ -451,7 +451,7 @@ extension EditorTextView {
 
     @objc func upperCase(_ sender: Any?) { transformSelections("Upper Case") { $0.uppercased() } }
     @objc func lowerCase(_ sender: Any?) { transformSelections("Lower Case") { $0.lowercased() } }
-    @objc func titleCase(_ sender: Any?) { transformSelections("Title Case") { $0.capitalized } }
+    @objc func titleCase(_ sender: Any?) { transformSelections("Title Case", EditorTextView.titleCased) }
     @objc func swapCase(_ sender: Any?) {
         transformSelections("Swap Case") { s in
             // Case mapping can change length ("ß" → "SS"), so map to strings, not characters.
@@ -461,21 +461,74 @@ extension EditorTextView {
 
     @objc func snakeCase(_ sender: Any?) {
         transformSelections("Snake Case") { s in
-            var out = ""
-            for (i, c) in s.enumerated() {
-                if c.isUppercase && i > 0 { out += "_" }
-                out += c == "-" || c == " " ? "_" : c.lowercased()
-            }
-            return out
+            EditorTextView.convertIdentifiers(s) { $0.map { $0.lowercased() }.joined(separator: "_") }
         }
     }
 
     @objc func camelCase(_ sender: Any?) {
         transformSelections("Camel Case") { s in
-            let parts = s.split(whereSeparator: { $0 == "_" || $0 == "-" || $0 == " " })
-            guard let first = parts.first else { return s }
-            return first.lowercased() + parts.dropFirst().map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }.joined()
+            EditorTextView.convertIdentifiers(s) { words in
+                guard let first = words.first else { return "" }
+                return first.lowercased() + words.dropFirst().map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }.joined()
+            }
         }
+    }
+
+    /// Uppercases the first letter of each word and leaves the rest alone, so "NASA" and
+    /// "McDonald" keep their capitals. An apostrophe inside a word ("don't") doesn't start one.
+    static func titleCased(_ s: String) -> String {
+        var out = ""
+        var prev: Character?
+        var beforePrev: Character?
+        for c in s {
+            let startsWord: Bool
+            if let p = prev {
+                startsWord = p == "'" || p == "’" ? !(beforePrev?.isLetter ?? false) : !p.isLetter && !p.isNumber
+            } else {
+                startsWord = true
+            }
+            out += startsWord && c.isLetter ? String(c).capitalized : String(c)
+            beforePrev = prev
+            prev = c
+        }
+        return out
+    }
+
+    /// Applies `join` to the words of each line, keeping each line's indentation, trailing
+    /// spaces and leading or trailing underscores (`_privateName`).
+    static func convertIdentifiers(_ s: String, _ join: ([String]) -> String) -> String {
+        let edge: (Character) -> Bool = { $0 == "_" || $0 == " " || $0 == "\t" }
+        return s.components(separatedBy: "\n").map { line in
+            let lead = line.prefix(while: edge)
+            let rest = line.dropFirst(lead.count)
+            let trail = String(rest.reversed().prefix(while: edge).reversed())
+            let words = identifierWords(String(rest.dropLast(trail.count)))
+            return words.isEmpty ? line : String(lead) + join(words) + trail
+        }.joined(separator: "\n")
+    }
+
+    /// Splits at `_`, `-` and spaces and where the case changes, keeping acronyms together:
+    /// "parseHTTPResponse" and "parse_http_response" both give parse, HTTP/http, Response/response.
+    static func identifierWords(_ s: String) -> [String] {
+        var words: [String] = []
+        var word = ""
+        let chars = Array(s)
+        for (i, c) in chars.enumerated() {
+            if c == "_" || c == "-" || c.isWhitespace {
+                if !word.isEmpty { words.append(word); word = "" }
+                continue
+            }
+            if c.isUppercase, let prev = word.last {
+                let nextIsLower = i + 1 < chars.count && chars[i + 1].isLowercase
+                if prev.isLowercase || prev.isNumber || (prev.isUppercase && nextIsLower) {
+                    words.append(word)
+                    word = ""
+                }
+            }
+            word.append(c)
+        }
+        if !word.isEmpty { words.append(word) }
+        return words
     }
 
     // MARK: Line permutations
@@ -531,6 +584,7 @@ extension EditorTextView {
     @objc func convertIndentationToTabs(_ sender: Any?) { convertIndentation(toTabs: true) }
 
     private func convertIndentation(toTabs: Bool) {
+        guard !document.isReadOnly else { NSSound.beep(); return }
         let w = document.indentWidth
         var edits: [TextEdit] = []
         for l in 0..<lines.count {
@@ -587,14 +641,22 @@ extension EditorTextView {
 
     // MARK: Validation
 
+    static let editingActions: Set<Selector> = [
+        #selector(cut(_:)), #selector(paste(_:)), #selector(complete(_:)),
+        #selector(indentLines(_:)), #selector(outdentLines(_:)), #selector(duplicateLine(_:)), #selector(deleteLine(_:)),
+        #selector(moveLineUp(_:)), #selector(moveLineDown(_:)), #selector(joinLines(_:)),
+        #selector(insertLineAfter(_:)), #selector(insertLineBefore(_:)),
+        #selector(toggleComment(_:)), #selector(toggleBlockComment(_:)),
+        #selector(upperCase(_:)), #selector(lowerCase(_:)), #selector(titleCase(_:)), #selector(swapCase(_:)),
+        #selector(snakeCase(_:)), #selector(camelCase(_:)),
+        #selector(sortLines(_:)), #selector(sortLinesCaseSensitive(_:)), #selector(reverseLines(_:)),
+        #selector(uniqueLines(_:)), #selector(shuffleLines(_:)),
+        #selector(trimTrailingWhitespace(_:)), #selector(convertIndentationToSpaces(_:)), #selector(convertIndentationToTabs(_:)),
+        #selector(formatJSON(_:)), #selector(minifyJSON(_:)),
+    ]
+
     override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
-        if let action = item.action, document.isReadOnly {
-            let mutating: [Selector] = [#selector(toggleComment(_:)), #selector(indentLines(_:)), #selector(outdentLines(_:)),
-                                        #selector(duplicateLine(_:)), #selector(deleteLine(_:)), #selector(moveLineUp(_:)),
-                                        #selector(moveLineDown(_:)), #selector(joinLines(_:)), #selector(paste(_:)), #selector(cut(_:)),
-                                        #selector(formatJSON(_:)), #selector(minifyJSON(_:))]
-            if mutating.contains(action) { return false }
-        }
+        if let action = item.action, document.isReadOnly, EditorTextView.editingActions.contains(action) { return false }
         return super.validateUserInterfaceItem(item)
     }
 }

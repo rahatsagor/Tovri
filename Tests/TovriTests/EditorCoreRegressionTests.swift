@@ -37,6 +37,94 @@ final class EditorCoreRegressionTests: XCTestCase {
         XCTAssertEqual(e.document.string as String, "STRASSE ǆ")
     }
 
+    func testSnakeAndCamelCaseSplitWordsOnceAndKeepAcronyms() {
+        func convert(_ text: String, _ command: (EditorTextView) -> Void) -> String {
+            let e = makeEditor(text)
+            defer { e.close() }
+            e.textView.setSelectedRange(NSRange(location: 0, length: e.document.length))
+            command(e.textView)
+            return e.document.string as String
+        }
+        let snake: [(String, String)] = [
+            ("Hello World", "hello_world"), ("fooBar", "foo_bar"), ("foo-Bar", "foo_bar"),
+            ("parseHTTPResponse", "parse_http_response"), ("_privateValue", "_private_value"),
+            ("already_snake", "already_snake"), ("md5Hash\nTwoLines", "md5_hash\ntwo_lines"),
+            ("    fooBar\n\tbazQux  ", "    foo_bar\n\tbaz_qux  "), ("  _privateValue", "  _private_value"),
+        ]
+        for (input, expected) in snake { XCTAssertEqual(convert(input) { $0.snakeCase(nil) }, expected, input) }
+        let camel: [(String, String)] = [
+            ("hello_world", "helloWorld"), ("FooBar", "fooBar"), ("fooBar", "fooBar"),
+            ("HTTP_SERVER", "httpServer"), ("parseHTTPResponse", "parseHttpResponse"), ("__init_value__", "__initValue__"),
+        ]
+        for (input, expected) in camel { XCTAssertEqual(convert(input) { $0.camelCase(nil) }, expected, input) }
+    }
+
+    func testTitleCaseKeepsCapitalsInsideWords() {
+        let cases: [(String, String)] = [
+            ("hello world", "Hello World"), ("NASA and McDonald", "NASA And McDonald"),
+            ("don't stop", "Don't Stop"), ("'quoted' text", "'Quoted' Text"),
+            ("3d-model v2", "3d-Model V2"), ("ǆungla straße", "ǅungla Straße"),
+        ]
+        for (input, expected) in cases { XCTAssertEqual(EditorTextView.titleCased(input), expected, input) }
+    }
+
+    func testWindowCommandsAreNotTakenByAppKitClassesEarlierInTheResponderChain() {
+        _ = NSApplication.shared
+        var actions: [Selector] = []
+        func walk(_ menu: NSMenu) {
+            for item in menu.items {
+                if let sub = item.submenu { walk(sub) } else if let a = item.action { actions.append(a) }
+            }
+        }
+        walk(MainMenu.build(recentMenu: NSMenu()))
+        let controllerActions = actions.filter {
+            class_respondsToSelector(MainWindowController.self, $0) && !class_respondsToSelector(NSWindowController.self, $0)
+        }
+        XCTAssertTrue(controllerActions.contains(#selector(MainWindowController.toggleSidebarCommand(_:))))
+        let earlier: [AnyClass] = [NSWindow.self, NSTextView.self, NSScrollView.self, NSClipView.self, NSView.self]
+        for action in controllerActions {
+            for cls in earlier where class_respondsToSelector(cls, action) {
+                XCTFail("\(NSStringFromClass(cls)) handles \(NSStringFromSelector(action)) before the window controller")
+            }
+        }
+    }
+
+    func testReadOnlyDocumentsDisableEveryEditingCommand() {
+        let e = makeEditor("    a\n")
+        defer { e.close() }
+        e.document.isReadOnly = true
+        for action in EditorTextView.editingActions {
+            let item = NSMenuItem(title: "", action: action, keyEquivalent: "")
+            XCTAssertFalse(e.textView.validateUserInterfaceItem(item), NSStringFromSelector(action))
+        }
+        let tabs = e.document.indentUsesTabs
+        e.textView.convertIndentationToTabs(nil)
+        e.textView.convertIndentationToSpaces(nil)
+        XCTAssertEqual(e.document.indentUsesTabs, tabs)
+        XCTAssertEqual(e.document.string as String, "    a\n")
+    }
+
+    func testSaveAsRunsTheCleanupsOfTheFolderItSavesInto() throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = dir.appendingPathComponent("a.txt")
+        try "one  \ntwo".write(to: source, atomically: true, encoding: .utf8)
+        let project = dir.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "root = true\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n"
+            .write(to: project.appendingPathComponent(".editorconfig"), atomically: true, encoding: .utf8)
+        try withController { controller in
+            let doc = try XCTUnwrap(controller.open(url: source))
+            controller.rootView.layoutSubtreeIfNeeded()
+            let target = project.appendingPathComponent("b.txt")
+            var saved: Bool?
+            controller.write(doc, to: target) { saved = $0 }
+            XCTAssertEqual(saved, true)
+            XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "one\ntwo\n")
+            XCTAssertEqual(doc.url, target)
+        }
+    }
+
     func testOverlappingMultiCaretDeletionsMerge() {
         let words = makeEditor("foo bar")
         defer { words.close() }

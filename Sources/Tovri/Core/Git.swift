@@ -73,6 +73,7 @@ struct LineDiff {
 final class GitRepository {
     let root: URL
     private static var cache: [String: GitRepository] = [:]
+    private static let cacheLock = NSLock()
     private static let queue = DispatchQueue(label: "app.tovri.git", qos: .utility, attributes: .concurrent)
 
     static let executable: String? = {
@@ -96,14 +97,17 @@ final class GitRepository {
 
     private init(root: URL) { self.root = root }
 
-    /// Finds the repository containing `url` by walking up to the nearest `.git`.
+    /// Finds the repository containing `url` by walking up to the nearest `.git`. The `.git` is
+    /// checked every time, so a repository that was deleted or moved stops being found.
     static func find(for url: URL) -> GitRepository? {
         var dir = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
         let fm = FileManager.default
         for _ in 0..<64 {
-            let key = dir.standardizedFileURL.path
-            if let r = cache[key] { return r }
             if fm.fileExists(atPath: dir.appendingPathComponent(".git").path) {
+                let key = dir.standardizedFileURL.path
+                cacheLock.lock()
+                defer { cacheLock.unlock() }
+                if let r = cache[key] { return r }
                 let r = GitRepository(root: dir.standardizedFileURL)
                 cache[key] = r
                 return r
@@ -165,48 +169,95 @@ final class GitRepository {
 
     private func rawRun(_ args: [String]) -> Data? {
         guard let git = GitRepository.executable else { return nil }
+        return GitRepository.runProcess(URL(fileURLWithPath: git), ["-C", root.path] + GitRepository.safetyOptions + args,
+                                        environment: ["GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1", "LC_ALL": "C", "PATH": "/usr/bin:/bin"])
+    }
+
+    /// Longest a git command may run before it is stopped.
+    static let timeout: TimeInterval = 30
+
+    /// Standard output of a successful run, or nil if it failed or ran past `timeout`. The
+    /// output is read on another thread, so a stalled network volume, or a child process
+    /// that keeps the pipe open, can't hold the caller past the timeout.
+    static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout) -> Data? {
+        final class Output: @unchecked Sendable { var data = Data() }
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: git)
-        p.arguments = ["-C", root.path] + GitRepository.safetyOptions + args
-        p.environment = ["GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1", "LC_ALL": "C", "PATH": "/usr/bin:/bin"]
+        p.executableURL = executable
+        p.arguments = args
+        p.environment = environment
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         p.standardInput = FileHandle.nullDevice
         do { try p.run() } catch { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return p.terminationStatus == 0 ? data : nil
+        let output = Output()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            output.data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            p.terminate()
+            let pid = p.processIdentifier
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
+                if p.isRunning { kill(pid, SIGKILL) }
+            }
+            return nil
+        }
+        return p.terminationReason == .exit && p.terminationStatus == 0 ? output.data : nil
     }
 
     func status(_ completion: @escaping ([String: GitFileStatus]) -> Void) {
         GitRepository.queue.async {
-            var result: [String: GitFileStatus] = [:]
-            if let data = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]) {
-                let parts = data.split(separator: 0, omittingEmptySubsequences: true)
-                var i = 0
-                while i < parts.count {
-                    let entry = String(decoding: parts[i], as: UTF8.self)
-                    i += 1
-                    guard entry.count > 3 else { continue }
-                    let x = entry[entry.startIndex]
-                    let y = entry[entry.index(after: entry.startIndex)]
-                    let path = String(entry.dropFirst(3))
-                    let s: GitFileStatus
-                    switch (x, y) {
-                    case ("?", "?"): s = .untracked
-                    case ("!", "!"): s = .ignored
-                    case ("U", _), (_, "U"), ("A", "A"), ("D", "D"): s = .conflicted
-                    case ("R", _): s = .renamed; i += 1
-                    case ("A", _): s = .added
-                    case ("D", _), (_, "D"): s = .deleted
-                    default: s = .modified
-                    }
-                    result[path] = s
-                }
-            }
+            let data = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"])
+            let result = data.map(GitRepository.parseStatus) ?? [:]
             DispatchQueue.main.async { completion(result) }
         }
+    }
+
+    /// Parses `git status --porcelain=v1 -z`. Renames and copies, in the index or (for
+    /// intent-to-add files) the work tree, are followed by an extra field holding the old path.
+    static func parseStatus(_ data: Data) -> [String: GitFileStatus] {
+        var result: [String: GitFileStatus] = [:]
+        let parts = data.split(separator: 0, omittingEmptySubsequences: true)
+        var i = 0
+        while i < parts.count {
+            let entry = parts[i]
+            i += 1
+            guard entry.count > 3 else { continue }
+            let x = Character(Unicode.Scalar(entry[entry.startIndex]))
+            let y = Character(Unicode.Scalar(entry[entry.startIndex + 1]))
+            let path = String(decoding: entry.dropFirst(3), as: UTF8.self)
+            if "RC".contains(x) || "RC".contains(y) { i += 1 }
+            let s: GitFileStatus
+            switch (x, y) {
+            case ("?", "?"): s = .untracked
+            case ("!", "!"): s = .ignored
+            case ("U", _), (_, "U"), ("A", "A"), ("D", "D"): s = .conflicted
+            case ("R", _), (_, "R"): s = .renamed
+            case ("A", _), ("C", _), (_, "C"): s = .added
+            case ("D", _), (_, "D"): s = .deleted
+            default: s = .modified
+            }
+            result[path] = s
+        }
+        return result
+    }
+
+    /// Tracked and untracked files under `dir` that `.gitignore` doesn't exclude, relative to
+    /// `dir`, or nil if git can't list them. Runs on the calling thread.
+    func unignoredFiles(in dir: URL) -> [String]? {
+        guard let data = run(["-C", dir.path, "ls-files", "-z", "--cached", "--others", "--exclude-standard"]) else { return nil }
+        var seen = Set<String>()
+        var out: [String] = []
+        for part in data.split(separator: 0) {
+            let path = String(decoding: part, as: UTF8.self)
+            // Untracked nested repositories are listed as folders; merge conflicts list a file once per stage.
+            if path.hasSuffix("/") || !seen.insert(path).inserted { continue }
+            out.append(path)
+        }
+        return out
     }
 
     /// Ignored files and directories (directories collapsed, with a trailing slash removed).

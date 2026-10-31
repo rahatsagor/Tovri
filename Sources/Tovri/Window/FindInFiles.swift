@@ -49,7 +49,7 @@ final class FileSearcher {
         st.wholeWord = o.wholeWord
         guard let re = st.makeRegex(query: o.query) else { return nil }
         let excludes = Settings.shared.searchExcludes.union(Settings.shared.hiddenPatterns)
-        var files = ProjectIndex.enumerate(root: o.root, excludes: excludes, limit: 500_000)
+        var files = FileSearcher.files(in: o.root, excludes: excludes, limit: 500_000)
         if !o.include.isEmpty || !o.exclude.isEmpty {
             files = files.filter { rel in
                 let name = (rel as NSString).lastPathComponent
@@ -92,6 +92,23 @@ final class FileSearcher {
             fileCount += 1
         }
         return Result(text: text, matches: total, files: fileCount, scanned: files.count)
+    }
+
+    /// In a Git repository, the files Git doesn't ignore; elsewhere, every file. Both skip the
+    /// folders and names in `excludes`.
+    static func files(in root: URL, excludes: Set<String>, limit: Int) -> [String] {
+        let dir = URL(fileURLWithPath: root.path, isDirectory: true)
+        guard let listed = GitRepository.find(for: dir)?.unignoredFiles(in: dir) else {
+            return ProjectIndex.enumerate(root: root, excludes: excludes, limit: limit)
+        }
+        var out: [String] = []
+        for rel in listed {
+            let parts = rel.split(separator: "/")
+            if parts.last == ".DS_Store" || parts.contains(where: { excludes.contains(String($0)) }) { continue }
+            out.append(rel)
+            if out.count >= limit { break }
+        }
+        return out
     }
 
     private static func search(_ url: URL, path: String, _ re: NSRegularExpression) -> (String, Int)? {
@@ -169,7 +186,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         findField.field.toolTip = "Text or pattern to search for"
         whereField.field.toolTip = "Folder to search (searched recursively). Defaults to the open folder; ~ is allowed."
         includeField.field.toolTip = "Only search files matching these patterns, separated by commas.\nPatterns without a slash match file names (*.swift); patterns with a slash match paths (src/*)."
-        excludeField.field.toolTip = "Skip files matching these patterns, e.g. *.min.js, dist/*.\nFolders listed in Settings → Files are always skipped."
+        excludeField.field.toolTip = "Skip files matching these patterns, e.g. *.min.js, dist/*.\nFiles ignored by Git and folders listed in Settings → Files are always skipped."
         [titleLabel, caseButton, wordButton, regexButton, findButton].forEach(panel.addSubview)
     }
 
