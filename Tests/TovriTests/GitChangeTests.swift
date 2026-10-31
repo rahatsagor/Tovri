@@ -98,4 +98,39 @@ final class GitChangeTests: XCTestCase {
         let headers = diff.split(separator: "\n").filter { $0.hasPrefix("@@") }
         XCTAssertEqual(headers, ["@@ -1,5 +1,5 @@", "@@ -16,5 +16,5 @@"])
     }
+
+    func testStatusSkipsTheOldPathOfRenamesAndCopiesInEitherColumn() {
+        let entries = ["R  new.txt", "old.txt", " R moved.txt", "was.txt", "C  copy.txt", "orig.txt",
+                       " M edited.txt", "?? fresh.txt", "UU both.txt"]
+        let status = GitRepository.parseStatus(Data((entries.joined(separator: "\0") + "\0").utf8))
+        XCTAssertEqual(status.count, 6)
+        XCTAssertEqual(status["new.txt"], .renamed)
+        XCTAssertEqual(status["moved.txt"], .renamed)
+        XCTAssertEqual(status["copy.txt"], .added)
+        XCTAssertEqual(status["edited.txt"], .modified)
+        XCTAssertEqual(status["fresh.txt"], .untracked)
+        XCTAssertEqual(status["both.txt"], .conflicted)
+        XCTAssertNil(status["old.txt"])
+        XCTAssertNil(status["was.txt"])
+        XCTAssertNil(status["orig.txt"])
+    }
+
+    func testCommandsThatRunTooLongAreStopped() {
+        let start = Date()
+        XCTAssertNil(GitRepository.runProcess(URL(fileURLWithPath: "/bin/sleep"), ["10"], environment: [:], timeout: 0.5))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3)
+        XCTAssertEqual(GitRepository.runProcess(URL(fileURLWithPath: "/bin/echo"), ["hi"], environment: [:]), Data("hi\n".utf8))
+        XCTAssertNil(GitRepository.runProcess(URL(fileURLWithPath: "/usr/bin/false"), [], environment: [:]))
+    }
+
+    func testARepositoryIsForgottenOnceItsGitFolderIsGone() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tovri-find-\(UUID().uuidString)").resolvingSymlinksInPath()
+        let dotGit = dir.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(at: dotGit, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.txt")
+        XCTAssertEqual(GitRepository.find(for: file)?.root.path, dir.standardizedFileURL.path)
+        try FileManager.default.removeItem(at: dotGit)
+        XCTAssertNil(GitRepository.find(for: file))
+    }
 }

@@ -37,6 +37,27 @@ final class SessionTests: XCTestCase {
         try body(controller)
     }
 
+    private func closedWindow(folder: String?, buffer: String?) -> WindowSession {
+        let tab = TabSession(path: "/tmp/a.txt", untitledName: nil, buffer: buffer, selection: 0, selectionLength: 0,
+                             scrollX: 0, scrollY: 0, language: nil, encoding: nil, lineEnding: nil)
+        return WindowSession(frame: "", folder: folder, sidebarVisible: true, sidebarWidth: 240, layout: "single",
+                             groups: [GroupSession(tabs: [tab], selected: 0)], activeGroup: 0, fullScreen: false)
+    }
+
+    func testAClosedWindowComesBackOnlyToKeepUnsavedChanges() {
+        let clean = closedWindow(folder: "/tmp/project", buffer: nil)
+        let unsaved = closedWindow(folder: "/tmp/project", buffer: "buffer-1")
+        XCTAssertFalse(AppDelegate.reopensClosedWindow(nil))
+        XCTAssertFalse(AppDelegate.reopensClosedWindow(clean))
+        XCTAssertTrue(AppDelegate.reopensClosedWindow(unsaved))
+
+        let open = closedWindow(folder: nil, buffer: nil)
+        XCTAssertTrue(AppDelegate.sessionWindows(open: [], closed: nil).isEmpty)
+        XCTAssertEqual(AppDelegate.sessionWindows(open: [], closed: clean).map(\.folder), ["/tmp/project"])
+        XCTAssertEqual(AppDelegate.sessionWindows(open: [open], closed: clean).map(\.folder), [nil])
+        XCTAssertEqual(AppDelegate.sessionWindows(open: [open], closed: unsaved).map(\.folder), [nil, "/tmp/project"])
+    }
+
     func testSessionKeepsSelectedTabAfterOmittingEmptyUntitledTabs() {
         withController { controller in
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

@@ -860,21 +860,38 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     @objc func revertDocumentToSaved(_ sender: Any?) {
-        guard let doc = activeDocument, doc.url != nil else { return }
-        do { try doc.reload() } catch { showError(error) }
+        guard let doc = activeDocument, doc.url != nil, let window else { return }
+        // Reloading clears the undo history, so the unsaved edits can't be brought back.
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Revert “\(doc.displayName)” to the saved version?"
+        alert.informativeText = "Your unsaved changes will be lost. This can’t be undone."
+        alert.addButton(withTitle: "Revert")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .alertFirstButtonReturn else { return }
+            do { try doc.reload() } catch { self?.showError(error) }
+        }
     }
 
     func save(_ doc: Document, replacingExternalChanges: Bool = false, completion: ((Bool) -> Void)? = nil) {
         guard !doc.isTransient else { completion?(true); return }
         guard doc.url != nil else { saveAs(doc, completion: completion); return }
+        write(doc, to: nil, replacingExternalChanges: replacingExternalChanges, completion: completion)
+    }
+
+    /// Writes `doc` to `target`, or to its own file when nil, after the save-time cleanups.
+    func write(_ doc: Document, to target: URL?, replacingExternalChanges: Bool = false, completion: ((Bool) -> Void)? = nil) {
         let editor = allGroupsTabs().first { $0.document === doc && $0.editor != nil }?.editor
         if let tv = editor?.textView {
-            if doc.trimsTrailingWhitespaceOnSave { tv.trimTrailingWhitespace(nil) }
-            if doc.insertsFinalNewlineOnSave { tv.ensureTrailingNewline() }
+            let cleanups = doc.saveCleanups(to: target)
+            if cleanups.trimTrailingWhitespace { tv.trimTrailingWhitespace(nil) }
+            if cleanups.insertFinalNewline { tv.ensureTrailingNewline() }
         }
         do {
-            try doc.save(replacingExternalChanges: replacingExternalChanges)
+            try doc.save(to: target, replacingExternalChanges: replacingExternalChanges)
             statusBar.flash("Saved “\(doc.displayName)”")
+            if target != nil { updateTitle() }
             refreshGitStatus()
             completion?(true)
         } catch DocumentError.modifiedOnDisk {
@@ -887,7 +904,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             alert.addButton(withTitle: "Save Anyway")
             alert.addButton(withTitle: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {
-                save(doc, replacingExternalChanges: true, completion: completion)
+                write(doc, to: target, replacingExternalChanges: true, completion: completion)
             } else { completion?(false) }
         } catch DocumentError.encodingFailed(let enc) {
             let alert = NSAlert()
@@ -897,7 +914,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             alert.addButton(withTitle: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {
                 doc.encoding = .utf8
-                save(doc, replacingExternalChanges: replacingExternalChanges, completion: completion)
+                write(doc, to: target, replacingExternalChanges: replacingExternalChanges, completion: completion)
             } else { completion?(false) }
         } catch {
             showError(error)
@@ -915,16 +932,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         panel.showsTagField = false
         panel.isExtensionHidden = false
         panel.beginSheetModal(for: window) { [weak self] resp in
-            guard resp == .OK, let url = panel.url else { completion?(false); return }
-            do {
-                try doc.save(to: url)
-                self?.updateTitle()
-                self?.updateStatusBar()
-                completion?(true)
-            } catch {
-                self?.showError(error)
-                completion?(false)
-            }
+            guard resp == .OK, let url = panel.url, let self else { completion?(false); return }
+            self.write(doc, to: url, completion: completion)
         }
     }
 
@@ -1050,13 +1059,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     // MARK: Tabs navigation
 
-    @objc func selectNextTab(_ sender: Any?) {
+    // NSWindow's own selectNextTab(_:) and selectPreviousTab(_:), for native window tabs, would
+    // take these first and grey them out, so the names differ.
+    @objc func selectNextTabCommand(_ sender: Any?) {
         let g = activeGroup
         guard !g.tabs.isEmpty else { return }
         g.select((g.selectedIndex + 1) % g.tabs.count)
     }
 
-    @objc func selectPreviousTab(_ sender: Any?) {
+    @objc func selectPreviousTabCommand(_ sender: Any?) {
         let g = activeGroup
         guard !g.tabs.isEmpty else { return }
         g.select((g.selectedIndex - 1 + g.tabs.count) % g.tabs.count)
@@ -1154,7 +1165,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     // MARK: Sidebar
 
-    @objc func toggleSidebar(_ sender: Any?) {
+    /// Not named `toggleSidebar(_:)`: NSWindow implements that for split view sidebars, and as the
+    /// window comes before its controller in the responder chain, it would grey out View → Sidebar.
+    @objc func toggleSidebarCommand(_ sender: Any?) {
         if folderURL == nil {
             sidebarForcedOpen.toggle()
         } else {
@@ -1165,13 +1178,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     @objc func focusSidebar(_ sender: Any?) {
-        if !isSidebarShown { toggleSidebar(nil) }
+        if !isSidebarShown { toggleSidebarCommand(nil) }
         sidebar.focusTree()
     }
 
     @objc func revealInSidebar(_ sender: Any?) {
         guard let url = activeDocument?.url else { return }
-        if !isSidebarShown { toggleSidebar(nil) }
+        if !isSidebarShown { toggleSidebarCommand(nil) }
         sidebar.reveal(url)
     }
 
@@ -1756,7 +1769,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         let s = Settings.shared
         switch menuItem.action {
-        case #selector(toggleSidebar(_:)): menuItem.state = isSidebarShown ? .on : .off
+        case #selector(toggleSidebarCommand(_:)): menuItem.state = isSidebarShown ? .on : .off
         case #selector(toggleMinimap(_:)): menuItem.state = s.showMinimap ? .on : .off
         case #selector(toggleLineNumbers(_:)): menuItem.state = s.showLineNumbers ? .on : .off
         case #selector(toggleIndentGuides(_:)): menuItem.state = s.showIndentGuides ? .on : .off

@@ -41,8 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         SessionStore.shared.stateProvider = { [weak self] in
             guard let self else { return [] }
-            if self.controllers.isEmpty { return self.closedWindowSession.map { [$0] } ?? [] }
-            return self.controllers.map { $0.sessionState() }
+            return AppDelegate.sessionWindows(open: self.controllers.map { $0.sessionState() }, closed: self.closedWindowSession)
         }
         NotificationCenter.default.addObserver(self, selector: #selector(documentChangedOnDisk(_:)), name: .documentFileDidChangeOnDisk, object: nil)
 
@@ -139,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wait = q["wait"]
         func target() -> MainWindowController {
             if wantsNewWindow { return newWindow() }
-            return activeController ?? reopenLastWindowOrCreate()
+            return windowForOpening()
         }
         // A waiter whose request opened no document (a folder, Quick Look, an error) is released
         // right away so `tovri -w` doesn't block forever.
@@ -319,6 +318,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return newWindow()
     }
 
+    /// The window for a file opened from Finder or the command line. With no window open, the
+    /// last closed one comes back only when it holds unsaved changes; otherwise a single file
+    /// gets a fresh window instead of reopening the folder that was closed.
+    private func windowForOpening() -> MainWindowController {
+        if let c = activeController { return c }
+        if AppDelegate.reopensClosedWindow(closedWindowSession) { return reopenLastWindowOrCreate() }
+        closedWindowSession = nil
+        return newWindow()
+    }
+
+    static func reopensClosedWindow(_ closed: WindowSession?) -> Bool { closed?.hasUnsavedChanges == true }
+
+    /// The windows to save. A closed window is kept while no other window is open, and for as
+    /// long as it holds unsaved changes, so opening another window can't drop them.
+    static func sessionWindows(open: [WindowSession], closed: WindowSession?) -> [WindowSession] {
+        guard let closed, open.isEmpty || closed.hasUnsavedChanges else { return open }
+        return open + [closed]
+    }
+
     @objc private func documentChangedOnDisk(_ n: Notification) {
         guard let doc = n.object as? Document else { return }
         let owner = controllers.first { $0.window?.isKeyWindow == true && $0.allOpenDocuments().contains { $0 === doc } }
@@ -339,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     newWindow(folder: url)
                 }
             } else {
-                let c = activeController ?? reopenLastWindowOrCreate()
+                let c = windowForOpening()
                 c.open(url: url)
                 c.window?.makeKeyAndOrderFront(nil)
             }

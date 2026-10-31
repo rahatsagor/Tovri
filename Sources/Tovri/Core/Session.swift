@@ -28,6 +28,9 @@ struct WindowSession: Codable {
     var groups: [GroupSession]
     var activeGroup: Int
     var fullScreen: Bool
+
+    /// Hot exit stores a buffer only for edits that aren't saved to disk.
+    var hasUnsavedChanges: Bool { groups.contains { $0.tabs.contains { $0.buffer != nil } } }
 }
 
 struct AppSession: Codable {
