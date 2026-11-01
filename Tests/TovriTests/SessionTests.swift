@@ -44,18 +44,41 @@ final class SessionTests: XCTestCase {
                              groups: [GroupSession(tabs: [tab], selected: 0)], activeGroup: 0, fullScreen: false)
     }
 
-    func testAClosedWindowComesBackOnlyToKeepUnsavedChanges() {
-        let clean = closedWindow(folder: "/tmp/project", buffer: nil)
-        let unsaved = closedWindow(folder: "/tmp/project", buffer: "buffer-1")
-        XCTAssertFalse(AppDelegate.reopensClosedWindow(nil))
-        XCTAssertFalse(AppDelegate.reopensClosedWindow(clean))
-        XCTAssertTrue(AppDelegate.reopensClosedWindow(unsaved))
+    func testClosedWindowsWithUnsavedChangesAreNeverForgotten() {
+        let clean = closedWindow(folder: "/tmp/clean", buffer: nil)
+        let unsaved = closedWindow(folder: "/tmp/unsaved", buffer: "buffer-1")
+        let later = closedWindow(folder: "/tmp/later", buffer: nil)
+        XCTAssertFalse(clean.hasUnsavedChanges)
+        XCTAssertTrue(unsaved.hasUnsavedChanges)
+
+        // Closing another window, even an empty one, keeps the closed window's unsaved buffers.
+        var closed = AppDelegate.remembering([], closing: unsaved)
+        closed = AppDelegate.remembering(closed, closing: clean)
+        closed = AppDelegate.remembering(closed, closing: later)
+        XCTAssertEqual(closed.map(\.folder), ["/tmp/unsaved", "/tmp/later"])
 
         let open = closedWindow(folder: nil, buffer: nil)
-        XCTAssertTrue(AppDelegate.sessionWindows(open: [], closed: nil).isEmpty)
-        XCTAssertEqual(AppDelegate.sessionWindows(open: [], closed: clean).map(\.folder), ["/tmp/project"])
-        XCTAssertEqual(AppDelegate.sessionWindows(open: [open], closed: clean).map(\.folder), [nil])
-        XCTAssertEqual(AppDelegate.sessionWindows(open: [open], closed: unsaved).map(\.folder), [nil, "/tmp/project"])
+        XCTAssertTrue(AppDelegate.sessionWindows(open: [], closed: []).isEmpty)
+        XCTAssertEqual(AppDelegate.sessionWindows(open: [], closed: closed).map(\.folder), ["/tmp/unsaved", "/tmp/later"])
+        XCTAssertEqual(AppDelegate.sessionWindows(open: [open], closed: [clean]).map(\.folder), [nil])
+        XCTAssertEqual(AppDelegate.sessionWindows(open: [open], closed: closed).map(\.folder), [nil, "/tmp/unsaved"])
+    }
+
+    func testLaunchingToOpenAFileSkipsAWindowClosedBeforeQuitting() {
+        var closedClean = closedWindow(folder: "/tmp/project", buffer: nil)
+        closedClean.closed = true
+        var closedUnsaved = closedWindow(folder: "/tmp/project", buffer: "buffer-1")
+        closedUnsaved.closed = true
+        let open = closedWindow(folder: "/tmp/project", buffer: nil)
+        XCTAssertTrue(AppDelegate.skipsAtLaunch(closedClean, openingFiles: true))
+        XCTAssertFalse(AppDelegate.skipsAtLaunch(closedClean, openingFiles: false))
+        XCTAssertFalse(AppDelegate.skipsAtLaunch(closedUnsaved, openingFiles: true))
+        XCTAssertFalse(AppDelegate.skipsAtLaunch(open, openingFiles: true))
+
+        let decoded = try? JSONDecoder().decode(WindowSession.self, from: JSONEncoder().encode(closedClean))
+        XCTAssertEqual(decoded?.closed, true)
+        let old = Data(#"{"frame":"","sidebarVisible":true,"sidebarWidth":240,"layout":"single","groups":[],"activeGroup":0,"fullScreen":false}"#.utf8)
+        XCTAssertNil(try JSONDecoder().decode(WindowSession.self, from: old).closed, "0.2.0 sessions still load")
     }
 
     func testSessionKeepsSelectedTabAfterOmittingEmptyUntitledTabs() {

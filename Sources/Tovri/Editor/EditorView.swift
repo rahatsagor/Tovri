@@ -654,7 +654,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         guard r.length > 0 else { return }
         let s = document.string.substring(with: r)
         FindState.shared.query = FindState.shared.regex ? NSRegularExpression.escapedPattern(for: s) : s
-        findBar?.syncFromState()
+        if let bar = findBar, !bar.isHidden { bar.queryDidChange() } else { findBar?.syncFromState() }
     }
 
     // MARK: Find results

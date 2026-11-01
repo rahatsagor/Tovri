@@ -152,6 +152,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
     private let backdrop = PaletteBackdrop()
     private let panel = FlippedView()
     private let titleLabel = NSTextField(labelWithString: "Find in Files")
+    private let errorLabel = NSTextField(labelWithString: "")
     let findField = ThemedTextField(placeholder: "Find")
     let whereField = ThemedTextField(placeholder: "Where (folder)")
     let includeField = ThemedTextField(placeholder: "Include, e.g. *.swift, src/*")
@@ -169,6 +170,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         self.controller = controller
         super.init()
         backdrop.onClick = { [weak self] in self?.close() }
+        backdrop.onResize = { [weak self] in self?.layout() }
         backdrop.addSubview(panel)
         panel.wantsLayer = true
         panel.layer?.cornerRadius = 11
@@ -187,7 +189,10 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         whereField.field.toolTip = "Folder to search (searched recursively). Defaults to the open folder; ~ is allowed."
         includeField.field.toolTip = "Only search files matching these patterns, separated by commas.\nPatterns without a slash match file names (*.swift); patterns with a slash match paths (src/*)."
         excludeField.field.toolTip = "Skip files matching these patterns, e.g. *.min.js, dist/*.\nFiles ignored by Git and folders listed in Settings → Files are always skipped."
-        [titleLabel, caseButton, wordButton, regexButton, findButton].forEach(panel.addSubview)
+        errorLabel.font = .systemFont(ofSize: 11.5)
+        errorLabel.textColor = .systemRed
+        errorLabel.lineBreakMode = .byTruncatingTail
+        [titleLabel, errorLabel, caseButton, wordButton, regexButton, findButton].forEach(panel.addSubview)
     }
 
     func show(folder: URL?) {
@@ -207,6 +212,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
             }
         }
         findField.stringValue = st.query
+        errorLabel.stringValue = ""
         caseButton.isOn = st.caseSensitive
         wordButton.isOn = st.wholeWord
         regexButton.isOn = st.regex
@@ -238,7 +244,16 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         excludeField.frame = NSRect(x: fx + half + 8, y: 112, width: half, height: 28)
         let bw = findButton.intrinsicWidth + 16
         findButton.frame = NSRect(x: fx + fw - bw, y: 150, width: bw, height: 26)
+        errorLabel.frame = NSRect(x: fx + 2, y: 155, width: fw - bw - 14, height: 16)
     }
+
+    private func showError(_ message: String, focus field: ThemedTextField) {
+        errorLabel.stringValue = message
+        NSSound.beep()
+        window?.makeFirstResponder(field.field)
+    }
+
+    func controlTextDidChange(_ obj: Notification) { errorLabel.stringValue = "" }
 
     func close() {
         backdrop.removeFromSuperview()
@@ -255,12 +270,19 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
 
     private func submit() {
         let q = findField.stringValue
-        guard !q.isEmpty else { NSSound.beep(); return }
+        guard !q.isEmpty else { showError("Type something to find.", focus: findField); return }
         let whereText = (whereField.stringValue as NSString).expandingTildeInPath
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: whereText, isDirectory: &isDir), isDir.boolValue else {
-            NSSound.beep()
-            window?.makeFirstResponder(whereField.field)
+            showError("There’s no folder at that path.", focus: whereField)
+            return
+        }
+        let probe = FindState()
+        probe.regex = regexButton.isOn
+        probe.caseSensitive = caseButton.isOn
+        probe.wholeWord = wordButton.isOn
+        guard probe.makeRegex(query: q) != nil else {
+            showError("That isn’t a valid regular expression.", focus: findField)
             return
         }
         let st = FindState.shared

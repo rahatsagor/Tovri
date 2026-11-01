@@ -126,7 +126,10 @@ final class CompletionController: NSObject, NSTableViewDataSource, NSTableViewDe
         let height = CGFloat(min(items.count, maxRows)) * rowHeight + 8
         let caret = tv.firstRect(forCharacterRange: prefixRange, actualRange: nil)
         var origin = NSPoint(x: caret.minX - 26, y: caret.minY - height - 4)
-        if let screen = window.screen?.visibleFrame, origin.y < screen.minY { origin.y = caret.maxY + 4 }
+        if let screen = window.screen?.visibleFrame {
+            if origin.y < screen.minY { origin.y = caret.maxY + 4 }
+            origin.x = max(screen.minX, min(origin.x, screen.maxX - width))
+        }
         panel.setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: false)
         container.frame = NSRect(origin: .zero, size: panel.frame.size)
         scroll.frame = container.bounds.insetBy(dx: 0, dy: 4)

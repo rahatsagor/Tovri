@@ -11,11 +11,11 @@ extension EditorView {
         gitHunk(at: document.lines.line(containing: textView.selectedRange().location))
     }
 
-    /// Moves to the following or preceding change and shows what it replaced.
+    /// Moves to the change after or before `line` (the caret's line when nil) and shows what it replaced.
     @discardableResult
-    func gotoChange(forward: Bool) -> Bool {
+    func gotoChange(forward: Bool, from line: Int? = nil) -> Bool {
         guard Settings.shared.gitGutter else { return false }
-        let line = document.lines.line(containing: textView.selectedRange().location)
+        let line = line ?? document.lines.line(containing: textView.selectedRange().location)
         guard let h = document.gitDiff.nextHunk(from: line, forward: forward, lineCount: document.lines.count) else { return false }
         goTo(line: min(h.newStart, document.lines.count - 1) + 1)
         showGitChange(h)
@@ -65,6 +65,11 @@ final class GitChangePopover: NSViewController {
     private let hunk: DiffHunk
     private weak var editor: EditorView?
 
+    private static let padding: CGFloat = 12
+    private static let maxWidth: CGFloat = 720
+    private static let maxCodeHeight: CGFloat = 300
+    private static let maxLines = 2000
+
     static func show(_ hunk: DiffHunk, in editor: EditorView) {
         current?.close()
         let popover = NSPopover()
@@ -95,101 +100,153 @@ final class GitChangePopover: NSViewController {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    private var summary: String {
+    /// "1 line changed, 2 added": a hunk replacing 1 line with 3 changed one and added two.
+    static func summary(of hunk: DiffHunk) -> String {
         func lines(_ n: Int) -> String { n == 1 ? "1 line" : "\(n) lines" }
-        if hunk.isDeletion { return "\(lines(hunk.oldLines.count)) deleted since the last commit" }
-        if hunk.isAddition { return "\(lines(hunk.newCount)) added since the last commit" }
-        return "\(lines(hunk.newCount)) changed since the last commit"
+        let old = hunk.oldLines.count
+        let new = hunk.newCount
+        if hunk.isDeletion { return "\(lines(old)) deleted" }
+        if hunk.isAddition { return "\(lines(new)) added" }
+        var parts = ["\(lines(min(old, new))) changed"]
+        if new > old { parts.append("\(new - old) added") }
+        if old > new { parts.append("\(old - new) deleted") }
+        return parts.joined(separator: ", ")
+    }
+
+    /// The hunk's place among the document's changes, or nil if the diff has moved on.
+    private var position: (index: Int, count: Int)? {
+        guard let hunks = editor?.document.gitDiff.hunks, let i = hunks.firstIndex(of: hunk) else { return nil }
+        return (i + 1, hunks.count)
+    }
+
+    private static func label(_ s: String, _ font: NSFont, _ color: NSColor) -> NSTextField {
+        let l = NSTextField(labelWithString: s)
+        l.font = font
+        l.textColor = color
+        l.lineBreakMode = .byTruncatingTail
+        l.toolTip = s
+        return l
     }
 
     override func loadView() {
-        let title = NSTextField(labelWithString: summary)
-        title.font = .systemFont(ofSize: 12, weight: .medium)
-        title.textColor = .secondaryLabelColor
-        title.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let theme = ThemeManager.shared.active
+        let p = GitChangePopover.padding
+        let root = FlippedView()
 
-        func iconButton(_ symbol: String, _ label: String, _ action: Selector) -> NSButton {
-            let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: label)!, target: self, action: action)
-            b.title = ""
-            b.imagePosition = .imageOnly
-            b.bezelStyle = .accessoryBarAction
-            b.isBordered = true
-            b.toolTip = label
-            b.setAccessibilityLabel(label)
-            return b
+        let title = GitChangePopover.label(GitChangePopover.summary(of: hunk), .systemFont(ofSize: 12.5, weight: .semibold), theme.chromeForeground)
+        var detailText = "Since the last commit"
+        let position = self.position
+        if let position, position.count > 1 { detailText += " · change \(position.index) of \(position.count)" }
+        let shownLines = hunk.oldLines.prefix(GitChangePopover.maxLines)
+        if hunk.oldLines.count > shownLines.count { detailText += " · first \(shownLines.count) lines shown" }
+        let detail = GitChangePopover.label(detailText, .systemFont(ofSize: 11), theme.chromeSecondary)
+
+        var buttons: [ToolButton] = []
+        if (position?.count ?? 0) > 1 {
+            buttons.append(ToolButton(symbol: "chevron.up", tooltip: "Previous Change\n⇧⌥F5") { [weak self] in self?.go(forward: false) })
+            buttons.append(ToolButton(symbol: "chevron.down", tooltip: "Next Change\n⌥F5") { [weak self] in self?.go(forward: true) })
         }
-        let previous = iconButton("chevron.up", "Previous Change (⇧⌥F5)", #selector(previousChange))
-        let next = iconButton("chevron.down", "Next Change (⌥F5)", #selector(nextChange))
-        let revert = NSButton(title: "Revert", target: self, action: #selector(revertChange))
-        revert.bezelStyle = .push
-        revert.controlSize = .small
-        revert.toolTip = hunk.isAddition ? "Remove the added lines" : "Restore the text from the last commit"
+        let revert = ToolButton(title: "Revert", tooltip: hunk.isAddition ? "Revert\nRemove the added lines." : "Revert\nRestore the text from the last commit.") { [weak self] in
+            self?.revert()
+        }
+        revert.wantsLayer = true
+        revert.layer?.cornerRadius = 5
+        revert.layer?.borderWidth = 1
+        revert.layer?.borderColor = theme.chromeBorder.cgColor
+        buttons.append(revert)
+        let buttonWidths = buttons.map { $0 === revert ? $0.intrinsicWidth : 24 }
+        let buttonsWidth = buttonWidths.reduce(0, +) + CGFloat(buttons.count - 1) * 4
 
-        let header = NSStackView(views: [title, previous, next, revert])
-        header.orientation = .horizontal
-        header.distribution = .fill
-        header.spacing = 6
+        let titleSize = title.fittingSize
+        let detailSize = detail.fittingSize
+        var width = max(360, ceil(max(titleSize.width, detailSize.width)) + 16 + buttonsWidth + 2 * p)
 
-        let stack = NSStackView(views: [header])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
-
-        var width: CGFloat = 340
-        if !hunk.oldLines.isEmpty {
+        var code: NSScrollView?
+        var codeHeight: CGFloat = 0
+        if !shownLines.isEmpty {
             let font = NSFont.monospacedSystemFont(ofSize: max(11, Settings.shared.font.pointSize - 1), weight: .regular)
-            let shown = hunk.oldLines.prefix(2000).joined(separator: "\n")
-            let theme = ThemeManager.shared.active
+            let inset = NSSize(width: 8, height: 6)
+            let longest = shownLines.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+            let textWidth = ceil(longest) + 2 * inset.width + 10
+            width = max(width, textWidth + 2 * p)
+            width = min(width, GitChangePopover.maxWidth)
+            let lineHeight = NSLayoutManager().defaultLineHeight(for: font)
+            let contentHeight = ceil(CGFloat(shownLines.count) * lineHeight + 2 * inset.height)
+            codeHeight = min(contentHeight, GitChangePopover.maxCodeHeight)
+            let codeWidth = width - 2 * p
+
             let deleted = theme.color(.deleted) ?? .systemRed
-            let text = NSTextView()
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: max(codeWidth, textWidth), height: max(codeHeight, contentHeight)))
             text.isEditable = false
             text.isSelectable = true
-            text.drawsBackground = true
-            text.backgroundColor = deleted.withAlphaComponent(0.12)
-            text.textContainerInset = NSSize(width: 6, height: 6)
+            text.drawsBackground = false
+            text.textContainerInset = inset
             text.font = font
-            text.textColor = .labelColor
-            text.string = shown
+            text.textColor = theme.foreground
+            text.string = shownLines.joined(separator: "\n")
             text.isHorizontallyResizable = true
+            text.isVerticallyResizable = true
             text.textContainer?.widthTracksTextView = false
             text.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-            let longest = hunk.oldLines.prefix(2000).map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
-            width = min(max(width, longest + 40), 720)
-            let lineHeight = font.ascender - font.descender + font.leading + 2
-            let height = min(CGFloat(min(hunk.oldLines.count, 2000)) * lineHeight + 14, 300)
+            text.minSize = NSSize(width: codeWidth, height: codeHeight)
+            text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            text.setAccessibilityLabel("Text before the change")
+
             let scroll = NSScrollView()
             scroll.documentView = text
-            scroll.hasVerticalScroller = true
-            scroll.hasHorizontalScroller = longest + 40 > width
+            scroll.drawsBackground = true
+            scroll.backgroundColor = deleted.withAlphaComponent(theme.isDark ? 0.16 : 0.10)
+            scroll.hasVerticalScroller = contentHeight > codeHeight
+            scroll.hasHorizontalScroller = textWidth > codeWidth
             scroll.autohidesScrollers = true
+            scroll.scrollerStyle = .overlay
             scroll.borderType = .noBorder
-            scroll.translatesAutoresizingMaskIntoConstraints = false
-            scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
-            scroll.widthAnchor.constraint(equalToConstant: width - 24).isActive = true
-            text.frame = NSRect(x: 0, y: 0, width: width - 24, height: height)
-            text.minSize = NSSize(width: 0, height: height)
-            text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-            text.isVerticallyResizable = true
-            text.autoresizingMask = [.width]
-            stack.addArrangedSubview(scroll)
+            scroll.wantsLayer = true
+            scroll.layer?.cornerRadius = 6
+            scroll.layer?.masksToBounds = true
+            code = scroll
         }
-        header.translatesAutoresizingMaskIntoConstraints = false
-        header.widthAnchor.constraint(equalToConstant: width - 24).isActive = true
-        view = stack
+        width = min(width, GitChangePopover.maxWidth)
+
+        let textHeight = ceil(titleSize.height) + 2 + ceil(detailSize.height)
+        let headerHeight = max(textHeight, 26)
+        let textMaxWidth = width - 2 * p - buttonsWidth - 16
+        title.frame = NSRect(x: p, y: p + (headerHeight - textHeight) / 2, width: textMaxWidth, height: ceil(titleSize.height))
+        detail.frame = NSRect(x: p, y: title.frame.maxY + 2, width: textMaxWidth, height: ceil(detailSize.height))
+        var x = width - p
+        for (b, w) in zip(buttons, buttonWidths).reversed() {
+            x -= w
+            b.frame = NSRect(x: x, y: p + (headerHeight - 24) / 2, width: w, height: 24)
+            x -= 4
+        }
+        [title, detail].forEach(root.addSubview)
+        buttons.forEach(root.addSubview)
+
+        var height = p + headerHeight + p
+        if let code {
+            code.frame = NSRect(x: p, y: height - 2, width: width - 2 * p, height: codeHeight)
+            root.addSubview(code)
+            height = code.frame.maxY + p
+        }
+        root.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        preferredContentSize = root.frame.size
+        view = root
     }
 
-    @objc private func previousChange() {
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // The popover would otherwise focus its first button and draw a focus ring on it.
+        view.window?.makeFirstResponder(nil)
+    }
+
+    private func go(forward: Bool) {
+        guard let editor else { return }
+        let line = min(hunk.newStart, editor.document.lines.count - 1)
         GitChangePopover.current?.close()
-        editor?.gotoChange(forward: false)
+        editor.gotoChange(forward: forward, from: line)
     }
 
-    @objc private func nextChange() {
-        GitChangePopover.current?.close()
-        editor?.gotoChange(forward: true)
-    }
-
-    @objc private func revertChange() {
+    private func revert() {
         GitChangePopover.current?.close()
         editor?.revertGitChange(hunk)
     }
