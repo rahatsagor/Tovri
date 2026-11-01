@@ -9,6 +9,41 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-01
+
+### Changed
+
+- **Close Folder** has a keyboard shortcut: ⌃⌘W.
+
+### Fixed
+
+- The closed-folder bug still happened across restarts: close a folder
+  window, quit Tovri, relaunch it and open a single file, and the closed
+  window came back along with the file. Now a window you closed before
+  quitting only comes back if it has unsaved changes.
+- The popover for a Git change (click a marker in the gutter) had no
+  padding and cut off its title, and **Next Change** and **Previous Change**
+  stepped from the text cursor instead of the change shown in the popover.
+- **Find in Files** did nothing when the regular expression was invalid,
+  the folder didn't exist or the search text was empty. It now explains
+  what's wrong.
+- Clicking the padding of an overlay panel such as **Find in Files** closed
+  the panel, and panels drifted off center when the window was resized.
+- ⌘W closed the tab behind **Find in Files** while the panel was open. It
+  now closes the panel.
+- The find bar lost focus when you clicked its buttons, didn't search again
+  when you pressed ⌘E with the bar open, and clipped the "N of M" count.
+- The command palette listed some commands twice, offered commands that
+  can't run right now, and showed an empty list instead of "No matches".
+- A long branch name or commit message in the status bar overlapped the
+  items on the right instead of being truncated.
+- When Tovri saves files in the background, for example because it lost
+  focus, a file that can't be saved no longer opens a dialog per file. A
+  short message appears in the window instead.
+- The completion list could extend past the edge of the screen.
+- Several menu items stayed clickable when they can't do anything, such as
+  **Close Other Tabs** with a single tab open.
+
 ## [0.2.0] - 2026-11-01
 
 ### Changed
@@ -145,6 +180,7 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/rahatsagor/Tovri/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rahatsagor/Tovri/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rahatsagor/Tovri/releases/tag/v0.1.0
