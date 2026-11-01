@@ -342,9 +342,13 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     // MARK: Editing bookkeeping
 
+    /// Lines touched by the most recent edit, for editors that keep per-line state.
+    private(set) var lastEditLines: (firstLine: Int, removed: Int, inserted: Int) = (0, 0, 0)
+
     func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions, range editedRange: NSRange, changeInLength delta: Int) {
         guard editedMask.contains(.editedCharacters), !isBulkLoading else { return }
         let r = lines.update(editedRange: editedRange, delta: delta, text: textStorage.mutableString)
+        lastEditLines = r
         syntax.linesChanged(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted)
         editVersion += 1
         dirtyFlag = true
@@ -539,25 +543,37 @@ final class Document: NSObject, NSTextStorageDelegate {
     private var gitDiffScheduled = false
     private var gitGeneration = 0
 
-    /// Fetches the file's contents at HEAD and recomputes the gutter diff.
+    /// What the baseline was read from: the file, its encoding and HEAD's commit.
+    private var gitBaselineSource: String?
+
+    /// Fetches the file's contents at HEAD and recomputes the gutter diff. Running git is skipped
+    /// when HEAD still points at the commit the current baseline came from.
     func refreshGitBaseline() {
-        guard let url, length < 3_000_000, let repo = GitRepository.find(for: url) else {
+        guard Settings.shared.gitGutter, let url, length < 3_000_000, let repo = GitRepository.find(for: url) else {
             // After Save As outside the repository the old file's HEAD copy no longer applies.
             clearGitBaseline()
             return
         }
         let enc = encoding
+        let source = repo.headToken.map { "\(url.path)\n\(enc.rawValue)\n\($0)" }
+        if let source, source == gitBaselineSource, gitBaseline != nil {
+            scheduleGitDiff(delay: 0)
+            return
+        }
         repo.headContents(of: url) { [weak self] data in
-            guard let self, self.url == url else { return }
+            guard let self, self.url == url, Settings.shared.gitGutter else { return }
             let decoded = data.map { TextEncoding.decode($0, preferred: enc) }
             guard let decoded, !decoded.isBinary else { self.clearGitBaseline(); return }
             self.gitBaseline = LineEnding.normalize(decoded.text, rawData: nil).0
+            self.gitBaselineSource = source
             self.scheduleGitDiff(delay: 0)
         }
     }
 
-    private func clearGitBaseline() {
+    /// Drops the committed copy and the diff, e.g. when Git features are turned off.
+    func clearGitBaseline() {
         gitBaseline = nil
+        gitBaselineSource = nil
         gitGeneration += 1
         guard !gitDiff.isEmpty || !gitDiff.hunks.isEmpty else { return }
         gitDiff = LineDiff()

@@ -1,6 +1,6 @@
 import Foundation
 
-enum GitFileStatus {
+enum GitFileStatus: Equatable {
     case modified, added, untracked, deleted, renamed, conflicted, ignored
 
     var letter: String {
@@ -79,18 +79,9 @@ final class GitRepository {
     static let executable: String? = {
         let fm = FileManager.default
         var candidates = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/Library/Developer/CommandLineTools/usr/bin/git"]
-        let p = Process()
-        let pipe = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
-        p.arguments = ["-p"]
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        if (try? p.run()) != nil {
-            p.waitUntilExit()
-            if let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
-                candidates.append(s + "/usr/bin/git")
-            }
+        if let data = runProcess(URL(fileURLWithPath: "/usr/bin/xcode-select"), ["-p"], environment: ProcessInfo.processInfo.environment, timeout: 5),
+           let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            candidates.append(s + "/usr/bin/git")
         }
         return candidates.first { fm.isExecutableFile(atPath: $0) }
     }()
@@ -135,6 +126,34 @@ final class GitRepository {
         let t = head.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.hasPrefix("ref: refs/heads/") { return String(t.dropFirst("ref: refs/heads/".count)) }
         return t.isEmpty ? nil : String(t.prefix(7))
+    }
+
+    /// Identifies the commit HEAD points at by reading .git directly, without running git. Nil when
+    /// it can't be worked out cheaply; callers then treat HEAD as changed.
+    var headToken: String? {
+        let dir = gitDir
+        guard let head = try? String(contentsOf: dir.appendingPathComponent("HEAD"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !head.isEmpty else { return nil }
+        guard head.hasPrefix("ref: ") else { return head }
+        let ref = String(head.dropFirst(5))
+        // Linked worktrees keep their HEAD here but share refs with the main repository.
+        var refDirs = [dir]
+        if let common = try? String(contentsOf: dir.appendingPathComponent("commondir"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !common.isEmpty {
+            refDirs.append(URL(fileURLWithPath: common, relativeTo: dir).standardizedFileURL)
+        }
+        for d in refDirs {
+            if let sha = try? String(contentsOf: d.appendingPathComponent(ref), encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines), !sha.isEmpty { return head + " " + sha }
+        }
+        for d in refDirs {
+            guard let packed = try? String(contentsOf: d.appendingPathComponent("packed-refs"), encoding: .utf8) else { continue }
+            for line in packed.split(separator: "\n") where line.hasSuffix(" " + ref) {
+                return head + " " + line.prefix { $0 != " " }
+            }
+        }
+        // An unborn branch has no commit yet.
+        return refDirs.contains { FileManager.default.fileExists(atPath: $0.appendingPathComponent(ref).path) } ? nil : head + " unborn"
     }
 
     func relativePath(_ url: URL) -> String? {
@@ -189,12 +208,16 @@ final class GitRepository {
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         p.standardInput = FileHandle.nullDevice
+        // waitUntilExit() on a background thread can miss the exit and wait out the whole
+        // timeout, so the exit is signaled by the termination handler instead.
+        let exited = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in exited.signal() }
         do { try p.run() } catch { return nil }
         let output = Output()
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
             output.data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
+            exited.wait()
             done.signal()
         }
         guard done.wait(timeout: .now() + timeout) == .success else {
@@ -245,6 +268,67 @@ final class GitRepository {
         return result
     }
 
+    struct ChangedFile {
+        var path: String
+        var status: GitFileStatus
+        var added: Int?
+        var removed: Int?
+    }
+
+    /// Files with uncommitted changes and their line counts against HEAD. Untracked files count
+    /// every line as added; binary and very large files have no counts. Pass a `status` that was
+    /// just read to skip running `git status` again.
+    func changedFiles(status known: [String: GitFileStatus]? = nil, _ completion: @escaping ([ChangedFile]) -> Void) {
+        GitRepository.queue.async {
+            let status = known ?? self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"])
+                .map(GitRepository.parseStatus) ?? [:]
+            let counts = status.isEmpty ? [:] : (self.run(["diff", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
+            var out: [ChangedFile] = []
+            for (path, st) in status where st != .ignored {
+                var f = ChangedFile(path: path, status: st)
+                if let c = counts[path] {
+                    (f.added, f.removed) = (c.added, c.removed)
+                } else if st == .untracked, let n = GitRepository.lineCount(of: self.root.appendingPathComponent(path)) {
+                    (f.added, f.removed) = (n, 0)
+                }
+                out.append(f)
+            }
+            out.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    /// Parses `git diff --numstat -z`. Binary files report "-" and get no counts.
+    static func parseNumstat(_ data: Data) -> [String: (added: Int, removed: Int)] {
+        var result: [String: (added: Int, removed: Int)] = [:]
+        let parts = data.split(separator: 0, omittingEmptySubsequences: false)
+        var i = 0
+        while i < parts.count {
+            let fields = parts[i].split(separator: 9, maxSplits: 2, omittingEmptySubsequences: false)
+            i += 1
+            guard fields.count == 3 else { continue }
+            var path = String(decoding: fields[2], as: UTF8.self)
+            // A rename leaves the path field empty and is followed by the old and new paths.
+            if path.isEmpty {
+                guard i + 1 < parts.count else { break }
+                path = String(decoding: parts[i + 1], as: UTF8.self)
+                i += 2
+            }
+            guard let a = Int(String(decoding: fields[0], as: UTF8.self)),
+                  let r = Int(String(decoding: fields[1], as: UTF8.self)) else { continue }
+            result[path] = (a, r)
+        }
+        return result
+    }
+
+    static func lineCount(of url: URL) -> Int? {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= 4_000_000,
+              let data = try? Data(contentsOf: url), !data.contains(0) else { return nil }
+        guard !data.isEmpty else { return 0 }
+        let newlines = data.reduce(0) { $1 == 10 ? $0 + 1 : $0 }
+        return newlines + (data.last == 10 ? 0 : 1)
+    }
+
     /// Tracked and untracked files under `dir` that `.gitignore` doesn't exclude, relative to
     /// `dir`, or nil if git can't list them. Runs on the calling thread.
     func unignoredFiles(in dir: URL) -> [String]? {
@@ -272,6 +356,56 @@ final class GitRepository {
                 }
             }
             DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    struct Commit: Equatable {
+        var sha: String
+        var shortSHA: String
+        var author: String
+        var date: Date
+        var subject: String
+        /// The file's path in this commit, which differs from today's after a rename.
+        var path: String
+    }
+
+    /// Commits that changed the file, newest first, following renames.
+    func history(of url: URL, limit: Int = 200, _ completion: @escaping ([Commit]) -> Void) {
+        guard let rel = relativePath(url) else { completion([]); return }
+        GitRepository.queue.async {
+            // -z writes each path as-is, ending in NUL; without it git quotes and escapes
+            // non-ASCII names, tabs, quotes and newlines.
+            let data = self.run(["log", "--follow", "-z", "-n", String(limit), "--format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s", "--name-only", "--", rel])
+            let commits = data.map { GitRepository.parseHistory($0, fallbackPath: rel) } ?? []
+            DispatchQueue.main.async { completion(commits) }
+        }
+    }
+
+    /// Parses `log -z --format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s --name-only`: each record is the
+    /// header, NUL, a newline, then the path ending in NUL. Paths are kept byte for byte.
+    static func parseHistory(_ data: Data, fallbackPath: String) -> [Commit] {
+        data.split(separator: 0x1e).compactMap { record in
+            let parts = record.split(separator: 0, maxSplits: 1, omittingEmptySubsequences: false)
+            guard let headerBytes = parts.first else { return nil }
+            let f = String(decoding: headerBytes, as: UTF8.self)
+                .split(separator: "\u{1f}", maxSplits: 4, omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 5, !f[0].isEmpty, let t = TimeInterval(f[3]) else { return nil }
+            var path = fallbackPath
+            if parts.count > 1 {
+                var rest = parts[1]
+                if rest.first == 10 { rest = rest.dropFirst() }
+                if let end = rest.firstIndex(of: 0) { rest = rest[rest.startIndex..<end] }
+                if !rest.isEmpty { path = String(decoding: rest, as: UTF8.self) }
+            }
+            return Commit(sha: f[0], shortSHA: f[1], author: f[2], date: Date(timeIntervalSince1970: t), subject: f[4], path: path)
+        }
+    }
+
+    /// Raw bytes of `path` (relative to the repository) in `commit`, or nil if it isn't there.
+    func contents(of path: String, at commit: String, _ completion: @escaping (Data?) -> Void) {
+        GitRepository.queue.async {
+            let data = self.run(["show", commit + ":" + path])
+            DispatchQueue.main.async { completion(data) }
         }
     }
 

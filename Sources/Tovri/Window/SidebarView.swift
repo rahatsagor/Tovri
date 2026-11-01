@@ -50,6 +50,9 @@ protocol SidebarDelegate: AnyObject {
     func sidebarRequestsOpenFolder(_ sidebar: SidebarView)
     func sidebar(_ sidebar: SidebarView, findInFolder url: URL)
     func sidebar(_ sidebar: SidebarView, didMove from: URL, to: URL)
+    /// The Changes list was shown and wants current files and line counts.
+    func sidebarNeedsChanges(_ sidebar: SidebarView)
+    func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction)
 }
 
 final class SidebarOutlineView: NSOutlineView {
@@ -127,6 +130,42 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     private var nodesByPath: [String: FileNode] = [:]
     static let topInset: CGFloat = TabBarView.height
 
+    // MARK: Changes view
+
+    private let tabs = SidebarTabs()
+    /// Created the first time the Changes list is shown, and dropped when the feature is turned off.
+    private var changesView: ChangesView?
+    var isShowingChanges: Bool { showsTabs && tabs.selected == .changes }
+    private var showsTabs: Bool { Settings.shared.gitChangesAndHistory && root != nil }
+
+    func setChangeCount(_ n: Int) { tabs.changeCount = n }
+
+    func setChanges(_ files: [GitRepository.ChangedFile]) {
+        tabs.changeCount = files.count
+        changesView?.setFiles(files)
+    }
+
+    func showChanges(_ on: Bool) {
+        guard showsTabs || !on else { return }
+        tabs.selected = on ? .changes : .files
+        selectTab(tabs.selected)
+    }
+
+    private func selectTab(_ tab: SidebarTabs.Tab) {
+        if tab == .changes && changesView == nil {
+            let v = ChangesView()
+            v.onAction = { [weak self] f, action in
+                guard let self else { return }
+                self.delegate?.sidebar(self, change: f, action: action)
+            }
+            addSubview(v)
+            changesView = v
+        }
+        updatePlaceholder()
+        needsLayout = true
+        if tab == .changes { delegate?.sidebarNeedsChanges(self) }
+    }
+
     override var isFlipped: Bool { true }
 
     init() {
@@ -176,6 +215,8 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         placeholder.alignment = .center
         addSubview(placeholder)
         addSubview(openButton)
+        tabs.onSelect = { [weak self] t in self?.selectTab(t) }
+        addSubview(tabs)
 
         NotificationCenter.default.addObserver(self, selector: #selector(applyTheme), name: .themeDidChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: .settingsDidChange, object: nil)
@@ -193,12 +234,21 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         outline.backgroundColor = theme.translucent ? .clear : theme.chromeBackground
         titleLabel.textColor = theme.chromeSecondary
         placeholder.textColor = theme.chromeSecondary
+        tabs.needsDisplay = true
+        changesView?.applyTheme()
         needsDisplay = true
         outline.reloadData()
         openButton.needsDisplay = true
     }
 
     @objc private func settingsChanged() {
+        if !Settings.shared.gitChangesAndHistory, changesView != nil || tabs.selected != .files {
+            tabs.selected = .files
+            changesView?.removeFromSuperview()
+            changesView = nil
+        }
+        updatePlaceholder()
+        needsLayout = true
         guard let root else { return }
         refresh(node: root, recursive: true)
     }
@@ -220,7 +270,15 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
             b.frame = NSRect(x: bx, y: top + 2, width: 22, height: 22)
         }
         titleLabel.frame = NSRect(x: 16, y: top + 6, width: max(40, bx - 22), height: 16)
-        scroll.frame = NSRect(x: 0, y: top + 28, width: bounds.width - 1, height: max(0, bounds.height - top - 28))
+        var contentTop = top + 28
+        tabs.isHidden = !showsTabs
+        if showsTabs {
+            tabs.frame = NSRect(x: 0, y: contentTop, width: bounds.width - 1, height: 30)
+            contentTop += 34
+        }
+        let content = NSRect(x: 0, y: contentTop, width: bounds.width - 1, height: max(0, bounds.height - contentTop))
+        scroll.frame = content
+        changesView?.frame = content
         outline.tableColumns.first?.width = scroll.contentSize.width - 4
         placeholder.frame = NSRect(x: 10, y: top + 60, width: bounds.width - 20, height: 18)
         let w = openButton.intrinsicWidth + 12
@@ -229,10 +287,16 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     private func updatePlaceholder() {
         let none = root == nil
-        headerButtons.forEach { $0.isHidden = none }
+        let changes = isShowingChanges
+        for (i, b) in headerButtons.enumerated() {
+            // In the Changes list only Refresh applies.
+            b.isHidden = none || (changes && i != 2)
+        }
         placeholder.isHidden = !none
         openButton.isHidden = !none
-        scroll.isHidden = none
+        scroll.isHidden = none || changes
+        changesView?.isHidden = none || !changes
+        needsLayout = true
         titleLabel.stringValue = (root?.name ?? "Explorer").uppercased()
     }
 
@@ -354,6 +418,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 
     func setGitStatus(_ status: [String: GitFileStatus]) {
+        guard status != gitStatus else { return }
         gitStatus = status
         var dirs = Set<String>()
         for (path, st) in status where st != .ignored {
@@ -430,7 +495,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         }
     }
 
-    func focusTree() { window?.makeFirstResponder(outline) }
+    func focusTree() {
+        if isShowingChanges, let v = changesView { v.focus() } else { window?.makeFirstResponder(outline) }
+    }
 
     private var menuNode: FileNode?
 
@@ -625,6 +692,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 
     @objc private func refreshMenu() {
+        if isShowingChanges { delegate?.sidebarNeedsChanges(self); return }
         guard let root else { return }
         refresh(node: root, recursive: true)
     }

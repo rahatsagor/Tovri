@@ -75,11 +75,30 @@ final class GutterView: NSView {
         let folds = tlm.folds
         let chevronColor = theme.gutterForeground
         let editor = tv.editor
-        let diff = Settings.shared.gitGutter ? doc.gitDiff : LineDiff()
+        let diff = editor?.lineDiff ?? LineDiff()
         let addedColor = theme.color(.inserted) ?? .systemGreen
         let modifiedColor = theme.color(.changed) ?? .systemOrange
         let deletedColor = theme.color(.deleted) ?? .systemRed
         let baselineShift = tlm.baseline
+        let inline = editor?.inlineDiff
+        let gaps = tlm.hasGaps
+        let deletedTint = deletedColor.withAlphaComponent(theme.isDark ? 0.14 : 0.12)
+        let insertedTint = addedColor.withAlphaComponent(theme.isDark ? 0.11 : 0.10)
+        let lh = tlm.lineHeight
+        let minusAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: max(9, tv.document.font.pointSize - 1), weight: .bold),
+                                                         .foregroundColor: deletedColor]
+        let minus = "−" as NSString
+        let minusSize = minus.size(withAttributes: minusAttrs)
+        func drawRemoved(top: CGFloat, height: CGFloat) {
+            guard height > 0.5 else { return }
+            deletedTint.setFill()
+            NSRect(x: 0, y: top, width: bounds.width, height: height).fill()
+            var row = top
+            while row < top + height - 0.5 {
+                minus.draw(at: NSPoint(x: 8 - minusSize.width / 2 + 1, y: row + (lh - minusSize.height) / 2), withAttributes: minusAttrs)
+                row += lh
+            }
+        }
 
         var line = lines.line(containing: chars.location)
         let endChar = NSMaxRange(chars)
@@ -92,15 +111,26 @@ final class GutterView: NSView {
                 continue
             }
             var frag: NSRect
+            var full: NSRect
             if start >= length {
-                frag = lm.extraLineFragmentRect
-                if frag.height == 0 { break }
+                full = lm.extraLineFragmentRect
+                if full.height == 0 { break }
+                frag = gaps ? tlm.extraTextBand : full
             } else {
                 let g = lm.glyphIndexForCharacter(at: start)
-                frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+                full = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+                frag = gaps ? tlm.textBand(forGlyphAt: g) : full
             }
             let y = frag.minY + yOffset
-            if y > bounds.maxY { break }
+            if full.minY + yOffset > bounds.maxY { break }
+            if gaps {
+                drawRemoved(top: full.minY + yOffset, height: frag.minY - full.minY)
+                if line == lines.count - 1 { drawRemoved(top: full.maxY + yOffset - tlm.trailingGapHeight, height: tlm.trailingGapHeight) }
+            }
+            if inline?.changed.contains(line) == true {
+                insertedTint.setFill()
+                NSRect(x: 0, y: y, width: bounds.width, height: frag.height).fill()
+            }
             if y + frag.height >= dirtyRect.minY {
                 let isActive = activeLines.contains(line)
                 if isActive && Settings.shared.highlightCurrentLine && sels.allSatisfy({ $0.length == 0 }) {
@@ -112,8 +142,9 @@ final class GutterView: NSView {
                         (mark == .added ? addedColor : modifiedColor).setFill()
                         NSBezierPath(roundedRect: NSRect(x: 2, y: y + 1, width: 3, height: frag.height - 2), xRadius: 1.5, yRadius: 1.5).fill()
                     }
-                    // Lines removed after the last line are marked below it.
-                    for top in [diff.deletions.contains(line) ? y : nil,
+                    // Lines removed after the last line are marked below it. While comparing,
+                    // the removed lines themselves are shown instead.
+                    for top in inline != nil ? [] : [diff.deletions.contains(line) ? y : nil,
                                 line == lines.count - 1 && diff.deletions.contains(lines.count) ? y + frag.height : nil].compactMap({ $0 }) {
                         deletedColor.setFill()
                         let tri = NSBezierPath()
@@ -178,7 +209,7 @@ final class GutterView: NSView {
                 : CGFloat.greatestFiniteMagnitude
             let below = editor.gitHunk(at: startLine + 1)
             if let hunk = (below?.isDeletion == true && nextTop - (p.y - tv.textContainerOrigin.y) < 5 ? below : nil) ?? editor.gitHunk(at: startLine) {
-                editor.showGitChange(hunk)
+                editor.showGitChange(hunk, toggle: true)
                 return
             }
         }

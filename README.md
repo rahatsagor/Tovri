@@ -79,9 +79,13 @@ about 45 MB of memory.
 
 #### Review what changed
 Gutter markers show every change since the last commit. Click one to see the
-original or revert it, compare the whole file with **Compare with Last
-Commit** (⇧⌥⌘D), and list every changed file with **Changed Files** (⇧⌥⌘G).
-Ideal for checking what a coding agent touched.
+removed and added lines or revert them. **Compare with Last Commit** (⇧⌥⌘D)
+shows removed lines right in the editor, and the status bar counts changed
+files: click it to list them with the lines each one adds and removes.
+Ideal for checking what a coding agent touched. Turn on **Changes and file
+history** in **Settings → Git** for a Changes list in the sidebar and **File
+History** (⇧⌥⌘H), which compares a file with any earlier commit. Every Git
+feature can be turned off there too.
 
 </td>
 </tr>
@@ -239,7 +243,7 @@ includes `/opt/homebrew/bin` or `/usr/local/bin` (`echo $PATH`).
 
 Tovri uses the Git installed on your Mac. Install the Xcode Command Line
 Tools with `xcode-select --install`, or `brew install git`. Check that
-**Settings → Files → Show changes in the gutter** is on, and that the file is
+**Settings → Git → Use Git** and **Changes in the editor** are on, and that the file is
 inside a Git repository.
 
 </details>

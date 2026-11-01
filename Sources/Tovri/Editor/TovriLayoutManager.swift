@@ -93,7 +93,93 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
         lineFragmentRect.pointee.size.height = lineHeight
         lineFragmentUsedRect.pointee.size.height = lineHeight
         baselineOffset.pointee = baseline
+        if let gaps, let lines = gapLines, glyphRange.length > 0 {
+            let char = characterIndexForGlyph(at: glyphRange.location)
+            let line = lines.line(containing: char)
+            let above = lines.start(of: line) == char ? gaps.above[line] ?? 0 : 0
+            let below = gaps.trailing > 0 && line == lines.count - 1 && NSMaxRange(glyphRange) >= numberOfGlyphs ? gaps.trailing : 0
+            if above + below > 0 {
+                let a = CGFloat(above) * lineHeight
+                lineFragmentRect.pointee.size.height += a + CGFloat(below) * lineHeight
+                lineFragmentUsedRect.pointee.origin.y = lineFragmentRect.pointee.origin.y + a
+                baselineOffset.pointee = baseline + a
+            }
+        }
         return true
+    }
+
+    // MARK: Gaps for removed lines
+
+    /// Rows of space opened for lines removed since the last commit (Compare with Last Commit).
+    struct Gaps: Equatable {
+        /// Line → number of removed lines shown above it.
+        var above: [Int: Int] = [:]
+        /// Removed lines shown below the last line.
+        var trailing = 0
+        var isEmpty: Bool { above.isEmpty && trailing == 0 }
+    }
+
+    /// Nil unless comparing; layout then costs nothing extra.
+    private(set) var gaps: Gaps?
+    private var gapLines: LineIndex?
+    var hasGaps: Bool { gaps != nil }
+
+    /// Sets the gaps and relays out only the lines whose gaps changed.
+    func setGaps(_ new: Gaps?, lines: LineIndex) {
+        let new = new?.isEmpty == true ? nil : new
+        guard new != gaps else { return }
+        let old = gaps
+        gaps = new
+        gapLines = new == nil ? nil : lines
+        guard let storage = textStorage else { return }
+        let len = storage.length
+        var affected = Set(old?.above.keys.map { $0 } ?? []).union(new?.above.keys.map { $0 } ?? [])
+        if (old?.trailing ?? 0) != (new?.trailing ?? 0) { affected.insert(lines.count - 1) }
+        for line in affected where line >= 0 {
+            var r = lines.fullRange(of: min(line, lines.count - 1), textLength: len)
+            // The empty line after a final newline has no characters; relaying out the last one updates it.
+            if r.length == 0 { r = NSRange(location: max(0, len - 1), length: len > 0 ? 1 : 0) }
+            guard r.length > 0 else { continue }
+            invalidateLayout(forCharacterRange: r, actualCharacterRange: nil)
+        }
+    }
+
+    /// The text row of a line fragment, without the gaps opened above or below it.
+    func textBand(forGlyphAt g: Int) -> NSRect {
+        let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+        guard gaps != nil else { return frag }
+        let used = lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil)
+        return NSRect(x: frag.minX, y: used.minY, width: frag.width, height: min(lineHeight, frag.height))
+    }
+
+    var extraTextBand: NSRect {
+        let frag = extraLineFragmentRect
+        guard gaps != nil, frag.height > 0 else { return frag }
+        return NSRect(x: frag.minX, y: extraLineFragmentUsedRect.minY, width: frag.width, height: min(lineHeight, frag.height))
+    }
+
+    /// Height of removed lines shown below the last line; the used rect doesn't include it.
+    var trailingGapHeight: CGFloat { CGFloat(gaps?.trailing ?? 0) * lineHeight }
+
+    /// Shrinks a highlight that lies within one line fragment to that fragment's text row.
+    /// Taller highlights span several lines and keep the gaps between them.
+    func trimmedToText(_ r: NSRect, origin o: NSPoint) -> NSRect {
+        guard gaps != nil, let tc = textContainers.first, numberOfGlyphs > 0 else { return r }
+        let g = glyphIndex(for: NSPoint(x: max(0, r.minX - o.x), y: r.midY - o.y), in: tc)
+        let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil).offsetBy(dx: o.x, dy: o.y)
+        guard frag.height > lineHeight + 0.5, r.minY >= frag.minY - 0.5, r.maxY <= frag.maxY + 0.5 else { return r }
+        let band = textBand(forGlyphAt: g).offsetBy(dx: o.x, dy: o.y)
+        return NSRect(x: r.minX, y: band.minY, width: r.width, height: band.height)
+    }
+
+    override func fillBackgroundRectArray(_ rectArray: UnsafePointer<NSRect>, count rectCount: Int, forCharacterRange charRange: NSRange, color: NSColor) {
+        guard gaps != nil, let tv = firstTextView, rectCount > 0 else {
+            super.fillBackgroundRectArray(rectArray, count: rectCount, forCharacterRange: charRange, color: color)
+            return
+        }
+        let o = tv.textContainerOrigin
+        let rects = (0..<rectCount).map { trimmedToText(rectArray[$0], origin: o) }
+        rects.withUnsafeBufferPointer { super.fillBackgroundRectArray($0.baseAddress!, count: rectCount, forCharacterRange: charRange, color: color) }
     }
 
     // MARK: Folding
@@ -133,6 +219,13 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
         var u = usedRect
         f.size.height = lineHeight
         u.size.height = lineHeight
+        if let gaps, let lines = gapLines, let storage = textStorage,
+           storage.length == 0 || storage.mutableString.character(at: storage.length - 1) == 10 {
+            let above = gaps.above[lines.count - 1] ?? 0
+            let a = CGFloat(above) * lineHeight
+            f.size.height += a + CGFloat(gaps.trailing) * lineHeight
+            u.origin.y = f.origin.y + a
+        }
         super.setExtraLineFragmentRect(f, usedRect: u, textContainer: container)
     }
 

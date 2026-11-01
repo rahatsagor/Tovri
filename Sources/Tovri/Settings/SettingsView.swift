@@ -20,6 +20,7 @@ enum SettingsWindow {
         add("Appearance", "paintpalette", AppearanceSettings(), height: 500)
         add("Editor", "text.cursor", EditorSettings(), height: 672)
         add("Files", "folder", FilesSettings(), height: 712)
+        add("Git", "arrow.triangle.branch", GitSettings(), height: 440)
         add("Key Bindings", "keyboard", KeyBindingsSettings(), height: 600)
         add("Updates", "arrow.triangle.2.circlepath", UpdatesSettings(), height: 300)
         let w = NSWindow(contentViewController: tabs)
@@ -133,13 +134,54 @@ struct EditorSettings: View {
     }
 }
 
+struct GitSettings: View {
+    @AppStorage(Settings.Key.gitEnabled) private var enabled = true
+    @AppStorage(Settings.Key.gitGutter) private var gutter = true
+    @AppStorage(Settings.Key.gitSidebarStatus) private var sidebar = true
+    @AppStorage(Settings.Key.gitStatusBarChanges) private var statusBar = true
+    @AppStorage(Settings.Key.gitChangesAndHistory) private var history = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: $enabled) {
+                    Text("Use Git")
+                    Text("When off, Tovri never runs git or reads .git folders, and every Git feature below is gone.")
+                }
+            }
+            Section("Features") {
+                Toggle(isOn: $gutter) {
+                    Text("Changes in the editor")
+                    Text("Gutter markers, the change card, Revert Change and Compare with Last Commit. Loads the committed copy of each open file.")
+                }
+                Toggle(isOn: $sidebar) {
+                    Text("File status in the sidebar")
+                    Text("Colors changed files and dims ignored ones.")
+                }
+                Toggle(isOn: $statusBar) {
+                    Text("Changed files in the status bar")
+                    Text("Shows how many files have uncommitted changes. Click it to list them.")
+                }
+            }
+            .disabled(!enabled)
+            Section("More") {
+                Toggle(isOn: $history) {
+                    Text("Changes and file history")
+                    Text("A Changes list in the sidebar, and File History (⇧⌥⌘H) to compare a file with any earlier commit. Runs git only while you use them.")
+                }
+            }
+            .disabled(!enabled)
+        }
+        .formStyle(.grouped)
+    }
+}
+
 struct FilesSettings: View {
     @AppStorage(Settings.Key.hotExit) private var hotExit = true
     @AppStorage(Settings.Key.restoreSession) private var restore = true
     @AppStorage(Settings.Key.trimTrailingWhitespace) private var trim = false
     @AppStorage(Settings.Key.ensureNewlineAtEOF) private var newline = false
     @AppStorage(Settings.Key.saveOnFocusLost) private var saveOnFocusLost = false
-    @AppStorage(Settings.Key.gitGutter) private var gitGutter = true
     @AppStorage(Settings.Key.showHiddenFiles) private var hidden = true
     @AppStorage(Settings.Key.hiddenPatterns) private var hiddenPatterns = ".git .svn .hg .DS_Store"
     @AppStorage(Settings.Key.searchExcludes) private var excludes = ""
@@ -191,9 +233,6 @@ struct FilesSettings: View {
                 Toggle("Trim trailing whitespace on save", isOn: $trim)
                 Toggle("Ensure newline at end of file", isOn: $newline)
                 Toggle("Save files when Tovri loses focus", isOn: $saveOnFocusLost)
-            }
-            Section("Git") {
-                Toggle("Show changes in the gutter", isOn: $gitGutter)
             }
             Section("Sidebar & Search") {
                 Toggle("Reveal the active file in the sidebar", isOn: $revealActive)

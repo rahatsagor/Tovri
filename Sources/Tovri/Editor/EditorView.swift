@@ -5,6 +5,7 @@ protocol EditorViewDelegate: AnyObject {
     func editorSelectionDidChange(_ editor: EditorView)
     func editor(_ editor: EditorView, openFindResultPath path: String, line: Int)
     func editor(_ editor: EditorView, openFiles urls: [URL])
+    func editorGitDiffDidChange(_ editor: EditorView)
 }
 
 /// One editing surface for a document: gutter, scrollable text view, minimap and find bar.
@@ -220,6 +221,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         textView.setFrameSize(textView.frame.size)
         textView.constrainScrollPosition()
         layoutFindBar()
+        positionChangeCard()
         colorizeVisible()
     }
 
@@ -243,6 +245,9 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         textView.applyFontMetrics()
         layoutManager.showInvisibles = s.showInvisibles
         textView.scrollPastEnd = s.scrollPastEnd
+        if comparisonLabel == nil ? !s.gitGutter : !s.gitChangesAndHistory { setComparing(false) }
+        if !s.gitGutter { closeChangeCard() }
+        inlineDiff?.invalidateRendering()
         gutter.showsNumbers = s.showLineNumbers
         gutter.updateStyle()
         setWordWrap(wordWrapOverride ?? s.wordWrap)
@@ -263,6 +268,8 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         scrollView.contentView.drawsBackground = !theme.translucent
         scrollView.appearance = theme.appearance
         gutter.updateStyle()
+        inlineDiff?.invalidateRendering()
+        changeCard?.applyTheme()
         colorizer.updateTheme()
         colorizeVisible()
         findBar?.applyTheme()
@@ -358,6 +365,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         if previewMode == .split { preview?.scroll(toLine: topVisibleLine) }
         let scrolledDown = scrollView.contentView.bounds.minY > 1
         if topShadow.isHidden == scrolledDown { topShadow.isHidden = !scrolledDown }
+        positionChangeCard()
         colorizeVisible()
         gutter.needsDisplay = true
         minimap.needsDisplay = true
@@ -369,6 +377,14 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     func documentDidEdit(range: NSRange, delta: Int) {
         adjustFolds(editedRange: range, delta: delta)
+        closeChangeCard()
+        if let d = inlineDiff {
+            let r = document.lastEditLines
+            if d.applyEdit(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted) {
+                layoutManager.setGaps(d.gaps, lines: document.lines)
+            }
+            if comparisonBase != nil { scheduleBaseDiff() }
+        }
         schedulePreviewUpdate()
         colorizer.invalidateAll()
         scheduleRecolor()
@@ -378,6 +394,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func documentDidReload() {
+        closeChangeCard()
         layoutManager.setFoldsStorage([])
         colorizer.clearAll()
         let len = document.length
@@ -396,6 +413,201 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     func documentGitDiffDidChange() {
         gutter.needsDisplay = true
+        if inlineDiff != nil && comparisonBase == nil {
+            if Settings.shared.gitGutter && document.hasGitBaseline {
+                preservingViewport {
+                    inlineDiff = InlineDiff(diff: document.gitDiff, lineCount: document.lines.count)
+                    layoutManager.setGaps(inlineDiff?.gaps, lines: document.lines)
+                }
+            } else {
+                setComparing(false)
+            }
+        }
+        if comparisonLabel == nil, let card = changeCard, !document.gitDiff.hunks.contains(card.hunk) { closeChangeCard() }
+        if pendingCompare, document.hasGitBaseline {
+            pendingCompare = false
+            setComparing(true)
+        }
+        if pendingFirstChange, !document.gitDiff.hunks.isEmpty {
+            pendingFirstChange = false
+            gotoChange(forward: true, from: -1, showCard: false)
+        }
+        delegate?.editorGitDiffDidChange(self)
+    }
+
+    // MARK: Compare with Last Commit
+
+    private(set) var inlineDiff: InlineDiff?
+    var isComparing: Bool { inlineDiff != nil }
+    /// Set when the editor should start comparing once the committed copy has loaded.
+    var pendingCompare = false {
+        didSet {
+            guard pendingCompare else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.pendingCompare = false }
+        }
+    }
+    /// Set when the editor should move to the first change once the diff arrives.
+    var pendingFirstChange = false {
+        didSet {
+            guard pendingFirstChange else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.pendingFirstChange = false }
+        }
+    }
+
+    /// Shows or hides removed lines and change tints in the editor. Returns false when the file
+    /// has no committed copy to compare with.
+    @discardableResult
+    func setComparing(_ on: Bool) -> Bool {
+        if on {
+            guard Settings.shared.gitGutter, document.hasGitBaseline else { return false }
+            if inlineDiff != nil { return true }
+        } else if inlineDiff == nil {
+            // A comparison with an earlier commit may still be computing.
+            comparisonBase = nil
+            comparisonLabel = nil
+            baseDiffGeneration += 1
+            baseLineDiff = LineDiff()
+            gutter.needsDisplay = true
+            return true
+        }
+        closeChangeCard()
+        comparisonBase = nil
+        comparisonLabel = nil
+        baseDiffGeneration += 1
+        baseLineDiff = LineDiff()
+        preservingViewport {
+            inlineDiff = on ? InlineDiff(diff: document.gitDiff, lineCount: document.lines.count) : nil
+            layoutManager.setGaps(inlineDiff?.gaps, lines: document.lines)
+        }
+        delegate?.editorGitDiffDidChange(self)
+        return true
+    }
+
+    /// Text compared with instead of the last commit (File History), and how to name it.
+    private var comparisonBase: String?
+    private(set) var comparisonLabel: String?
+    private var baseDiffGeneration = 0
+    private var baseDiffScheduled = false
+    private var baseLineDiff = LineDiff()
+    private var baseDiffVersion = -1
+
+    /// The changes the gutter, change card, Revert and Next/Previous Change work with: against the
+    /// commit chosen in File History while comparing with it, otherwise against HEAD.
+    var lineDiff: LineDiff {
+        if comparisonLabel != nil { return Settings.shared.gitChangesAndHistory ? baseLineDiff : LineDiff() }
+        return Settings.shared.gitGutter ? document.gitDiff : LineDiff()
+    }
+
+    /// Whether `lineDiff` matches the current text, so a hunk from it can be reverted safely.
+    var isLineDiffCurrent: Bool {
+        comparisonLabel != nil ? baseDiffVersion == document.editVersion : document.isGitDiffCurrent
+    }
+
+    /// Compares the editor with `base`, e.g. the file in an earlier commit, the same way
+    /// Compare with Last Commit does. `completion` runs once the comparison is shown.
+    func compare(withBase base: String, label: String, completion: ((InlineDiff) -> Void)? = nil) {
+        guard Settings.shared.gitChangesAndHistory else { return }
+        closeChangeCard()
+        comparisonBase = base
+        comparisonLabel = label
+        baseLineDiff = LineDiff()
+        baseDiffVersion = -1
+        computeBaseDiff(completion)
+    }
+
+    private func scheduleBaseDiff() {
+        guard !baseDiffScheduled else { return }
+        baseDiffScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.baseDiffScheduled = false
+            self.computeBaseDiff(nil)
+        }
+    }
+
+    private func computeBaseDiff(_ completion: ((InlineDiff) -> Void)?) {
+        guard let base = comparisonBase, !isClosed else { return }
+        baseDiffGeneration += 1
+        let generation = baseDiffGeneration
+        let current = document.string.copy() as! NSString
+        let version = document.editVersion
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let diff = GitRepository.diff(old: base.split(separator: "\n", omittingEmptySubsequences: false),
+                                          new: (current as String).split(separator: "\n", omittingEmptySubsequences: false))
+            DispatchQueue.main.async {
+                guard let self, generation == self.baseDiffGeneration, self.comparisonBase != nil else { return }
+                // Turned off in Settings while diffing.
+                guard Settings.shared.gitChangesAndHistory else { self.setComparing(false); return }
+                // An edit arrived while diffing; its own recompute is already scheduled.
+                guard version == self.document.editVersion else { self.scheduleBaseDiff(); return }
+                let inline = InlineDiff(diff: diff, lineCount: self.document.lines.count)
+                self.baseLineDiff = diff
+                self.baseDiffVersion = version
+                if let card = self.changeCard, !diff.hunks.contains(card.hunk) { self.closeChangeCard() }
+                self.preservingViewport {
+                    self.inlineDiff = inline
+                    self.layoutManager.setGaps(inline.gaps, lines: self.document.lines)
+                }
+                self.delegate?.editorGitDiffDidChange(self)
+                completion?(inline)
+            }
+        }
+    }
+
+    /// Keeps the caret's line (or the top line, if the caret is off screen) at the same place
+    /// on screen while gaps open or close above it.
+    private func preservingViewport(_ change: () -> Void) {
+        let clip = scrollView.contentView
+        let caret = textView.selectedRange().location
+        let caretRect = textView.caretRect(at: caret)
+        let anchor = clip.bounds.intersects(caretRect) ? caret : textView.visibleCharacterRange.location
+        let before = textView.caretRect(at: anchor).minY - clip.bounds.minY
+        change()
+        layoutManager.ensureLayout(forCharacterRange: NSRange(location: anchor, length: min(1, document.length - anchor)))
+        textView.setFrameSize(textView.frame.size)
+        let after = textView.caretRect(at: anchor).minY
+        clip.scroll(to: textView.constrainedScrollPosition(NSPoint(x: clip.bounds.minX, y: after - before)))
+        scrollView.reflectScrolledClipView(clip)
+        textView.needsDisplay = true
+        gutter.needsDisplay = true
+        textView.updateInsertionPointStateAndRestartTimer(true)
+    }
+
+    // MARK: Change card
+
+    private(set) var changeCard: GitChangeCard?
+
+    func showGitChange(_ hunk: DiffHunk, toggle: Bool = false) {
+        if toggle, changeCard?.hunk == hunk { closeChangeCard(); return }
+        closeChangeCard()
+        let card = GitChangeCard(hunk: hunk, editor: self)
+        if let bar = findBar { addSubview(card, positioned: .below, relativeTo: bar) } else { addSubview(card) }
+        changeCard = card
+        positionChangeCard()
+    }
+
+    func closeChangeCard() {
+        changeCard?.removeFromSuperview()
+        changeCard = nil
+    }
+
+    /// Places the card under the change, or above it when there's no room below; closes it once
+    /// the change scrolls out of view.
+    private func positionChangeCard() {
+        guard let card = changeCard else { return }
+        let lines = document.lines
+        let h = card.hunk
+        let first = min(h.newStart, lines.count - 1)
+        let last = max(first, min(h.newEnd, lines.count) - 1)
+        let top = convert(textView.caretRect(at: lines.start(of: first)), from: textView)
+        let bottom = convert(textView.caretRect(at: lines.start(of: last)), from: textView)
+        let visible = scrollView.frame
+        guard bottom.maxY > visible.minY, top.minY < visible.maxY else { closeChangeCard(); return }
+        let width = min(GitChangeCard.maxWidth, max(240, scrollView.textViewportWidth - 28))
+        let height = card.preferredHeight(width: width)
+        var y = bottom.maxY + 4
+        if y + height > bounds.height - 8 { y = top.minY - height - 4 }
+        card.frame = NSRect(x: scrollView.frame.minX + 4, y: max(8, y), width: width, height: height).integral
     }
 
     /// Code is full of identifiers that aren't words, so only prose is checked.
@@ -430,6 +642,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func selectionDidChange() {
+        closeChangeCard()
         if !folds.isEmpty { revealFolds(containing: textView.selectedRange()) }
         gutter.needsDisplay = true
         textView.updateBracketMatch()
@@ -617,7 +830,10 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         focus()
     }
 
-    func cancelOperationFallback() {}
+    func cancelOperationFallback() {
+        if changeCard != nil { closeChangeCard(); return }
+        if isComparing { setComparing(false) }
+    }
 
     func findNext(forward: Bool) {
         if let bar = findBar, !bar.isHidden {

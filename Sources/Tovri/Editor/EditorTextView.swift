@@ -130,7 +130,7 @@ final class EditorTextView: NSTextView {
             // more text is laid out. A logical line count cannot describe that coordinate
             // space: it can leave hundreds of empty viewports after the actual last glyph.
             // usedRect includes TextKit's current extent without forcing full-file layout.
-            let used = max(lm.usedRect(for: tc).maxY, lm.extraLineFragmentRect.maxY)
+            let used = max(lm.usedRect(for: tc).maxY + lm.trailingGapHeight, lm.extraLineFragmentRect.maxY)
             let contentHeight = max(lm.lineHeight, used) + insets
             // Scroll-past-end is useful only once the content fills the viewport.
             let scrollPadding = scrollPastEnd && contentHeight > viewport
@@ -169,6 +169,7 @@ final class EditorTextView: NSTextView {
         lm.enumerateEnclosingRects(forGlyphRange: gr, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0), in: tc) { r, _ in
             out.append(r.offsetBy(dx: origin.x, dy: origin.y))
         }
+        if tovriLayoutManager.hasGaps { out = out.map { tovriLayoutManager.trimmedToText($0, origin: origin) } }
         return out
     }
 
@@ -180,17 +181,18 @@ final class EditorTextView: NSTextView {
         let line = lines.line(containing: min(loc, len))
         let full = lines.fullRange(of: line, textLength: len)
         var r: NSRect
+        let tlm = tovriLayoutManager
         if full.length == 0 {
-            r = lm.extraLineFragmentRect
+            r = tlm.extraTextBand
             if r.height == 0 { r = NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
         } else {
             let gr = lm.glyphRange(forCharacterRange: full, actualCharacterRange: nil)
             guard gr.length > 0 else { return .zero }
-            let first = lm.lineFragmentRect(forGlyphAt: gr.location, effectiveRange: nil)
+            let first = tlm.textBand(forGlyphAt: gr.location)
             if full.length > 5000 || !(textContainer?.widthTracksTextView ?? false) {
                 r = first
             } else {
-                let last = lm.lineFragmentRect(forGlyphAt: NSMaxRange(gr) - 1, effectiveRange: nil)
+                let last = tlm.textBand(forGlyphAt: NSMaxRange(gr) - 1)
                 r = first.union(last)
             }
         }
@@ -203,17 +205,18 @@ final class EditorTextView: NSTextView {
         let len = document.length
         var frag: NSRect
         var x: CGFloat
+        let tlm = tovriLayoutManager
         if len == 0 || (loc >= len && text.character(at: len - 1) == 10) {
-            frag = lm.extraLineFragmentRect
+            frag = tlm.extraTextBand
             if frag.height == 0 { frag = NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
             x = frag.minX + tc.lineFragmentPadding
         } else if loc >= len {
             let g = lm.glyphIndexForCharacter(at: len - 1)
-            frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+            frag = tlm.textBand(forGlyphAt: g)
             x = lm.boundingRect(forGlyphRange: NSRange(location: g, length: 1), in: tc).maxX
         } else {
             let g = lm.glyphIndexForCharacter(at: loc)
-            frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+            frag = tlm.textBand(forGlyphAt: g)
             x = frag.minX + lm.location(forGlyphAt: g).x
         }
         let o = textContainerOrigin
@@ -253,6 +256,8 @@ final class EditorTextView: NSTextView {
             }
         }
 
+        if let diff = editor?.inlineDiff { drawInlineDiff(diff, in: rect, theme: theme) }
+
         if settings.rulerColumn > 0, let tc = textContainer {
             let x = floor(textContainerOrigin.x + tc.lineFragmentPadding + CGFloat(settings.rulerColumn) * charWidth)
             theme.guide.setFill()
@@ -289,6 +294,69 @@ final class EditorTextView: NSTextView {
                 let path = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 1.5), xRadius: 2, yRadius: 2)
                 path.lineWidth = 1
                 path.stroke()
+            }
+        }
+    }
+
+    /// Tints added and changed lines, and draws removed lines in the gaps opened above them.
+    private func drawInlineDiff(_ diff: InlineDiff, in rect: NSRect, theme: Theme) {
+        guard let lm = layoutManager, let tc = textContainer else { return }
+        let tlm = tovriLayoutManager
+        let o = textContainerOrigin
+        let lines = document.lines
+        let len = document.length
+        let gr = lm.glyphRange(forBoundingRect: rect.offsetBy(dx: -o.x, dy: -o.y), in: tc)
+        let cr = lm.characterRange(forGlyphRange: gr, actualGlyphRange: nil)
+        let first = lines.line(containing: cr.location)
+        // The empty line after a final newline has no glyphs, so it is never in `cr`.
+        let last = min(lines.line(containing: NSMaxRange(cr)) + 1, lines.count - 1, first + 2000)
+        guard first <= last else { return }
+        let deletedTint = (theme.color(.deleted) ?? .systemRed).withAlphaComponent(theme.isDark ? 0.14 : 0.12)
+        let insertedTint = (theme.color(.inserted) ?? .systemGreen).withAlphaComponent(theme.isDark ? 0.11 : 0.10)
+        let lh = lineHeight
+        let textX = o.x + tc.lineFragmentPadding
+        let textTop = tlm.baseline - document.font.ascender
+
+        func drawRemoved(_ rows: [NSAttributedString], top: CGFloat) {
+            guard !rows.isEmpty else { return }
+            let band = NSRect(x: 0, y: top, width: bounds.width, height: CGFloat(rows.count) * lh)
+            guard band.intersects(rect) else { return }
+            deletedTint.setFill()
+            band.intersection(rect).fill()
+            let firstRow = max(0, Int((rect.minY - top) / lh))
+            let lastRow = min(rows.count - 1, Int((rect.maxY - top) / lh))
+            guard firstRow <= lastRow else { return }
+            for i in firstRow...lastRow { rows[i].draw(at: NSPoint(x: textX, y: top + CGFloat(i) * lh + textTop)) }
+        }
+
+        for line in first...last {
+            let start = lines.start(of: line)
+            if !tlm.folds.isEmpty, tlm.fold(hiding: start) != nil { continue }
+            let frag: NSRect
+            let band: NSRect
+            if start >= len && (len == 0 || text.character(at: len - 1) == 10) {
+                frag = lm.extraLineFragmentRect
+                band = tlm.extraTextBand
+                if frag.height == 0 { continue }
+            } else {
+                guard start < len || line == lines.count - 1 else { continue }
+                let g = lm.glyphIndexForCharacter(at: min(start, len - 1))
+                frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+                band = tlm.textBand(forGlyphAt: g)
+            }
+            let top = frag.minY + o.y
+            if top > rect.maxY { break }
+            if band.minY > frag.minY + 0.5 { drawRemoved(diff.rows(at: line, document: document), top: top) }
+            if line == lines.count - 1, tlm.trailingGapHeight > 0, len > 0 {
+                let end = lm.lineFragmentRect(forGlyphAt: lm.glyphIndexForCharacter(at: len - 1), effectiveRange: nil)
+                drawRemoved(diff.rows(at: InlineDiff.trailingKey, document: document), top: end.maxY - tlm.trailingGapHeight + o.y)
+            }
+            if diff.changed.contains(line) {
+                let lr = lineRect(forCharacter: start)
+                if lr.intersects(rect) {
+                    insertedTint.setFill()
+                    lr.intersection(rect).fill()
+                }
             }
         }
     }
@@ -349,6 +417,22 @@ final class EditorTextView: NSTextView {
             for k in 0..<levels {
                 NSRect(x: floor(x0 + CGFloat(k) * step), y: lr.minY, width: 1, height: lr.height).fill()
             }
+        }
+    }
+
+    override func updateInsertionPointStateAndRestartTimer(_ restartFlag: Bool) {
+        super.updateInsertionPointStateAndRestartTimer(restartFlag)
+        // Also called while the text view is set up or torn down, without a layout manager.
+        if (layoutManager as? TovriLayoutManager)?.hasGaps == true { fitInsertionIndicators() }
+    }
+
+    /// The system caret spans its whole line fragment; next to removed lines that fragment also
+    /// holds the gap above the text, so the caret is cut back to the text row.
+    func fitInsertionIndicators() {
+        guard selectedRange().length == 0 else { return }
+        let band = caretRect(at: selectedRange().location)
+        for case let indicator as NSTextInsertionIndicator in subviews where abs(indicator.frame.height - band.height) > 1 {
+            indicator.frame = NSRect(x: indicator.frame.minX, y: band.minY, width: indicator.frame.width, height: band.height)
         }
     }
 

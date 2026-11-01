@@ -5,7 +5,7 @@ protocol StatusBarDelegate: AnyObject {
 }
 
 final class StatusBarView: NSView, NSViewToolTipOwner {
-    enum Item: Int, CaseIterable { case branch, position, indentation, encoding, lineEnding, language }
+    enum Item: Int, CaseIterable { case branch, changes, position, indentation, encoding, lineEnding, theme, language }
     static let height: CGFloat = 24
 
     weak var delegate: StatusBarDelegate?
@@ -39,6 +39,8 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
 
     private static let help: [Item: String] = [
         .branch: "Current Git branch",
+        .changes: "Files with uncommitted changes. Click to list them (⇧⌥⌘G).",
+        .theme: "Color theme. Click to choose another.",
         .position: "Cursor line and column. Click to go to a line (⌃G).",
         .indentation: "Indentation used for new lines. Click to switch between spaces and tabs or change the width.",
         .encoding: "Text encoding used to read and save this file. Click to save with or reopen in another encoding.",
@@ -65,8 +67,8 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
     private let font = NSFont.systemFont(ofSize: 11.5)
 
     private static let names: [Item: String] = [
-        .branch: "Git branch", .position: "Cursor position", .indentation: "Indentation",
-        .encoding: "Encoding", .lineEnding: "Line ending", .language: "Language",
+        .branch: "Git branch", .changes: "Changed files", .position: "Cursor position", .indentation: "Indentation",
+        .encoding: "Encoding", .lineEnding: "Line ending", .theme: "Theme", .language: "Language",
     ]
 
     /// Where each item with a value sits; drawing, clicks and accessibility all use this.
@@ -80,15 +82,27 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
             result[.branch] = r
             x = r.maxX + 10
         }
-        if let pos = values[.position] {
-            let r = NSRect(x: x - 6, y: 1, width: (pos as NSString).size(withAttributes: attrs).width + 12, height: bounds.height - 1)
-            result[.position] = r
+        if let changes = values[.changes], !changes.isEmpty {
+            let r = NSRect(x: x - 6, y: 1, width: (changes as NSString).size(withAttributes: attrs).width + 25, height: bounds.height - 1)
+            result[.changes] = r
+            x = r.maxX + 10
+        }
+        // In a narrow window the least useful items go first.
+        let widths = Dictionary(uniqueKeysWithValues: StatusBarView.rightItems.compactMap { item -> (Item, CGFloat)? in
+            guard let v = values[item], !v.isEmpty else { return nil }
+            return (item, (v as NSString).size(withAttributes: attrs).width + 12)
+        })
+        var shown = Set<Item>()
+        var used: CGFloat = 0
+        for item in [Item.language, .position, .indentation, .encoding, .lineEnding, .theme] {
+            guard let w = widths[item], x + used + w + 4 <= bounds.width - 10 else { continue }
+            shown.insert(item)
+            used += w + 4
         }
         var right = bounds.width - 10
-        for item in [Item.language, .lineEnding, .encoding, .indentation] {
-            guard let v = values[item], !v.isEmpty else { continue }
-            let w = (v as NSString).size(withAttributes: attrs).width
-            let r = NSRect(x: right - w - 12, y: 1, width: w + 12, height: bounds.height - 1)
+        for item in StatusBarView.rightItems.reversed() where shown.contains(item) {
+            let w = widths[item] ?? 0
+            let r = NSRect(x: right - w, y: 1, width: w, height: bounds.height - 1)
             result[item] = r
             right = r.minX - 4
         }
@@ -110,8 +124,10 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
     }
 
     private func messageX(_ rects: [Item: NSRect]) -> CGFloat {
-        (rects[.position] ?? rects[.branch]).map { $0.maxX + 10 } ?? 14
+        (rects[.changes] ?? rects[.branch]).map { $0.maxX + 10 } ?? 14
     }
+
+    private static let rightItems: [Item] = [.position, .indentation, .encoding, .lineEnding, .theme, .language]
 
     override func draw(_ dirtyRect: NSRect) {
         let theme = ThemeManager.shared.active
@@ -133,12 +149,21 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
             }
             drawTruncated(branch, x: r.minX + 22, width: r.width - 28, attrs: hover == .branch ? hoverAttrs : attrs)
         }
+        if let r = rects[.changes], let changes = values[.changes] {
+            if hover == .changes {
+                theme.tabHoverBackground.setFill()
+                NSBezierPath(roundedRect: r.insetBy(dx: 0, dy: 2), xRadius: 4, yRadius: 4).fill()
+            }
+            (theme.color(.changed) ?? .systemOrange).setFill()
+            NSBezierPath(ovalIn: NSRect(x: r.minX + 7, y: round(r.midY - 3) + 0.5, width: 6, height: 6)).fill()
+            drawTruncated(changes, x: r.minX + 19, width: r.width - 19, attrs: hover == .changes ? hoverAttrs : attrs)
+        }
         if let m = message ?? flashText {
             let x = messageX(rects)
-            let right = [Item.indentation, .encoding, .lineEnding, .language].compactMap { rects[$0]?.minX }.min() ?? bounds.width - 10
+            let right = StatusBarView.rightItems.compactMap { rects[$0]?.minX }.min() ?? bounds.width - 10
             drawTruncated(m, x: x, width: right - 10 - x, attrs: attrs)
         }
-        for item in [Item.position, .language, .lineEnding, .encoding, .indentation] {
+        for item in StatusBarView.rightItems {
             guard let r = rects[item], let v = values[item] else { continue }
             drawItem(v as NSString, rect: r, attrs: hover == item ? hoverAttrs : attrs, hovered: hover == item, theme: theme)
         }
@@ -211,7 +236,7 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
                 e.setAccessibilityLabel("\(StatusBarView.names[item] ?? ""): \(v)")
                 result.append(e)
             }
-            if item == .position, let m = message ?? flashText {
+            if item == .changes, let m = message ?? flashText {
                 messageElement.setAccessibilityValue(m)
                 result.append(messageElement)
             }

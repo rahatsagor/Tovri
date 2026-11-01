@@ -44,6 +44,13 @@ final class EditorGroup: NSObject, TabBarDelegate {
         e.toggleMarkdownPreviewSplit()
         self.refreshAccessories()
     }
+    private static let compareTip = "Compare with Last Commit (⇧⌥⌘D)\nShow removed lines and tint changed ones in the editor. Press ⎋ to stop."
+    private lazy var compareButton: ToolButton = ToolButton(symbol: "plus.forwardslash.minus", tooltip: EditorGroup.compareTip) { [weak self] in
+        guard let self else { return }
+        self.controller.activate(group: self)
+        self.controller.compareWithLastCommit(nil)
+        self.refreshAccessories()
+    }
     private(set) var tabs: [EditorTab] = []
     private(set) var selectedIndex = -1
 
@@ -58,8 +65,10 @@ final class EditorGroup: NSObject, TabBarDelegate {
         container.addSubview(emptyView)
         container.addSubview(previewButton)
         container.addSubview(splitPreviewButton)
+        container.addSubview(compareButton)
         previewButton.isHidden = true
         splitPreviewButton.isHidden = true
+        compareButton.isHidden = true
         emptyView.onOpen = { [weak self] url in self?.controller.open(url: url) }
         container.onLayout = { [weak self] in self?.layout() }
         NotificationCenter.default.addObserver(self, selector: #selector(docStateChanged(_:)), name: .documentStateDidChange, object: nil)
@@ -84,6 +93,8 @@ final class EditorGroup: NSObject, TabBarDelegate {
         tabBar.frame = NSRect(x: 0, y: 0, width: b.width, height: TabBarView.height)
         previewButton.frame = NSRect(x: b.width - 34, y: 8, width: 26, height: 24)
         splitPreviewButton.frame = NSRect(x: b.width - 62, y: 8, width: 26, height: 24)
+        let markdown = !previewButton.isHidden
+        compareButton.frame = NSRect(x: b.width - (markdown ? 90 : 34), y: 8, width: 26, height: 24)
         let content = NSRect(x: 0, y: TabBarView.height, width: b.width, height: max(0, b.height - TabBarView.height))
         emptyView.frame = content
         activeEditor?.frame = content
@@ -195,7 +206,14 @@ final class EditorGroup: NSObject, TabBarDelegate {
         splitPreviewButton.isHidden = !markdown
         previewButton.isOn = activeEditor?.previewMode == .full
         splitPreviewButton.isOn = activeEditor?.previewMode == .split
-        tabBar.trailingInset = markdown ? 68 : 8
+        // Offered only for files with changes, so it never shows for people who don't use Git.
+        let e = activeEditor
+        let compare = e?.isComparing == true || (Settings.shared.gitGutter && e?.document.gitDiff.hunks.isEmpty == false)
+        compareButton.isHidden = !compare
+        compareButton.isOn = e?.isComparing == true
+        compareButton.toolTip = e?.comparisonLabel.map { "Comparing with \($0)\nClick or press ⎋ to stop." } ?? EditorGroup.compareTip
+        tabBar.trailingInset = (markdown ? 68 : 8) + (compare ? 28 : 0)
+        layout()
     }
 
     // MARK: TabBarDelegate

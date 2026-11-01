@@ -109,11 +109,111 @@ final class ToolButton: NSView {
     }
 }
 
+/// Bordered button for floating cards: an icon, a title, or both.
+final class PillButton: NSView {
+    static let height: CGFloat = 24
+    var onClick: (() -> Void)?
+    let symbol: String?
+    let title: String?
+    /// Colors the icon and title with a token color, e.g. red for Revert.
+    var tintKind: TokenKind? { didSet { needsDisplay = true } }
+    private let font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+    private var hovering = false
+    private var pressed = false
+
+    init(symbol: String? = nil, title: String? = nil, tooltip: String? = nil, action: (() -> Void)? = nil) {
+        self.symbol = symbol
+        self.title = title
+        self.onClick = action
+        super.init(frame: NSRect(x: 0, y: 0, width: PillButton.height, height: PillButton.height))
+        toolTip = tooltip
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    var preferredWidth: CGFloat {
+        guard let title else { return PillButton.height }
+        let w = ceil((title as NSString).size(withAttributes: [.font: font]).width)
+        return w + (symbol == nil ? 18 : 34)
+    }
+
+    private var ownTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = ownTrackingArea { removeTrackingArea(a) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        ownTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
+    override func mouseDown(with event: NSEvent) { pressed = true; needsDisplay = true }
+    override func mouseUp(with event: NSEvent) {
+        pressed = false
+        needsDisplay = true
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .arrow) }
+
+    override func accessibilityLabel() -> String? { toolTip?.components(separatedBy: "\n").first ?? title ?? symbol }
+    override func accessibilityHelp() -> String? { toolTip }
+    override func accessibilityPerformPress() -> Bool {
+        guard let onClick else { return false }
+        onClick()
+        return true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let theme = ThemeManager.shared.active
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
+        (hovering || pressed ? theme.fieldBackground.mix(theme.foreground, pressed ? 0.14 : 0.08) : theme.fieldBackground).setFill()
+        path.fill()
+        theme.chromeBorder.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        let color = tintKind.flatMap { theme.color($0) } ?? theme.foreground
+        var img: NSImage?
+        if let symbol {
+            img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10.5, weight: .bold).applying(.init(paletteColors: [color])))
+        }
+        guard let title else {
+            if let img {
+                let s = img.size
+                img.draw(in: NSRect(x: round((bounds.width - s.width) / 2), y: round((bounds.height - s.height) / 2), width: s.width, height: s.height))
+            }
+            return
+        }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let ts = (title as NSString).size(withAttributes: attrs)
+        var x: CGFloat = 9
+        if let img {
+            let s = img.size
+            img.draw(in: NSRect(x: x, y: round((bounds.height - s.height) / 2), width: s.width, height: s.height))
+            x += 16
+        }
+        (title as NSString).draw(at: NSPoint(x: x, y: round((bounds.height - ts.height) / 2)), withAttributes: attrs)
+    }
+}
+
 /// Rounded, themed single-line text field.
 final class ThemedTextField: NSView {
     let field = FocusTextField()
-    private let placeholder: String
+    /// Set this rather than the field's placeholderString, which the themed placeholder overrides.
+    var placeholder: String { didSet { applyTheme() } }
     var fontSize: CGFloat = 13 { didSet { applyTheme(); needsLayout = true } }
+    /// Optional icon before the text, e.g. a magnifying glass.
+    var leadingSymbol: String? { didSet { applyTheme(); needsLayout = true } }
+    /// Optional muted label at the right edge, e.g. the palette's mode.
+    var trailingText: String = "" { didSet { trailingLabel.stringValue = trailingText; needsLayout = true } }
+    private let iconView = NSImageView()
+    private let trailingLabel = NSTextField(labelWithString: "")
 
     init(placeholder: String) {
         self.placeholder = placeholder
@@ -130,6 +230,10 @@ final class ThemedTextField: NSView {
         field.cell?.wraps = false
         field.onFocusChange = { [weak self] _ in self?.applyTheme() }
         addSubview(field)
+        trailingLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        trailingLabel.alignment = .right
+        addSubview(iconView)
+        addSubview(trailingLabel)
         applyTheme()
     }
 
@@ -150,12 +254,28 @@ final class ThemedTextField: NSView {
         field.placeholderAttributedString = NSAttributedString(string: placeholder, attributes: [
             .foregroundColor: theme.chromeSecondary, .font: NSFont.systemFont(ofSize: fontSize)])
         (field.currentEditor() as? NSTextView)?.insertionPointColor = theme.caret
+        trailingLabel.textColor = theme.chromeSecondary
+        iconView.image = leadingSymbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: fontSize - 1, weight: .medium).applying(.init(paletteColors: [theme.chromeSecondary])))
     }
 
     override func layout() {
         super.layout()
         let h = ceil((field.font ?? .systemFont(ofSize: fontSize)).boundingRectForFont.height) + 2
-        field.frame = NSRect(x: 8, y: round((bounds.height - h) / 2), width: bounds.width - 16, height: h)
+        var x: CGFloat = 8
+        iconView.isHidden = iconView.image == nil
+        if let img = iconView.image {
+            iconView.frame = NSRect(x: 10, y: round((bounds.height - img.size.height) / 2), width: img.size.width, height: img.size.height)
+            x = iconView.frame.maxX + 8
+        }
+        var right = bounds.width - 8
+        trailingLabel.isHidden = trailingText.isEmpty
+        if !trailingText.isEmpty {
+            let w = ceil(trailingLabel.fittingSize.width)
+            trailingLabel.frame = NSRect(x: bounds.width - 12 - w, y: round((bounds.height - 15) / 2), width: w, height: 15)
+            right = trailingLabel.frame.minX - 10
+        }
+        field.frame = NSRect(x: x, y: round((bounds.height - h) / 2), width: max(0, right - x), height: h)
     }
 }
 

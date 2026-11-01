@@ -9,6 +9,56 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
+### Added
+
+- **Compare with Last Commit** (⇧⌥⌘D) now shows the comparison in the editor
+  itself: removed lines appear struck through above the lines that replaced
+  them, and added or changed lines are tinted. You can keep editing; press ⎋
+  to stop. A button for it appears in the tab bar when a file has changes.
+  The old patch view is still there as **File → Show Changes as Patch**.
+- The status bar shows how many files have uncommitted changes. Click it, or
+  use **Changed Files** (⇧⌥⌘G), to list them with the lines each adds and
+  removes; choosing one opens it at its first change.
+- A **Git** settings pane. **Use Git** turns off everything Git-related, and
+  the gutter changes, sidebar status and changed-file count can each be
+  turned off on their own. A feature that's off runs no git commands at all.
+  With Git off, **Find in Files** searches every file instead of skipping
+  the ones Git ignores.
+- **Changes and file history**, off until you turn it on in Settings → Git:
+  - A **Changes** list in the sidebar, next to Files, with the lines each
+    file adds and removes. Right-click a file to compare it or see its
+    history.
+  - **File History** (⇧⌥⌘H) lists the commits that changed the current file.
+    Choose one to compare the file with that version in the editor, the same
+    way Compare with Last Commit works. While comparing, the gutter markers,
+    the change card, **Revert Change** and **Next/Previous Change** all work
+    against that commit.
+- The status bar shows the theme; click it to choose another.
+
+### Changed
+
+- Clicking a change marker opens a card in the editor instead of a popover.
+  It shows the removed and the added lines with syntax colors, which change
+  of how many it is, and buttons for the previous and next change, Revert
+  and close.
+- The sidebar's edge is easier to grab and highlights while you drag it.
+  Double-click it to reset the sidebar's width.
+- The palette shows what it's searching (files, commands, themes…) and its
+  keys at the bottom.
+- The cursor position moved to the right side of the status bar.
+- Tovri runs git less often: it no longer reloads each open file's committed
+  version every time the window is focused unless a commit was made, and the
+  status bar no longer looks up the branch on every cursor move.
+
+### Fixed
+
+- Change markers, sidebar colors and other Git information could
+  occasionally take 30 seconds to appear: Tovri sometimes missed that a git
+  command had finished and waited for its time limit.
+- The palette's search field never showed its placeholder text.
+
 ## [0.2.1] - 2026-11-01
 
 ### Changed
@@ -180,7 +230,8 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rahatsagor/Tovri/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rahatsagor/Tovri/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rahatsagor/Tovri/releases/tag/v0.1.0
