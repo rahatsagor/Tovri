@@ -94,11 +94,11 @@ final class FileSearcher {
         return Result(text: text, matches: total, files: fileCount, scanned: files.count)
     }
 
-    /// In a Git repository, the files Git doesn't ignore; elsewhere, every file. Both skip the
-    /// folders and names in `excludes`.
+    /// In a Git repository, the files Git doesn't ignore; elsewhere, or with Git turned off in
+    /// Settings, every file. Both skip the folders and names in `excludes`.
     static func files(in root: URL, excludes: Set<String>, limit: Int) -> [String] {
         let dir = URL(fileURLWithPath: root.path, isDirectory: true)
-        guard let listed = GitRepository.find(for: dir)?.unignoredFiles(in: dir) else {
+        guard Settings.shared.gitEnabled, let listed = GitRepository.find(for: dir)?.unignoredFiles(in: dir) else {
             return ProjectIndex.enumerate(root: root, excludes: excludes, limit: limit)
         }
         var out: [String] = []
@@ -188,7 +188,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         findField.field.toolTip = "Text or pattern to search for"
         whereField.field.toolTip = "Folder to search (searched recursively). Defaults to the open folder; ~ is allowed."
         includeField.field.toolTip = "Only search files matching these patterns, separated by commas.\nPatterns without a slash match file names (*.swift); patterns with a slash match paths (src/*)."
-        excludeField.field.toolTip = "Skip files matching these patterns, e.g. *.min.js, dist/*.\nFiles ignored by Git and folders listed in Settings → Files are always skipped."
+        excludeField.field.toolTip = "Skip files matching these patterns, e.g. *.min.js, dist/*.\nFiles ignored by Git (unless Git is off in Settings → Git) and folders listed in Settings → Files are always skipped."
         errorLabel.font = .systemFont(ofSize: 11.5)
         errorLabel.textColor = .systemRed
         errorLabel.lineBreakMode = .byTruncatingTail

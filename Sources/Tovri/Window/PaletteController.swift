@@ -11,6 +11,8 @@ struct PaletteItem {
     var action: () -> Void
     var preview: (() -> Void)?
     var positions: [Int] = []
+    /// Shown at the right edge instead of the shortcut, e.g. "+3 −1 M".
+    var trailing: NSAttributedString?
     fileprivate var units: [UInt16] = []
     fileprivate var basenameStart = 0
     fileprivate var score = 0
@@ -79,9 +81,11 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
     private var narrowing: (query: [UInt16], matched: [Int32])?
     private var rowHeight: CGFloat = 32
     private let maxRows = 10
-    private let hint = NSTextField(labelWithString: "↑↓ to navigate    ↩ to open    ⎋ to dismiss")
+    private let footer = PaletteFooter()
 
     var isVisible: Bool { backdrop.superview != nil }
+    /// Names the list on screen, so it can be closed when what it offers is turned off.
+    private(set) var listTag: String?
 
     init(controller: MainWindowController) {
         self.controller = controller
@@ -115,33 +119,50 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         scroll.autohidesScrollers = true
         scroll.scrollerStyle = .overlay
         panel.addSubview(scroll)
-        hint.font = .systemFont(ofSize: 11)
-        hint.alignment = .center
-        panel.addSubview(hint)
+        field.leadingSymbol = "magnifyingglass"
+        panel.addSubview(footer)
+    }
+
+    private static func label(for mode: Mode) -> String {
+        switch mode {
+        case .files: return "Goto Anything"
+        case .commands: return "Commands"
+        case .symbols: return "Symbols"
+        case .projectSymbols: return "Project Symbols"
+        case .line: return "Go to Line"
+        case .list: return ""
+        }
     }
 
     // MARK: Presentation
 
     func show(mode: Mode, initial: String = "") {
         self.mode = mode
+        listTag = nil
         source = []
         onCancel = nil
         switch mode {
-        case .files: field.field.placeholderString = "Search files by name (append :line or @symbol)"
-        case .commands: field.field.placeholderString = "Search commands"; source = controller.paletteCommands()
-        case .symbols: field.field.placeholderString = "Go to symbol"
-        case .projectSymbols: field.field.placeholderString = "Go to symbol in project"
-        case .line: field.field.placeholderString = "Go to line"
+        case .files: field.placeholder = "Search files by name (append :line or @symbol)"
+        case .commands: field.placeholder = "Search commands"; source = controller.paletteCommands()
+        case .symbols: field.placeholder = "Go to symbol"
+        case .projectSymbols: field.placeholder = "Go to symbol in project"
+        case .line: field.placeholder = "Go to line"
         case .list: break
         }
+        field.trailingText = PaletteController.label(for: mode)
+        footer.tip = mode == .files ? "Add :line or @symbol, or > for commands" : ""
         present(initial: initial)
     }
 
-    func showList(placeholder: String, items: [PaletteItem], selectedIndex: Int = 0, onCancel: (() -> Void)? = nil) {
+    func showList(placeholder: String, items: [PaletteItem], selectedIndex: Int = 0, label: String = "", tip: String = "",
+                  tag: String? = nil, onCancel: (() -> Void)? = nil) {
         mode = .list
+        listTag = tag
         source = items
         self.onCancel = onCancel
-        field.field.placeholderString = placeholder
+        field.placeholder = placeholder
+        field.trailingText = label
+        footer.tip = tip
         present(initial: "")
         if selectedIndex < results.count {
             table.selectRowIndexes(IndexSet(integer: selectedIndex), byExtendingSelection: false)
@@ -189,7 +210,7 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         panel.layer?.backgroundColor = theme.panelBackground.cgColor
         panel.layer?.borderColor = theme.chromeBorder.cgColor
         backdrop.appearance = theme.appearance
-        hint.textColor = theme.chromeSecondary.withAlphaComponent(0.8)
+        footer.needsDisplay = true
         field.applyTheme()
     }
 
@@ -198,17 +219,18 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         let width = min(660, b.width - 60)
         let rows = min(results.count, maxRows)
         let listH = CGFloat(rows) * rowHeight + (rows > 0 ? 8 : 0)
-        let hintH: CGFloat = 26
-        let h = 12 + 36 + 8 + listH + hintH
+        let footerH = PaletteFooter.height
+        let h = 12 + 36 + 8 + listH + footerH
         panel.frame = NSRect(x: round((b.width - width) / 2), y: 52, width: width, height: h)
         field.frame = NSRect(x: 10, y: 10, width: width - 20, height: 36)
         scroll.frame = NSRect(x: 0, y: 54, width: width, height: listH)
-        hint.frame = NSRect(x: 10, y: h - hintH + 4, width: width - 20, height: 16)
+        footer.frame = NSRect(x: 0, y: h - footerH, width: width, height: footerH)
         table.tableColumns.first?.width = width
     }
 
     func close(cancelled: Bool) {
         guard isVisible else { return }
+        listTag = nil
         backdrop.removeFromSuperview()
         if cancelled {
             if let r = restore {
@@ -522,6 +544,7 @@ private final class PaletteCell: NSTableCellView {
     private let detail = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
     private var hasIcon = false
+    private var hasTrailing = false
 
     init() {
         super.init(frame: .zero)
@@ -548,9 +571,14 @@ private final class PaletteCell: NSTableCellView {
         detail.stringValue = item.detail
         detail.font = .systemFont(ofSize: 11.5)
         detail.textColor = theme.chromeSecondary
-        shortcut.stringValue = item.shortcut
-        shortcut.font = .systemFont(ofSize: 12, weight: .medium)
-        shortcut.textColor = theme.chromeSecondary
+        hasTrailing = item.trailing != nil
+        if let t = item.trailing {
+            shortcut.attributedStringValue = t
+        } else {
+            shortcut.stringValue = item.shortcut
+            shortcut.font = .systemFont(ofSize: 12, weight: .medium)
+            shortcut.textColor = theme.chromeSecondary
+        }
         hasIcon = item.icon != nil || item.image != nil
         if let img = item.image {
             icon.image = img
@@ -572,7 +600,7 @@ private final class PaletteCell: NSTableCellView {
             icon.frame = NSRect(x: x, y: (h - 16) / 2, width: 16, height: 16)
             x += 24
         }
-        let sw = shortcut.stringValue.isEmpty ? 0 : shortcut.intrinsicContentSize.width + 4
+        let sw = shortcut.stringValue.isEmpty ? 0 : ceil(hasTrailing ? shortcut.attributedStringValue.size().width : shortcut.intrinsicContentSize.width) + 4
         shortcut.frame = NSRect(x: bounds.width - 20 - sw, y: (h - 16) / 2, width: sw, height: 16)
         if twoLine {
             title.frame = NSRect(x: x, y: 5, width: max(0, bounds.width - x - sw - 28), height: 18)
@@ -583,5 +611,50 @@ private final class PaletteCell: NSTableCellView {
         title.frame = NSRect(x: x, y: (h - 18) / 2, width: max(0, tw), height: 18)
         let dx = title.frame.maxX + 10
         detail.frame = NSRect(x: dx, y: (h - 15) / 2, width: max(0, bounds.width - dx - sw - 28), height: 15)
+    }
+}
+
+/// Key hints under the palette list, drawn as key caps, with an optional tip at the right.
+final class PaletteFooter: NSView {
+    static let height: CGFloat = 32
+    var tip = "" { didSet { needsDisplay = true } }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private static let hints: [([String], String)] = [(["↑", "↓"], "choose"), (["↩"], "open"), (["esc"], "close")]
+
+    override func draw(_ dirtyRect: NSRect) {
+        let theme = ThemeManager.shared.active
+        theme.chromeBorder.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+        let keyFont = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+        let textAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: theme.chromeSecondary]
+        let keyAttrs: [NSAttributedString.Key: Any] = [.font: keyFont, .foregroundColor: theme.foreground]
+        let capH: CGFloat = 18
+        let midY = (bounds.height + 1) / 2
+        var x: CGFloat = 14
+        for (keys, label) in PaletteFooter.hints {
+            for k in keys {
+                let s = k as NSString
+                let size = s.size(withAttributes: keyAttrs)
+                let cap = NSRect(x: x, y: round(midY - capH / 2), width: max(capH, ceil(size.width) + 8), height: capH)
+                let path = NSBezierPath(roundedRect: cap.insetBy(dx: 0.5, dy: 0.5), xRadius: 4, yRadius: 4)
+                theme.fieldBackground.setFill()
+                path.fill()
+                theme.chromeBorder.setStroke()
+                path.stroke()
+                s.draw(at: NSPoint(x: round(cap.midX - size.width / 2), y: round(cap.midY - size.height / 2)), withAttributes: keyAttrs)
+                x = cap.maxX + 3
+            }
+            let l = label as NSString
+            let ls = l.size(withAttributes: textAttrs)
+            l.draw(at: NSPoint(x: x + 3, y: round(midY - ls.height / 2)), withAttributes: textAttrs)
+            x += ls.width + 18
+        }
+        guard !tip.isEmpty else { return }
+        let t = tip as NSString
+        let ts = t.size(withAttributes: textAttrs)
+        guard bounds.width - 14 - ts.width > x else { return }
+        t.draw(at: NSPoint(x: bounds.width - 14 - ts.width, y: round(midY - ts.height / 2)), withAttributes: textAttrs)
     }
 }

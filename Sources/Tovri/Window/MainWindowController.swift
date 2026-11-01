@@ -108,20 +108,57 @@ final class DividerView: NSView {
     var onDrag: ((NSPoint) -> Void)?
     var onDoubleClick: (() -> Void)?
     var drawsLine = true
+    /// Where the line sits within the view, which is wider than the line so it's easy to grab.
+    var lineOffset: CGFloat?
+    private var highlighted = false { didSet { if oldValue != highlighted { needsDisplay = true } } }
+    private var dragging = false
     override var mouseDownCanMoveWindow: Bool { false }
     override func resetCursorRects() { addCursorRect(bounds, cursor: vertical ? .resizeLeftRight : .resizeUpDown) }
+
+    private var ownTrackingArea: NSTrackingArea?
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = ownTrackingArea { removeTrackingArea(a) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        ownTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        // Only light up after a short hover, so passing over the edge doesn't flash it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, let w = self.window else { return }
+            let p = self.convert(w.mouseLocationOutsideOfEventStream, from: nil)
+            if self.bounds.contains(p) { self.highlighted = true }
+        }
+    }
+    override func mouseExited(with event: NSEvent) { if !dragging { highlighted = false } }
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 { onDoubleClick?(); return }
+        dragging = true
+        highlighted = true
     }
     override func mouseDragged(with event: NSEvent) {
         guard let sv = superview else { return }
         onDrag?(sv.convert(event.locationInWindow, from: nil))
     }
+    override func mouseUp(with event: NSEvent) {
+        dragging = false
+        highlighted = bounds.contains(convert(event.locationInWindow, from: nil))
+    }
     override func draw(_ dirtyRect: NSRect) {
+        let theme = ThemeManager.shared.active
+        let pos = lineOffset ?? floor(vertical ? bounds.midX : bounds.midY)
+        if highlighted {
+            theme.accent.withAlphaComponent(0.8).setFill()
+            if vertical { NSRect(x: pos - 1, y: 0, width: 2, height: bounds.height).fill() }
+            else { NSRect(x: 0, y: pos - 1, width: bounds.width, height: 2).fill() }
+            return
+        }
         guard drawsLine else { return }
-        ThemeManager.shared.active.chromeBorder.setFill()
-        if vertical { NSRect(x: floor(bounds.midX), y: 0, width: 1, height: bounds.height).fill() }
-        else { NSRect(x: 0, y: floor(bounds.midY), width: bounds.width, height: 1).fill() }
+        theme.chromeBorder.setFill()
+        if vertical { NSRect(x: pos, y: 0, width: 1, height: bounds.height).fill() }
+        else { NSRect(x: 0, y: pos, width: bounds.width, height: 1).fill() }
     }
 }
 
@@ -187,9 +224,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         statusBar.delegate = self
         rootView.addSubview(sidebar)
         sidebarDivider.drawsLine = false
+        sidebarDivider.toolTip = "Drag to resize the sidebar. Double-click to reset its width."
         sidebarDivider.onDrag = { [weak self] p in
             guard let self else { return }
             self.sidebarWidth = min(max(160, p.x), min(640, self.rootView.bounds.width - 300))
+            Settings.shared.sidebarWidth = Double(self.sidebarWidth)
+            self.rootView.needsLayout = true
+        }
+        sidebarDivider.onDoubleClick = { [weak self] in
+            guard let self else { return }
+            self.sidebarWidth = CGFloat(Settings.defaults[Settings.Key.sidebarWidth] as? Double ?? 240)
             Settings.shared.sidebarWidth = Double(self.sidebarWidth)
             self.rootView.needsLayout = true
         }
@@ -226,7 +270,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         if showSidebar {
             let w = min(sidebarWidth, b.width - 200)
             sidebar.frame = NSRect(x: 0, y: 0, width: w, height: mainH)
-            sidebarDivider.frame = NSRect(x: w - 3, y: 0, width: 6, height: mainH)
+            sidebarDivider.frame = NSRect(x: w - 4, y: 0, width: 8, height: mainH)
+            sidebarDivider.lineOffset = 4
             x = w
         }
         statusBar.isHidden = statusH == 0
@@ -295,6 +340,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             groupDividers.append(d)
         }
         groupRatios = Array(repeating: 1, count: n)
+        // Editors are added below the status bar; the sidebar's edge must stay on top of them to be draggable.
+        rootView.addSubview(sidebarDivider, positioned: .above, relativeTo: groups.last?.container)
         activeGroupIndex = min(activeGroupIndex, n - 1)
         rootView.needsLayout = true
         if oldGroups.count != groups.count { updateGroupFocus() }
@@ -320,7 +367,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     // MARK: Theme and settings
 
-    @objc private func themeChanged() { applyTheme() }
+    @objc private func themeChanged() {
+        applyTheme()
+        updateStatusBar()
+    }
 
     private func applyTheme() {
         let theme = ThemeManager.shared.active
@@ -335,10 +385,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         DispatchQueue.main.async { (self.window as? TovriWindow)?.positionTrafficLights() }
     }
 
+    private var gitConfiguration = MainWindowController.currentGitConfiguration
+
+    private static var currentGitConfiguration: [Bool] {
+        let s = Settings.shared
+        return [s.gitEnabled, s.gitGutter, s.gitSidebarStatus, s.gitStatusBarChanges, s.gitChangesAndHistory]
+    }
+
     @objc private func settingsChanged() {
         rootView.needsLayout = true
+        let git = MainWindowController.currentGitConfiguration
+        if git != gitConfiguration {
+            gitConfiguration = git
+            gitContext = nil
+            refreshGitStatus()
+            for doc in allOpenDocuments() {
+                if Settings.shared.gitGutter { doc.refreshGitBaseline() } else { doc.clearGitBaseline() }
+            }
+            groups.forEach { $0.refreshAccessories() }
+            if !Settings.shared.gitChangesAndHistory, palette.listTag == MainWindowController.historyListTag {
+                palette.close(cancelled: true)
+            }
+            if !Settings.shared.gitEnabled, palette.listTag == MainWindowController.changedFilesListTag {
+                palette.close(cancelled: true)
+            }
+        }
         updateStatusBar()
     }
+
+    private static let historyListTag = "fileHistory"
+    private static let changedFilesListTag = "changedFiles"
 
     @objc private func documentStateChanged(_ n: Notification) {
         guard let d = n.object as? Document else { return }
@@ -428,15 +504,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         } else if doc.isProse, let words = doc.wordCount(updated: { [weak self] in self?.updateStatusBar() }) {
             pos += words == 1 ? "  ·  1 word" : "  ·  \(words.formatted()) words"
         }
-        let repo = GitRepository.find(for: doc.url ?? folderURL ?? URL(fileURLWithPath: "/"))
         statusBar.values = [
-            .branch: (doc.url != nil || folderURL != nil) ? (repo?.branch ?? "") : "",
+            .branch: gitBranch(for: doc),
+            .changes: Settings.shared.gitStatusBarChanges && changedFileCount > 0 ? "\(changedFileCount) changed" : "",
             .position: pos,
             .indentation: doc.indentUsesTabs ? "Tab Size: \(doc.indentWidth)" : "Spaces: \(doc.indentWidth)",
             .encoding: doc.encoding.rawValue,
             .lineEnding: doc.lineEnding.rawValue,
+            .theme: ThemeManager.shared.current.name,
             .language: doc.language.name,
         ]
+    }
+
+    /// The repository and branch for the status bar, looked up once per folder rather than on
+    /// every caret move. Cleared whenever Git status is refreshed.
+    private var gitContext: (key: String, branch: String)?
+
+    private func gitBranch(for doc: Document) -> String {
+        guard Settings.shared.gitEnabled, let base = doc.url ?? folderURL else { return "" }
+        let key = base.hasDirectoryPath ? base.path : base.deletingLastPathComponent().path
+        if let c = gitContext, c.key == key { return c.branch }
+        let branch = GitRepository.find(for: base)?.branch ?? ""
+        gitContext = (key, branch)
+        return branch
     }
 
     // MARK: EditorViewDelegate
@@ -461,6 +551,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     func editor(_ editor: EditorView, openFiles urls: [URL]) {
         for u in urls { open(url: u) }
+    }
+
+    func editorGitDiffDidChange(_ editor: EditorView) {
+        group(containing: editor)?.refreshAccessories()
     }
 
     // MARK: Opening
@@ -642,11 +736,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Git
 
     private var gitStatusPending = false
+    private(set) var changedFileCount = 0
 
+    /// Runs `git status` only for the features that are on: sidebar colors and the changed count.
     func refreshGitStatus() {
-        guard let folder = folderURL, let repo = GitRepository.find(for: folder) else {
+        gitContext = nil
+        let s = Settings.shared
+        guard s.gitNeedsStatus, let folder = folderURL, let repo = GitRepository.find(for: folder) else {
             sidebar.setGitStatus([:])
             sidebar.setIgnoredPaths([])
+            if changedFileCount != 0 {
+                changedFileCount = 0
+                updateStatusBar()
+            }
             return
         }
         guard !gitStatusPending else { return }
@@ -654,13 +756,34 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         repo.status { [weak self] status in
             guard let self else { return }
             self.gitStatusPending = false
+            let s = Settings.shared
+            guard s.gitNeedsStatus else { return }
             var abs: [String: GitFileStatus] = [:]
-            for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
+            if s.gitSidebarStatus {
+                for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
+            }
             self.sidebar.setGitStatus(abs)
+            let changed = status.filter { $0.value != .ignored }
+            self.changedFileCount = s.gitStatusBarChanges ? changed.count : 0
+            if s.gitChangesAndHistory {
+                self.sidebar.setChangeCount(changed.count)
+                // Line counts cost a `git diff`, so they're only read while the list is on screen.
+                if self.sidebar.isShowingChanges {
+                    repo.changedFiles(status: changed) { [weak self] files in
+                        guard let self, Settings.shared.gitChangesAndHistory else { return }
+                        self.sidebar.setChanges(self.withLiveCounts(files, root: repo.root))
+                    }
+                }
+            }
             self.updateStatusBar()
         }
-        repo.ignored { [weak self] list in
-            self?.sidebar.setIgnoredPaths(Set(list.map { repo.root.appendingPathComponent($0).standardizedFileURL.path }))
+        if s.gitSidebarStatus {
+            repo.ignored { [weak self] list in
+                guard Settings.shared.gitSidebarStatus else { return }
+                self?.sidebar.setIgnoredPaths(Set(list.map { repo.root.appendingPathComponent($0).standardizedFileURL.path }))
+            }
+        } else {
+            sidebar.setIgnoredPaths([])
         }
     }
 
@@ -961,7 +1084,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         (window as? TovriWindow)?.positionTrafficLights()
         checkExternalChanges()
         refreshGitStatus()
-        allOpenDocuments().forEach { $0.refreshGitBaseline() }
+        if Settings.shared.gitGutter { allOpenDocuments().forEach { $0.refreshGitBaseline() } }
     }
 
     func windowDidResize(_ notification: Notification) { (window as? TovriWindow)?.positionTrafficLights() }
@@ -1339,7 +1462,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             PaletteItem(title: lang.name, detail: lang.extensions.prefix(4).map { "." + $0 }.joined(separator: " "),
                         icon: lang === doc.language ? "checkmark" : nil) { doc.setLanguage(lang) }
         }
-        palette.showList(placeholder: "Set syntax", items: items, selectedIndex: all.firstIndex { $0 === doc.language } ?? 0)
+        palette.showList(placeholder: "Set syntax", items: items, selectedIndex: all.firstIndex { $0 === doc.language } ?? 0, label: "Syntax")
     }
 
     @objc func showThemePicker(_ sender: Any?) {
@@ -1353,7 +1476,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 Settings.shared.theme = t.name
             }
         }
-        palette.showList(placeholder: "Select theme", items: items, selectedIndex: tm.themes.firstIndex { $0 === current } ?? 0) {
+        palette.showList(placeholder: "Select theme", items: items, selectedIndex: tm.themes.firstIndex { $0 === current } ?? 0,
+                         label: "Themes", tip: "Themes preview as you move") {
             tm.preview(nil)
         }
     }
@@ -1471,6 +1595,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Changes since the last commit
 
     private func flashNoChanges(_ doc: Document?) {
+        if let label = activeEditor?.comparisonLabel, activeEditor?.document === doc {
+            statusBar.flash("No changes compared with \(label)")
+            return
+        }
+        guard Settings.shared.gitGutter else {
+            statusBar.flash(Settings.shared.gitEnabled ? "Changes in the editor are turned off in Settings → Git" : "Git is turned off in Settings → Git")
+            return
+        }
         guard let doc, doc.url != nil else { statusBar.flash("Save the file to compare it with Git"); return }
         statusBar.flash(doc.hasGitBaseline ? "No changes since the last commit" : "“\(doc.displayName)” isn’t tracked by Git")
     }
@@ -1489,9 +1621,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         e.revertGitChange(h)
     }
 
-    /// Opens a read-only diff of the active file, including unsaved edits, against HEAD.
+    /// Shows, in the editor, what changed since the last commit: removed lines struck through
+    /// above the lines that replaced them, and added or changed lines tinted.
     @objc func compareWithLastCommit(_ sender: Any?) {
+        guard let e = activeEditor, !e.document.isTransient else { NSSound.beep(); return }
+        if e.isComparing { e.setComparing(false); return }
+        guard Settings.shared.gitGutter, e.document.hasGitBaseline, e.setComparing(true), let d = e.inlineDiff else {
+            flashNoChanges(e.document)
+            return
+        }
+        statusBar.flash(d.isEmpty ? "No changes since the last commit. Edits show here as you type."
+                                  : "Comparing “\(e.document.displayName)” with the last commit: +\(d.added) −\(d.deleted)")
+    }
+
+    /// Opens a read-only unified diff of the active file, including unsaved edits, against HEAD.
+    @objc func showChangesAsPatch(_ sender: Any?) {
         guard let doc = activeDocument, !doc.isTransient else { NSSound.beep(); return }
+        guard Settings.shared.gitGutter else { flashNoChanges(doc); return }
         guard let diff = doc.unifiedDiffAgainstHead(), !diff.isEmpty else { flashNoChanges(doc); return }
         let name = "\(doc.displayName) — Changes"
         observeChangesSources()
@@ -1527,28 +1673,149 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
     }
 
-    /// Lists files with uncommitted changes, e.g. everything an AI agent just touched.
+    /// Lists files with uncommitted changes and how many lines each adds and removes, e.g.
+    /// everything an AI agent just touched. Choosing one opens it at its first change.
     @objc func showChangedFiles(_ sender: Any?) {
+        guard Settings.shared.gitEnabled else { statusBar.flash("Git is turned off in Settings → Git"); return }
         guard let base = folderURL ?? activeDocument?.url, let repo = GitRepository.find(for: base) else {
             statusBar.flash("Not in a Git repository")
             return
         }
-        repo.status { [weak self] status in
-            guard let self else { return }
+        repo.changedFiles { [weak self] files in
+            guard let self, Settings.shared.gitEnabled else { return }
+            guard !files.isEmpty else { self.statusBar.flash("No uncommitted changes"); return }
             let theme = ThemeManager.shared.active
-            let entries = status.filter { $0.value != .ignored && $0.value != .deleted }.sorted { $0.key < $1.key }
-            guard !entries.isEmpty else { self.statusBar.flash("No changed files"); return }
-            let items = entries.map { rel, st -> PaletteItem in
-                let url = repo.root.appendingPathComponent(rel)
-                let dir = (rel as NSString).deletingLastPathComponent
-                var item = PaletteItem(title: url.lastPathComponent, detail: st.label + (dir.isEmpty ? "" : " · " + dir)) { [weak self] in
-                    self?.open(url: url)
-                }
-                item.image = FileIcons.image(forFileName: url.lastPathComponent, theme: theme, size: 12)
-                item.twoLine = true
+            let items = self.withLiveCounts(files, root: repo.root).map { f -> PaletteItem in
+                let url = repo.root.appendingPathComponent(f.path)
+                let counts = f.added.map { ($0, f.removed ?? 0) }
+                var item = PaletteItem(title: f.path) { [weak self] in self?.openChangedFile(url, status: f.status) }
+                item.image = FileIcons.image(forFileName: url.lastPathComponent, theme: theme, size: 14)
+                item.trailing = MainWindowController.changeSummary(counts, status: f.status, theme: theme)
                 return item
             }
-            self.palette.showList(placeholder: "Changed files (\(entries.count))", items: items)
+            self.palette.showList(placeholder: "Changed files", items: items, label: "Changed Files",
+                                  tip: files.count == 1 ? "1 file with uncommitted changes" : "\(files.count) files with uncommitted changes",
+                                  tag: MainWindowController.changedFilesListTag)
+        }
+    }
+
+    /// Open files with unsaved edits are counted from the editor, so the numbers match what's on screen.
+    private func withLiveCounts(_ files: [GitRepository.ChangedFile], root: URL) -> [GitRepository.ChangedFile] {
+        var live: [String: (Int, Int)] = [:]
+        for d in allOpenDocuments() where d.isDirty && d.hasGitBaseline {
+            guard let path = d.url?.standardizedFileURL.resolvingSymlinksInPath().path else { continue }
+            live[path] = d.gitDiff.hunks.reduce((0, 0)) { ($0.0 + $1.newCount, $0.1 + $1.oldLines.count) }
+        }
+        guard !live.isEmpty else { return files }
+        return files.map { f in
+            var f = f
+            if let l = live[root.appendingPathComponent(f.path).standardizedFileURL.resolvingSymlinksInPath().path] { (f.added, f.removed) = l }
+            return f
+        }
+    }
+
+    // MARK: File history
+
+    /// Lists the commits that changed the active file; choosing one compares the file with it.
+    @objc func showFileHistory(_ sender: Any?) {
+        guard Settings.shared.gitChangesAndHistory else {
+            statusBar.flash("Turn on Changes and file history in Settings → Git")
+            return
+        }
+        guard let e = activeEditor, let url = e.document.url else { statusBar.flash("Save the file to see its history"); return }
+        showHistory(of: url, in: e)
+    }
+
+    private func showHistory(of url: URL, in editor: EditorView) {
+        guard let repo = GitRepository.find(for: url) else { statusBar.flash("“\(url.lastPathComponent)” isn’t in a Git repository"); return }
+        repo.history(of: url) { [weak self, weak editor] commits in
+            guard let self, let editor, Settings.shared.gitChangesAndHistory else { return }
+            guard !commits.isEmpty else { self.statusBar.flash("“\(url.lastPathComponent)” has no commits yet"); return }
+            let theme = ThemeManager.shared.active
+            let when = RelativeDateTimeFormatter()
+            when.unitsStyle = .full
+            let now = Date()
+            let items = commits.map { c -> PaletteItem in
+                var item = PaletteItem(title: c.subject.isEmpty ? "(no message)" : c.subject,
+                                       detail: "\(c.author) · \(when.localizedString(for: c.date, relativeTo: now))") { [weak self, weak editor] in
+                    guard let self, let editor else { return }
+                    self.compare(editor, with: c, in: repo)
+                }
+                item.twoLine = true
+                item.icon = "clock.arrow.circlepath"
+                item.trailing = NSAttributedString(string: c.shortSHA, attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium), .foregroundColor: theme.chromeSecondary])
+                return item
+            }
+            self.palette.showList(placeholder: "Search commits to “\(url.lastPathComponent)”", items: items, label: "File History",
+                                  tip: "Choose a commit to compare the file with it", tag: MainWindowController.historyListTag)
+        }
+    }
+
+    private func compare(_ editor: EditorView, with c: GitRepository.Commit, in repo: GitRepository) {
+        // The list may have stayed open while the feature was turned off.
+        guard Settings.shared.gitChangesAndHistory else { return }
+        let doc = editor.document
+        repo.contents(of: c.path, at: c.sha) { [weak self, weak editor] data in
+            guard let self, let editor, Settings.shared.gitChangesAndHistory else { return }
+            guard let data else { self.statusBar.flash("Couldn’t read the file at \(c.shortSHA)"); return }
+            let decoded = TextEncoding.decode(data, preferred: doc.encoding)
+            guard !decoded.isBinary else { self.statusBar.flash("The file at \(c.shortSHA) isn’t text"); return }
+            let base = LineEnding.normalize(decoded.text, rawData: nil).0
+            editor.compare(withBase: base, label: "\(c.shortSHA) “\(c.subject)”") { [weak self] d in
+                self?.statusBar.flash(d.isEmpty ? "No changes since \(c.shortSHA)"
+                                                : "Comparing with \(c.shortSHA) “\(c.subject)”: +\(d.added) −\(d.deleted). Press ⎋ to stop.")
+            }
+        }
+    }
+
+    // MARK: Sidebar changes
+
+    func sidebarNeedsChanges(_ sidebar: SidebarView) { refreshGitStatus() }
+
+    func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction) {
+        guard let folder = folderURL, let repo = GitRepository.find(for: folder) else { return }
+        let url = repo.root.appendingPathComponent(change.path)
+        switch action {
+        case .open:
+            openChangedFile(url, status: change.status)
+        case .compare:
+            guard change.status != .deleted, let doc = open(url: url), let e = activeEditor, e.document === doc else { return }
+            if doc.hasGitBaseline { compareWithLastCommit(nil) } else { e.pendingCompare = true }
+        case .history:
+            guard change.status != .deleted, let doc = open(url: url), let e = activeEditor, e.document === doc else { return }
+            showHistory(of: url, in: e)
+        case .reveal:
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    /// "+22 −3 M", colored like the gutter.
+    static func changeSummary(_ counts: (Int, Int)?, status: GitFileStatus, theme: Theme) -> NSAttributedString {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
+        let out = NSMutableAttributedString()
+        if let (a, r) = counts {
+            out.append(NSAttributedString(string: "+\(a)", attributes: [.font: font, .foregroundColor: theme.color(.inserted) ?? .systemGreen]))
+            out.append(NSAttributedString(string: " −\(r)", attributes: [.font: font, .foregroundColor: theme.color(.deleted) ?? .systemRed]))
+        }
+        let color: NSColor
+        switch status {
+        case .added, .untracked: color = theme.color(.inserted) ?? .systemGreen
+        case .deleted, .conflicted: color = theme.color(.deleted) ?? .systemRed
+        default: color = theme.color(.changed) ?? .systemOrange
+        }
+        out.append(NSAttributedString(string: (out.length > 0 ? "  " : "") + status.letter,
+                                      attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .bold), .foregroundColor: color]))
+        return out
+    }
+
+    private func openChangedFile(_ url: URL, status: GitFileStatus) {
+        guard status != .deleted else { statusBar.flash("“\(url.lastPathComponent)” was deleted"); return }
+        guard let doc = open(url: url), let e = activeEditor, e.document === doc else { return }
+        if doc.gitDiff.hunks.isEmpty || !doc.isGitDiffCurrent {
+            e.pendingFirstChange = true
+        } else {
+            e.gotoChange(forward: true, from: -1, showCard: false)
         }
     }
 
@@ -1573,7 +1840,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             let items = ordered.map { s in
                 PaletteItem(title: s.name, detail: "\(s.displayPath):\(s.line + 1)", icon: "arrow.turn.down.right") { [weak self] in self?.jump(to: s) }
             }
-            self.palette.showList(placeholder: "Definitions of \(word)", items: items)
+            self.palette.showList(placeholder: "Definitions of \(word)", items: items, label: "Definitions")
         }
     }
 
@@ -1678,10 +1945,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Status bar
 
     func statusBar(_ bar: StatusBarView, clicked item: StatusBarView.Item, at rect: NSRect) {
+        switch item {
+        case .changes: showChangedFiles(nil); return
+        case .theme: showThemePicker(nil); return
+        default: break
+        }
         guard let doc = activeDocument else { return }
         let menu = NSMenu()
         switch item {
-        case .branch:
+        case .branch, .changes, .theme:
             return
         case .position:
             gotoLine(nil)
@@ -1844,6 +2116,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case #selector(moveTabToNextGroup(_:)), #selector(splitTabRight(_:)): return activeTab != nil
         case #selector(saveAllDocuments(_:)): return hasDirtyDocuments
         case #selector(revertChange(_:)): return activeEditor?.gitHunkAtCaret != nil
+        case #selector(compareWithLastCommit(_:)):
+            menuItem.state = activeEditor?.isComparing == true ? .on : .off
+            return s.gitGutter && activeEditor != nil
+        case #selector(nextChange(_:)), #selector(previousChange(_:)):
+            return activeEditor.map { s.gitGutter || $0.comparisonLabel != nil } ?? false
+        case #selector(showChangesAsPatch(_:)):
+            return s.gitGutter && activeEditor != nil
+        case #selector(showChangedFiles(_:)): return s.gitEnabled
+        case #selector(showFileHistory(_:)): return s.gitChangesAndHistory && activeDocument?.url != nil
         case #selector(reopenClosedTab(_:)): return !closedTabs.isEmpty
         case #selector(toggleMarkdownPreview(_:)):
             menuItem.state = activeEditor?.previewMode == .full ? .on : .off

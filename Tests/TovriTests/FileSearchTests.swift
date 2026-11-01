@@ -42,6 +42,23 @@ final class FileSearchTests: XCTestCase {
         XCTAssertEqual(sub.scanned, 2)
     }
 
+    func testWithGitOffSearchRunsNoGitAndListsEveryFile() throws {
+        try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TovriSearch-" + UUID().uuidString).resolvingSymlinksInPath()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try shell("""
+        git init -q .
+        printf 'ignored.txt\\n' > .gitignore
+        echo needle > ignored.txt && echo needle > tracked.txt && git add tracked.txt
+        """, in: root)
+        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
+        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+        let result = try search(root)
+        XCTAssertEqual(result.files, 2)
+        XCTAssertTrue(result.text.contains("ignored.txt:"), "Git's ignore list was used with Git turned off")
+    }
+
     func testSearchingAnEmptyFolderReturnsNoResults() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("TovriSearch-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

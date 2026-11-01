@@ -40,7 +40,11 @@ final class Settings {
         static let sidebarVisible = "sidebarVisible"
         static let sidebarWidth = "sidebarWidth"
         static let saveOnFocusLost = "saveOnFocusLost"
+        static let gitEnabled = "gitEnabled"
         static let gitGutter = "gitGutter"
+        static let gitSidebarStatus = "gitSidebarStatus"
+        static let gitStatusBarChanges = "gitStatusBarChanges"
+        static let gitChangesAndHistory = "gitChangesAndHistory"
         static let quitWhenLastWindowCloses = "quitWhenLastWindowCloses"
         static let revealActiveFile = "revealActiveFile"
         static let markdownPreviewOnOpen = "markdownPreviewOnOpen"
@@ -83,7 +87,11 @@ final class Settings {
         Key.sidebarVisible: true,
         Key.sidebarWidth: 240.0,
         Key.saveOnFocusLost: false,
+        Key.gitEnabled: true,
         Key.gitGutter: true,
+        Key.gitSidebarStatus: true,
+        Key.gitStatusBarChanges: true,
+        Key.gitChangesAndHistory: false,
         Key.quitWhenLastWindowCloses: false,
         Key.revealActiveFile: true,
         Key.markdownPreviewOnOpen: false,
@@ -157,7 +165,16 @@ final class Settings {
     var sidebarWidth: Double { get { min(max(d.double(forKey: Key.sidebarWidth), 140), 600) } set { d.set(newValue, forKey: Key.sidebarWidth) } }
 
     var saveOnFocusLost: Bool { d.bool(forKey: Key.saveOnFocusLost) }
-    var gitGutter: Bool { d.bool(forKey: Key.gitGutter) }
+    /// Off: Tovri never runs git or reads a .git folder. Each Git feature below also needs this.
+    var gitEnabled: Bool { d.bool(forKey: Key.gitEnabled) }
+    /// Change markers, the change card and Compare with Last Commit. Off: no committed copies are loaded or diffed.
+    var gitGutter: Bool { gitEnabled && d.bool(forKey: Key.gitGutter) }
+    var gitSidebarStatus: Bool { gitEnabled && d.bool(forKey: Key.gitSidebarStatus) }
+    var gitStatusBarChanges: Bool { gitEnabled && d.bool(forKey: Key.gitStatusBarChanges) }
+    /// The sidebar's Changes view and File History. Off by default.
+    var gitChangesAndHistory: Bool { gitEnabled && d.bool(forKey: Key.gitChangesAndHistory) }
+    /// Whether anything needs `git status`.
+    var gitNeedsStatus: Bool { gitSidebarStatus || gitStatusBarChanges || gitChangesAndHistory }
     var quitWhenLastWindowCloses: Bool { d.bool(forKey: Key.quitWhenLastWindowCloses) }
     var revealActiveFile: Bool { d.bool(forKey: Key.revealActiveFile) }
     var markdownPreviewOnOpen: Bool { d.bool(forKey: Key.markdownPreviewOnOpen) }
