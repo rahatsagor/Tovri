@@ -44,7 +44,9 @@ final class ToolButton: NSView {
         if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override var acceptsFirstResponder: Bool { true }
+    /// Only keyboard navigation (Tab) focuses a button. A click must leave focus where it was, so
+    /// typing, Return and the find field's shortcuts keep working.
+    override var acceptsFirstResponder: Bool { NSApp.isFullKeyboardAccessEnabled }
 
     override func accessibilityLabel() -> String? {
         toolTip?.components(separatedBy: "\n").first ?? title ?? symbol
@@ -66,7 +68,11 @@ final class ToolButton: NSView {
         }
     }
 
-    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func becomeFirstResponder() -> Bool {
+        if NSApp.currentEvent?.type == .leftMouseDown { return false }
+        needsDisplay = true
+        return true
+    }
     override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
 
     var intrinsicWidth: CGFloat {

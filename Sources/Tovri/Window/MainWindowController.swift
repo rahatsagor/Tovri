@@ -793,6 +793,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     @objc func closeTabCommand(_ sender: Any?) {
         if palette.isVisible { palette.close(cancelled: true); return }
+        if findInFilesPanel.isVisible { findInFilesPanel.close(); return }
         let g = activeGroup
         if g.selectedIndex >= 0 {
             closeTab(in: g, at: g.selectedIndex)
@@ -874,14 +875,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
     }
 
-    func save(_ doc: Document, replacingExternalChanges: Bool = false, completion: ((Bool) -> Void)? = nil) {
+    /// With `interactive` false (automatic saves), a save that would need a question is skipped
+    /// and the document stays unsaved, rather than showing a dialog while Tovri is in the background.
+    func save(_ doc: Document, replacingExternalChanges: Bool = false, interactive: Bool = true, completion: ((Bool) -> Void)? = nil) {
         guard !doc.isTransient else { completion?(true); return }
-        guard doc.url != nil else { saveAs(doc, completion: completion); return }
-        write(doc, to: nil, replacingExternalChanges: replacingExternalChanges, completion: completion)
+        guard doc.url != nil else {
+            if interactive { saveAs(doc, completion: completion) } else { completion?(false) }
+            return
+        }
+        write(doc, to: nil, replacingExternalChanges: replacingExternalChanges, interactive: interactive, completion: completion)
     }
 
     /// Writes `doc` to `target`, or to its own file when nil, after the save-time cleanups.
-    func write(_ doc: Document, to target: URL?, replacingExternalChanges: Bool = false, completion: ((Bool) -> Void)? = nil) {
+    func write(_ doc: Document, to target: URL?, replacingExternalChanges: Bool = false, interactive: Bool = true,
+               completion: ((Bool) -> Void)? = nil) {
         let editor = allGroupsTabs().first { $0.document === doc && $0.editor != nil }?.editor
         if let tv = editor?.textView {
             let cleanups = doc.saveCleanups(to: target)
@@ -894,6 +901,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             if target != nil { updateTitle() }
             refreshGitStatus()
             completion?(true)
+        } catch let error where !interactive {
+            statusBar.flash("“\(doc.displayName)” wasn’t saved automatically: \(MainWindowController.autosaveProblem(error))")
+            completion?(false)
         } catch DocumentError.modifiedOnDisk {
             let alert = NSAlert()
             alert.alertStyle = .warning
@@ -921,6 +931,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             completion?(false)
         }
         updateStatusBar()
+    }
+
+    private static func autosaveProblem(_ error: Error) -> String {
+        switch error {
+        case DocumentError.modifiedOnDisk: return "it changed on disk."
+        case DocumentError.encodingFailed: return "its encoding can’t hold the text."
+        default: return error.localizedDescription
+        }
     }
 
     func saveAs(_ doc: Document, completion: ((Bool) -> Void)? = nil) {
@@ -1346,12 +1364,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         func walk(_ menu: NSMenu, prefix: String) {
             for item in menu.items where !item.isSeparatorItem && !item.isHidden {
                 if let sub = item.submenu {
-                    if ["Open Recent", "Services", "Window"].contains(item.title) { continue }
+                    // Syntax and Theme get their own "Set Syntax:" and "Theme:" entries below.
+                    if ["Open Recent", "Services", "Window", "Syntax", "Theme"].contains(item.title) { continue }
                     walk(sub, prefix: menu === main ? item.title : prefix)
                     continue
                 }
                 guard let action = item.action, !item.title.isEmpty else { continue }
                 if menu.title == "Window" && item.target is NSWindow { continue }
+                guard paletteCanRun(item) else { continue }
                 let target = item.target
                 let title = prefix.isEmpty ? item.title : "\(prefix): \(item.title)"
                 out.append(PaletteItem(title: title, shortcut: MainWindowController.shortcutString(item)) { [weak self] in
@@ -1375,6 +1395,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             })
         }
         return out
+    }
+
+    /// Whether the menu would enable `item` with the editor focused, so the palette only lists
+    /// commands that do something. The chain starts at the editor, not the palette's own field,
+    /// because the palette focuses the editor again before it runs a command.
+    func paletteCanRun(_ item: NSMenuItem) -> Bool {
+        guard let action = item.action else { return false }
+        var target: AnyObject?
+        if let t = item.target {
+            target = t.responds(to: action) ? t : nil
+        } else {
+            var r: NSResponder? = activeEditor?.textView ?? window
+            while let x = r, target == nil {
+                if x.responds(to: action) { target = x }
+                r = x.nextResponder
+            }
+            if target == nil, responds(to: action) { target = self }
+            if target == nil, let d = NSApp.delegate, d.responds(to: action) { target = d }
+        }
+        guard let target else { return false }
+        if let v = target as? NSMenuItemValidation { return v.validateMenuItem(item) }
+        if let v = target as? NSUserInterfaceValidations { return v.validateUserInterfaceItem(item) }
+        return true
     }
 
     static func shortcutString(_ item: NSMenuItem) -> String {
@@ -1795,6 +1838,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case #selector(revealInFinder(_:)), #selector(copyFilePath(_:)), #selector(copyRelativePath(_:)), #selector(revealInSidebar(_:)):
             return activeDocument?.url != nil
         case #selector(closeFolder(_:)): return folderURL != nil
+        case #selector(closeOtherTabs(_:)): return activeGroup.tabs.count > 1
+        case #selector(moveTabLeft(_:)): return activeGroup.selectedIndex > 0
+        case #selector(moveTabRight(_:)): return activeGroup.selectedIndex >= 0 && activeGroup.selectedIndex < activeGroup.tabs.count - 1
+        case #selector(moveTabToNextGroup(_:)), #selector(splitTabRight(_:)): return activeTab != nil
+        case #selector(saveAllDocuments(_:)): return hasDirtyDocuments
+        case #selector(revertChange(_:)): return activeEditor?.gitHunkAtCaret != nil
         case #selector(reopenClosedTab(_:)): return !closedTabs.isEmpty
         case #selector(toggleMarkdownPreview(_:)):
             menuItem.state = activeEditor?.previewMode == .full ? .on : .off

@@ -86,7 +86,7 @@ enum MainMenu {
         add(file, "Close Other Tabs", #selector(MainWindowController.closeOtherTabs(_:)))
         add(file, "Close All Tabs", #selector(MainWindowController.closeAllTabs(_:)), "w", [.command, .option])
         add(file, "Close Window", #selector(NSWindow.performClose(_:)), "w", [.command, .shift])
-        add(file, "Close Folder", #selector(MainWindowController.closeFolder(_:)))
+        add(file, "Close Folder", #selector(MainWindowController.closeFolder(_:)), "w", [.command, .control])
 
         // Edit
         let edit = submenu(main, "Edit")
@@ -138,7 +138,6 @@ enum MainMenu {
         add(folding, "Unfold All", #selector(EditorTextView.unfoldAllCommand(_:)), "]", [.command, .option, .control])
         edit.addItem(.separator())
         add(edit, "Show Completions", #selector(NSTextView.complete(_:)), "\u{1b}", [.option])
-        edit.addItem(.separator())
 
         // Selection
         let sel = submenu(main, "Selection")

@@ -134,7 +134,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         place(wordButton, 26, y: y1)
         place(caseButton, 26, y: y1)
         x -= 2
-        place(countLabel, 80, y: y1 + 5)
+        place(countLabel, max(56, ceil(countLabel.intrinsicContentSize.width) + 4), y: y1 + 5)
         countLabel.frame.size.height = 16
         toggleReplace.frame = NSRect(x: 6, y: y1, width: 20, height: h)
         findField.frame = NSRect(x: 30, y: y1, width: max(80, x - 34), height: h)
@@ -158,6 +158,12 @@ final class FindBar: NSView, NSTextFieldDelegate {
         needsLayout = true
         editor.needsLayout = true
         if v { window?.makeFirstResponder(replaceField.field) }
+    }
+
+    /// Searches again for a query set from outside the bar (Use Selection for Find), keeping focus.
+    func queryDidChange() {
+        syncFromState()
+        search(selectNearest: false, debounce: 0)
     }
 
     func activate() {
@@ -373,6 +379,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         } else {
             countLabel.stringValue = "\(total)\(tooMany ? "+" : "") found"
         }
+        needsLayout = true
     }
 
     func step(forward: Bool) {
@@ -436,5 +443,6 @@ final class FindBar: NSView, NSTextFieldDelegate {
         editor.textView.performEdits(edits, selection: .preserve, actionName: "Replace All")
         search(selectNearest: false, debounce: 0)
         countLabel.stringValue = "Replaced \(edits.count)"
+        needsLayout = true
     }
 }

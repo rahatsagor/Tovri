@@ -75,7 +75,8 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         var result: [Item: NSRect] = [:]
         var x: CGFloat = 14
         if let branch = values[.branch], !branch.isEmpty {
-            let r = NSRect(x: x - 6, y: 1, width: (branch as NSString).size(withAttributes: attrs).width + 30, height: bounds.height - 1)
+            let w = min((branch as NSString).size(withAttributes: attrs).width, StatusBarView.maxBranchWidth)
+            let r = NSRect(x: x - 6, y: 1, width: w + 30, height: bounds.height - 1)
             result[.branch] = r
             x = r.maxX + 10
         }
@@ -94,6 +95,20 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         return result
     }
 
+    private static let maxBranchWidth: CGFloat = 220
+
+    /// Draws `s` on one line, ending in "…" when it is wider than `width`.
+    private func drawTruncated(_ s: String, x: CGFloat, width: CGFloat, attrs: [NSAttributedString.Key: Any]) {
+        guard width > 12 else { return }
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byTruncatingTail
+        var a = attrs
+        a[.paragraphStyle] = para
+        let h = ceil((s as NSString).size(withAttributes: attrs).height)
+        (s as NSString).draw(with: NSRect(x: x, y: round((bounds.height - h) / 2) + 1, width: width, height: h),
+                             options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: a)
+    }
+
     private func messageX(_ rects: [Item: NSRect]) -> CGFloat {
         (rects[.position] ?? rects[.branch]).map { $0.maxX + 10 } ?? 14
     }
@@ -109,8 +124,6 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         let hoverAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: theme.chromeForeground]
 
         if let r = rects[.branch], let branch = values[.branch] {
-            let s = branch as NSString
-            let size = s.size(withAttributes: attrs)
             if hover == .branch {
                 theme.tabHoverBackground.setFill()
                 NSBezierPath(roundedRect: r.insetBy(dx: 0, dy: 2), xRadius: 4, yRadius: 4).fill()
@@ -118,11 +131,12 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
             if let img = FileIcons.image("arrow.triangle.branch", color: theme.chromeSecondary, size: 10) {
                 img.draw(in: NSRect(x: r.minX + 6, y: r.midY - img.size.height / 2, width: img.size.width, height: img.size.height))
             }
-            s.draw(at: NSPoint(x: r.minX + 22, y: r.minY + round((r.height - size.height) / 2)), withAttributes: hover == .branch ? hoverAttrs : attrs)
+            drawTruncated(branch, x: r.minX + 22, width: r.width - 28, attrs: hover == .branch ? hoverAttrs : attrs)
         }
         if let m = message ?? flashText {
-            let s = m as NSString
-            s.draw(at: NSPoint(x: messageX(rects), y: round((bounds.height - s.size(withAttributes: attrs).height) / 2) + 1), withAttributes: attrs)
+            let x = messageX(rects)
+            let right = [Item.indentation, .encoding, .lineEnding, .language].compactMap { rects[$0]?.minX }.min() ?? bounds.width - 10
+            drawTruncated(m, x: x, width: right - 10 - x, attrs: attrs)
         }
         for item in [Item.position, .language, .lineEnding, .encoding, .indentation] {
             guard let r = rects[item], let v = values[item] else { continue }

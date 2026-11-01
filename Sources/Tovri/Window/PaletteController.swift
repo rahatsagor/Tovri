@@ -37,8 +37,22 @@ final class Generation: @unchecked Sendable {
 /// Transparent full-window layer that closes the palette when clicked outside it.
 final class PaletteBackdrop: NSView {
     var onClick: (() -> Void)?
-    override func mouseDown(with event: NSEvent) { onClick?() }
+    /// Lays the panel out again, e.g. to keep it centered when the window is resized.
+    var onResize: (() -> Void)?
     override var isFlipped: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        // A click on a panel's padding or labels reaches the backdrop; only clicks outside dismiss.
+        let p = convert(event.locationInWindow, from: nil)
+        if subviews.contains(where: { !$0.isHidden && $0.frame.contains(p) }) { return }
+        onClick?()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let changed = newSize != frame.size
+        super.setFrameSize(newSize)
+        if changed { onResize?() }
+    }
 }
 
 /// Sublime-style overlay used for Go to Anything, the command palette, symbols and lists.
@@ -73,6 +87,7 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         self.controller = controller
         super.init()
         backdrop.onClick = { [weak self] in self?.close(cancelled: true) }
+        backdrop.onResize = { [weak self] in self?.layout() }
         backdrop.addSubview(panel)
         panel.wantsLayer = true
         panel.layer?.cornerRadius = 11
@@ -236,6 +251,10 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
             results = projectSymbolResults(q)
         case .line:
             results = lineResults(q.hasPrefix(":") ? String(q.dropFirst()) : q)
+        }
+        if results.isEmpty && !q.isEmpty && (mode == .files || mode == .commands || mode == .list) {
+            let files = mode == .files && !q.hasPrefix(">") && !q.hasPrefix("@")
+            results = [PaletteItem(title: files ? "No matching files" : "No matches", action: {})]
         }
         showResults(query: q)
     }

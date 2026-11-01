@@ -11,9 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var appearanceObservation: NSKeyValueObservation?
     private var sessionTimer: Timer?
     private var integrationObserver: AnyCancellable?
-    /// State of the last window closed with the close button, so reopening (or the next launch)
-    /// brings back its tabs and unsaved buffers the way Sublime Text does.
-    private var closedWindowSession: WindowSession?
+    /// Windows closed with the close button, oldest first, so reopening (or the next launch)
+    /// brings back their tabs and unsaved buffers the way Sublime Text does.
+    private var closedWindows: [WindowSession] = []
     let recentMenu = NSMenu(title: "Open Recent")
 
     var activeController: MainWindowController? {
@@ -41,12 +41,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         SessionStore.shared.stateProvider = { [weak self] in
             guard let self else { return [] }
-            return AppDelegate.sessionWindows(open: self.controllers.map { $0.sessionState() }, closed: self.closedWindowSession)
+            return AppDelegate.sessionWindows(open: self.controllers.map { $0.sessionState() }, closed: self.closedWindows)
         }
         NotificationCenter.default.addObserver(self, selector: #selector(documentChangedOnDisk(_:)), name: .documentFileDidChangeOnDisk, object: nil)
 
         if Settings.shared.restoreSession || Settings.shared.hotExit, let session = SessionStore.shared.load(), !session.windows.isEmpty {
             for w in session.windows {
+                if AppDelegate.skipsAtLaunch(w, openingFiles: !pendingURLs.isEmpty) {
+                    closedWindows.append(w)
+                    continue
+                }
                 let c = makeController()
                 c.restore(w)
                 c.showWindow(nil)
@@ -259,7 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidResignActive(_ notification: Notification) {
         guard Settings.shared.saveOnFocusLost else { return }
         for c in controllers {
-            for doc in c.allOpenDocuments() where doc.isDirty && doc.url != nil && !doc.isTransient { c.save(doc) }
+            for doc in c.allOpenDocuments() where doc.isDirty && doc.url != nil && !doc.isTransient { c.save(doc, interactive: false) }
         }
     }
 
@@ -291,7 +295,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Runs from windowShouldClose, while failure can still keep every editor alive.
     func saveSessionBeforeClosingWindow(_ c: MainWindowController) -> Bool {
         guard saveSessionBeforeExit() else { return false }
-        closedWindowSession = c.sessionState()
+        var s = c.sessionState()
+        s.closed = true
+        closedWindows = AppDelegate.remembering(closedWindows, closing: s)
         return true
     }
 
@@ -307,34 +313,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @discardableResult
     private func reopenLastWindowOrCreate() -> MainWindowController {
-        if let s = closedWindowSession {
-            closedWindowSession = nil
-            let c = makeController()
-            c.restore(s)
-            c.showWindow(nil)
-            if c.groups.allSatisfy({ $0.tabs.isEmpty }) && c.folderURL == nil { c.newTab(nil) }
-            return c
-        }
-        return newWindow()
+        guard let s = closedWindows.popLast() else { return newWindow() }
+        return restoreClosed(s)
     }
 
-    /// The window for a file opened from Finder or the command line. With no window open, the
-    /// last closed one comes back only when it holds unsaved changes; otherwise a single file
-    /// gets a fresh window instead of reopening the folder that was closed.
+    private func restoreClosed(_ s: WindowSession) -> MainWindowController {
+        let c = makeController()
+        c.restore(s)
+        c.showWindow(nil)
+        if c.groups.allSatisfy({ $0.tabs.isEmpty }) && c.folderURL == nil { c.newTab(nil) }
+        return c
+    }
+
+    /// The window for a file opened from Finder or the command line. With no window open, a
+    /// closed one comes back only when it holds unsaved changes; otherwise a single file gets a
+    /// fresh window instead of reopening the folder that was closed.
     private func windowForOpening() -> MainWindowController {
         if let c = activeController { return c }
-        if AppDelegate.reopensClosedWindow(closedWindowSession) { return reopenLastWindowOrCreate() }
-        closedWindowSession = nil
+        if let i = closedWindows.lastIndex(where: \.hasUnsavedChanges) { return restoreClosed(closedWindows.remove(at: i)) }
+        closedWindows.removeAll()
         return newWindow()
     }
 
-    static func reopensClosedWindow(_ closed: WindowSession?) -> Bool { closed?.hasUnsavedChanges == true }
+    /// Closing a window forgets earlier closed windows unless they hold unsaved changes, which
+    /// must survive until they are reopened.
+    static func remembering(_ closed: [WindowSession], closing s: WindowSession) -> [WindowSession] {
+        closed.filter(\.hasUnsavedChanges) + [s]
+    }
 
-    /// The windows to save. A closed window is kept while no other window is open, and for as
-    /// long as it holds unsaved changes, so opening another window can't drop them.
-    static func sessionWindows(open: [WindowSession], closed: WindowSession?) -> [WindowSession] {
-        guard let closed, open.isEmpty || closed.hasUnsavedChanges else { return open }
-        return open + [closed]
+    /// Launching Tovri to open files skips a window that was closed before quitting, by the
+    /// same rule as opening a file while Tovri runs with no window.
+    static func skipsAtLaunch(_ w: WindowSession, openingFiles: Bool) -> Bool {
+        openingFiles && w.closed == true && !w.hasUnsavedChanges
+    }
+
+    /// The windows to save: closed windows while no other window is open, and those with unsaved
+    /// changes always, so opening another window can't drop them.
+    static func sessionWindows(open: [WindowSession], closed: [WindowSession]) -> [WindowSession] {
+        open.isEmpty ? closed : open + closed.filter(\.hasUnsavedChanges)
     }
 
     @objc private func documentChangedOnDisk(_ n: Notification) {
@@ -370,9 +386,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let c = activeController {
             c.newTab(nil)
             c.window?.makeKeyAndOrderFront(nil)
-        } else {
-            reopenLastWindowOrCreate()
+            return
         }
+        let c = windowForOpening()
+        // A fresh window already has its empty tab; a reopened one with unsaved changes needs one.
+        if !c.isEmptyWindow { c.newTab(nil) }
+        c.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc func newWindowAction(_ sender: Any?) { newWindow() }
