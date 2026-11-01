@@ -9,6 +9,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
 ### Added
 
 - **Compare with Last Commit** (⇧⌥⌘D) now shows the comparison in the editor
@@ -228,7 +230,8 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rahatsagor/Tovri/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rahatsagor/Tovri/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rahatsagor/Tovri/releases/tag/v0.1.0
