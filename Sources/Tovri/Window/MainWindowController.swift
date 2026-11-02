@@ -179,6 +179,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     private var watcher: FileWatcher?
     private(set) lazy var palette = PaletteController(controller: self)
     private lazy var findInFilesPanel = FindInFilesPanel(controller: self)
+    private(set) lazy var replaceInFiles = ReplaceInFilesController(controller: self)
     private var closedTabs: [URL] = []
     private var sidebarVisible: Bool
     private var sidebarForcedOpen = false
@@ -1465,6 +1466,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     @objc func findPreviousMatch(_ sender: Any?) { activeEditor?.findNext(forward: false) }
     @objc func useSelectionForFindCommand(_ sender: Any?) { activeEditor?.useSelectionForFind() }
     @objc func showFindInFiles(_ sender: Any?) { findInFilesPanel.show(folder: nil) }
+    @objc func showReplaceInFiles(_ sender: Any?) { findInFilesPanel.show(folder: nil, replace: true) }
 
     /// The search shown in the Find Results tab, used when a result is opened.
     private struct FindInFilesSearch {
@@ -2251,6 +2253,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case #selector(showChangesAsPatch(_:)):
             return s.gitGutter && activeEditor != nil
         case #selector(showChangedFiles(_:)): return s.gitEnabled
+        case #selector(undoReplaceInFiles(_:)): return replaceInFiles.canUndo
         case #selector(showFileHistory(_:)): return s.gitChangesAndHistory && activeDocument?.url != nil
         case #selector(reopenClosedTab(_:)): return closedTabs.last { FileManager.default.fileExists(atPath: $0.path) } != nil
         case #selector(toggleMarkdownPreview(_:)):

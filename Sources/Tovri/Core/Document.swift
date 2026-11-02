@@ -586,7 +586,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// original. The rename would drop the old file's metadata, so mode, ownership, ACL, extended
     /// attributes (Finder tags, quarantine), the hidden flag and creation date are copied onto the
     /// new file first.
-    private static func writeFile(_ data: Data, replacing url: URL) throws {
+    static func writeFile(_ data: Data, replacing url: URL) throws {
         let path = url.path
         let fm = FileManager.default
         let existing = try? fm.attributesOfItem(atPath: path)

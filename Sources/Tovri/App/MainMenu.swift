@@ -184,6 +184,8 @@ enum MainMenu {
         add(find, "Use Selection for Find", #selector(MainWindowController.useSelectionForFindCommand(_:)), "e")
         find.addItem(.separator())
         add(find, "Find in Files…", #selector(MainWindowController.showFindInFiles(_:)), "f", [.command, .shift])
+        add(find, "Replace in Files…", #selector(MainWindowController.showReplaceInFiles(_:)), "f", [.command, .option, .shift])
+        add(find, "Undo Replace in Files", #selector(MainWindowController.undoReplaceInFiles(_:)))
 
         // View
         let view = submenu(main, "View")

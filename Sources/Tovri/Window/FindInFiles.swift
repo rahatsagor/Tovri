@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 
 /// Multi-threaded project search. Files are scanned concurrently across all cores.
 final class FileSearcher {
@@ -15,6 +16,17 @@ final class FileSearcher {
         var unsaved: [String: String] = [:]
         /// The languages of documents in `unsaved`, whose word characters Whole Word uses.
         var languages: [String: Language] = [:]
+        /// Lists each matching file in `Result.hits`, with a digest of what was read from disk.
+        var recordsHits = false
+    }
+
+    /// A matching file, for Replace in Files.
+    struct Hit {
+        /// Relative to `Options.root`.
+        var path: String
+        var matches: Int
+        /// The contents the matches were found in; nil for text from `Options.unsaved`.
+        var digest: SHA256.Digest?
     }
 
     struct Result {
@@ -24,6 +36,7 @@ final class FileSearcher {
         var scanned: Int
         /// The search stopped at `maxMatches`, `maxFiles` or `maxMatchesPerFile`; `text` has the first ones.
         var limited = false
+        var hits: [Hit] = []
     }
 
     static let maxMatches = 10_000
@@ -34,6 +47,7 @@ final class FileSearcher {
         var text: String
         var matches: Int
         var truncated: Bool
+        var digest: SHA256.Digest?
     }
 
     private let lock = NSLock()
@@ -103,6 +117,7 @@ final class FileSearcher {
         var results = [Found?](repeating: nil, count: files.count)
         let root = o.root
         let unsaved = o.unsaved
+        let digest = o.recordsHits
         let chunk = 64
         let chunks = (files.count + chunk - 1) / chunk
         var finished = [Bool](repeating: false, count: chunks)
@@ -121,7 +136,7 @@ final class FileSearcher {
                         let url = root.appendingPathComponent(files[i])
                         let isWordChar = FileSearcher.wordTest(o, path: files[i])
                         let hit = unsaved[files[i]].map { FileSearcher.search(text: $0, path: url.path, re, isWordChar: isWordChar) }
-                            ?? FileSearcher.search(url, path: url.path, re, isWordChar: isWordChar)
+                            ?? FileSearcher.search(url, path: url.path, re, isWordChar: isWordChar, digest: digest)
                         if let hit {
                             resultPtr[i] = hit
                             self.record(hit.matches)
@@ -136,6 +151,7 @@ final class FileSearcher {
         var total = 0
         var fileCount = 0
         var limited = false
+        var hits: [Hit] = []
         for (i, found) in results.enumerated() {
             guard finished[i / chunk] else { limited = true; break }
             guard let found else { continue }
@@ -144,8 +160,9 @@ final class FileSearcher {
             total += found.matches
             fileCount += 1
             if found.truncated { limited = true }
+            if o.recordsHits { hits.append(Hit(path: files[i], matches: found.matches, digest: found.digest)) }
         }
-        return Result(text: text, matches: total, files: fileCount, scanned: files.count, limited: limited)
+        return Result(text: text, matches: total, files: fileCount, scanned: files.count, limited: limited, hits: hits)
     }
 
     /// The Find Results text: a header, the matches by file, and a summary.
@@ -199,13 +216,15 @@ final class FileSearcher {
         return LineEnding.normalize(decoded.text, rawData: decoded.encoding == .utf8 ? data : nil).0
     }
 
-    private static func search(_ url: URL, path: String, _ re: NSRegularExpression, isWordChar: ((UInt16) -> Bool)?) -> Found? {
+    private static func search(_ url: URL, path: String, _ re: NSRegularExpression, isWordChar: ((UInt16) -> Bool)?,
+                               digest: Bool) -> Found? {
         // Only regular files: opening a FIFO would wait forever.
         var info = stat()
         guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
               info.st_size > 0, info.st_size < FileSearcher.maxFileSize else { return nil }
         guard let data = try? Document.readFile(url), !data.isEmpty, data.count < FileSearcher.maxFileSize,
-              let s = text(of: data), let found = search(text: s, path: path, re, isWordChar: isWordChar) else { return nil }
+              let s = text(of: data), var found = search(text: s, path: path, re, isWordChar: isWordChar) else { return nil }
+        if digest { found.digest = SHA256.hash(data: data) }
         return found
     }
 
@@ -249,7 +268,7 @@ final class FileSearcher {
     }
 }
 
-/// Overlay form for Find in Files.
+/// Overlay form for Find in Files and Replace in Files.
 final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
     unowned let controller: MainWindowController
     private let backdrop = PaletteBackdrop()
@@ -257,16 +276,20 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
     private let titleLabel = NSTextField(labelWithString: "Find in Files")
     private let errorLabel = NSTextField(labelWithString: "")
     let findField = ThemedTextField(placeholder: "Find")
+    let replaceField = ThemedTextField(placeholder: "Replace")
     let whereField = ThemedTextField(placeholder: "Where (folder)")
     let includeField = ThemedTextField(placeholder: "Include, e.g. *.swift, src/*")
     let excludeField = ThemedTextField(placeholder: "Exclude, e.g. *.min.js")
     private lazy var caseButton: ToolButton = ToolButton(title: "Aa", tooltip: "Match Case\nOnly find text with exactly the same uppercase and lowercase letters.") { [weak self] in self?.caseButton.isOn.toggle() }
     private lazy var wordButton: ToolButton = ToolButton(title: "ab", tooltip: "Whole Word\nOnly match complete words, not parts of longer words.") { [weak self] in self?.wordButton.isOn.toggle() }
-    private lazy var regexButton: ToolButton = ToolButton(title: ".*", tooltip: "Regular Expression\nTreat the search as a regular expression.") { [weak self] in self?.regexButton.isOn.toggle() }
+    private lazy var regexButton: ToolButton = ToolButton(title: ".*", tooltip: "Regular Expression\nTreat the search as a regular expression. Use $1, $2… in Replace to insert captured groups.") { [weak self] in self?.regexButton.isOn.toggle() }
     private lazy var findButton: ToolButton = ToolButton(title: "Find", tooltip: "Search all matching files (↩). Results open in a Find Results tab.") { [weak self] in self?.submit() }
+    private lazy var replaceAllButton: ToolButton = ToolButton(title: "Replace All…", tooltip: "Replace every match in all matching files (↩ in the Replace field). Tovri shows the matches and asks before it changes anything.") { [weak self] in self?.submitReplace() }
     private var lastWhere: String?
     private var lastInclude = ""
     private var lastExclude = ""
+    /// Showing the Replace field and Replace All.
+    private(set) var isReplacing = false
     var isVisible: Bool { backdrop.superview != nil }
 
     init(controller: MainWindowController) {
@@ -283,29 +306,35 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         panel.layer?.shadowRadius = 22
         panel.layer?.shadowOffset = CGSize(width: 0, height: -8)
         titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
-        for f in [findField, whereField, includeField, excludeField] {
+        for f in [findField, replaceField, whereField, includeField, excludeField] {
             f.field.delegate = self
             panel.addSubview(f)
         }
         findField.fontSize = 14
+        replaceField.fontSize = 14
         findField.field.toolTip = "Text or pattern to search for"
+        replaceField.field.toolTip = "Replacement text. With Regular Expression on, $1, $2… insert captured groups and \\n inserts a new line."
         whereField.field.toolTip = "Folder to search (searched recursively). Defaults to the open folder; ~ is allowed."
         includeField.field.toolTip = "Only search files matching these patterns, separated by commas.\nPatterns without a slash match file names (*.swift); patterns with a slash match paths (src/*)."
         excludeField.field.toolTip = "Skip files matching these patterns, e.g. *.min.js, dist/*.\nFiles ignored by Git (unless Git is off in Settings → Git) and folders listed in Settings → Files are always skipped."
         errorLabel.font = .systemFont(ofSize: 11.5)
         errorLabel.textColor = .systemRed
         errorLabel.lineBreakMode = .byTruncatingTail
-        [titleLabel, errorLabel, caseButton, wordButton, regexButton, findButton].forEach(panel.addSubview)
+        [titleLabel, errorLabel, caseButton, wordButton, regexButton, findButton, replaceAllButton].forEach(panel.addSubview)
     }
 
-    func show(folder: URL?) {
+    func show(folder: URL?, replace: Bool = false) {
         guard let content = controller.window?.contentView else { return }
+        isReplacing = replace
+        titleLabel.stringValue = replace ? "Replace in Files" : "Find in Files"
+        replaceField.isHidden = !replace
+        replaceAllButton.isHidden = !replace
         let theme = ThemeManager.shared.active
         panel.layer?.backgroundColor = theme.panelBackground.cgColor
         panel.layer?.borderColor = theme.chromeBorder.cgColor
         backdrop.appearance = theme.appearance
         titleLabel.textColor = theme.chromeSecondary
-        [findField, whereField, includeField, excludeField].forEach { $0.applyTheme() }
+        [findField, replaceField, whereField, includeField, excludeField].forEach { $0.applyTheme() }
         let st = FindState.shared
         // The selection only becomes the shared query when the search runs, so Esc leaves it alone.
         var query = st.query
@@ -317,6 +346,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
             }
         }
         findField.stringValue = query
+        replaceField.stringValue = st.replacement
         errorLabel.stringValue = ""
         caseButton.isOn = st.caseSensitive
         wordButton.isOn = st.wholeWord
@@ -335,7 +365,8 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
     private func layout() {
         let b = backdrop.bounds
         let w = min(640, b.width - 60)
-        panel.frame = NSRect(x: round((b.width - w) / 2), y: 52, width: w, height: 186)
+        let dy: CGFloat = isReplacing ? 40 : 0
+        panel.frame = NSRect(x: round((b.width - w) / 2), y: 52, width: w, height: 186 + dy)
         titleLabel.frame = NSRect(x: 16, y: 12, width: 200, height: 16)
         let fx: CGFloat = 14
         let fw = w - 28
@@ -343,13 +374,20 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         regexButton.frame = NSRect(x: fx + fw - 90, y: 39, width: 28, height: 26)
         wordButton.frame = NSRect(x: fx + fw - 60, y: 39, width: 28, height: 26)
         caseButton.frame = NSRect(x: fx + fw - 30, y: 39, width: 28, height: 26)
-        whereField.frame = NSRect(x: fx, y: 76, width: fw, height: 28)
+        replaceField.frame = NSRect(x: fx, y: 76, width: fw - 96, height: 32)
+        whereField.frame = NSRect(x: fx, y: 76 + dy, width: fw, height: 28)
         let half = (fw - 8) / 2
-        includeField.frame = NSRect(x: fx, y: 112, width: half, height: 28)
-        excludeField.frame = NSRect(x: fx + half + 8, y: 112, width: half, height: 28)
+        includeField.frame = NSRect(x: fx, y: 112 + dy, width: half, height: 28)
+        excludeField.frame = NSRect(x: fx + half + 8, y: 112 + dy, width: half, height: 28)
+        var right = fx + fw
+        if isReplacing {
+            let rw = replaceAllButton.intrinsicWidth + 16
+            replaceAllButton.frame = NSRect(x: right - rw, y: 150 + dy, width: rw, height: 26)
+            right -= rw + 6
+        }
         let bw = findButton.intrinsicWidth + 16
-        findButton.frame = NSRect(x: fx + fw - bw, y: 150, width: bw, height: 26)
-        errorLabel.frame = NSRect(x: fx + 2, y: 155, width: fw - bw - 14, height: 16)
+        findButton.frame = NSRect(x: right - bw, y: 150 + dy, width: bw, height: 26)
+        errorLabel.frame = NSRect(x: fx + 2, y: 155 + dy, width: max(0, right - bw - fx - 14), height: 16)
     }
 
     private func showError(_ message: String, focus field: ThemedTextField) {
@@ -367,20 +405,23 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         switch sel {
-        case #selector(NSResponder.insertNewline(_:)): submit(); return true
+        case #selector(NSResponder.insertNewline(_:)):
+            if isReplacing && control === replaceField.field { submitReplace() } else { submit() }
+            return true
         case #selector(NSResponder.cancelOperation(_:)): close(); return true
         default: return false
         }
     }
 
-    private func submit() {
+    /// The search the form describes, or nil after showing what's wrong with it.
+    private func validatedOptions() -> FileSearcher.Options? {
         let q = findField.stringValue
-        guard !q.isEmpty else { showError("Type something to find.", focus: findField); return }
+        guard !q.isEmpty else { showError("Type something to find.", focus: findField); return nil }
         let whereText = (whereField.stringValue as NSString).expandingTildeInPath
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: whereText, isDirectory: &isDir), isDir.boolValue else {
             showError("There’s no folder at that path.", focus: whereField)
-            return
+            return nil
         }
         let probe = FindState()
         probe.regex = regexButton.isOn
@@ -388,7 +429,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         probe.wholeWord = wordButton.isOn
         guard probe.makeRegex(query: q) != nil else {
             showError("That isn’t a valid regular expression.", focus: findField)
-            return
+            return nil
         }
         let st = FindState.shared
         st.query = q
@@ -398,11 +439,24 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         lastWhere = whereText
         lastInclude = includeField.stringValue
         lastExclude = excludeField.stringValue
-        let options = FileSearcher.Options(query: q, regex: st.regex, caseSensitive: st.caseSensitive, wholeWord: st.wholeWord,
-                                           root: URL(fileURLWithPath: whereText), include: FileSearcher.patterns(lastInclude),
-                                           exclude: FileSearcher.patterns(lastExclude))
+        return FileSearcher.Options(query: q, regex: st.regex, caseSensitive: st.caseSensitive, wholeWord: st.wholeWord,
+                                    root: URL(fileURLWithPath: whereText), include: FileSearcher.patterns(lastInclude),
+                                    exclude: FileSearcher.patterns(lastExclude))
+    }
+
+    private func submit() {
+        guard let options = validatedOptions() else { return }
+        if isReplacing { FindState.shared.replacement = replaceField.stringValue }
         close()
         controller.runFindInFiles(options)
+    }
+
+    private func submitReplace() {
+        guard let options = validatedOptions() else { return }
+        let replacement = replaceField.stringValue
+        FindState.shared.replacement = replacement
+        close()
+        controller.replaceInFiles.start(options, replacement: replacement)
     }
 
     private var window: NSWindow? { controller.window }

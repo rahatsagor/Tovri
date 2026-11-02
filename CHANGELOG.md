@@ -21,6 +21,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A **Backup** settings pane. **Export…** saves your preferences, key
   bindings and custom themes to a file, and **Import…** brings them back,
   on the same Mac or another one.
+- **Replace in Files** (⌥⇧⌘F) replaces text across a folder, with the same
+  options as Find in Files. Tovri lists every match and asks before changing
+  anything. Files open in Tovri change in the editor and stay unsaved, and
+  **Find → Undo Replace in Files** puts back the files the last replace
+  changed, except any you have edited since.
 - **Compare with Saved**, **Compare with Clipboard** and **Compare with
   File…** in the File menu show the differences right in the editor, the same
   way Compare with Last Commit does, and Revert Change undoes single changes.
