@@ -170,6 +170,21 @@ final class GutterView: NSView {
         }
     }
 
+    /// Top of a line's fragment in text container coordinates, or infinity past the end. The empty
+    /// line after a final newline has no glyphs and lives in the extra line fragment.
+    static func top(ofLine line: Int, in tv: EditorTextView) -> CGFloat {
+        guard let lm = tv.layoutManager else { return .greatestFiniteMagnitude }
+        let doc = tv.document
+        guard line < doc.lines.count else { return .greatestFiniteMagnitude }
+        let start = doc.lines.start(of: line)
+        if start >= doc.length {
+            if doc.length > 0 { lm.ensureLayout(forCharacterRange: NSRange(location: doc.length - 1, length: 1)) }
+            let extra = lm.extraLineFragmentRect
+            return extra.height > 0 ? extra.minY : .greatestFiniteMagnitude
+        }
+        return lm.lineFragmentRect(forGlyphAt: lm.glyphIndexForCharacter(at: start), effectiveRange: nil).minY
+    }
+
     private func drawChevron(folded: Bool, y: CGFloat, height: CGFloat, color: NSColor) {
         let name = folded ? "chevron.right" : "chevron.down"
         guard let img = NSImage(systemSymbolName: name, accessibilityDescription: folded ? "Unfold" : "Fold")?
@@ -204,9 +219,7 @@ final class GutterView: NSView {
         let x = convert(event.locationInWindow, from: nil).x
         if x < 14, let editor = tv.editor {
             // A deletion marker straddles the boundary, so a click just above a line also counts.
-            let nextTop = startLine + 1 < doc.lines.count
-                ? lm.lineFragmentRect(forGlyphAt: lm.glyphIndexForCharacter(at: doc.lines.start(of: startLine + 1)), effectiveRange: nil).minY
-                : CGFloat.greatestFiniteMagnitude
+            let nextTop = GutterView.top(ofLine: startLine + 1, in: tv)
             let below = editor.gitHunk(at: startLine + 1)
             if let hunk = (below?.isDeletion == true && nextTop - (p.y - tv.textContainerOrigin.y) < 5 ? below : nil) ?? editor.gitHunk(at: startLine) {
                 editor.showGitChange(hunk, toggle: true)

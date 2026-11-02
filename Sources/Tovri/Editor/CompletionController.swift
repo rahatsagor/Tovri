@@ -158,6 +158,10 @@ final class CompletionController: NSObject, NSTableViewDataSource, NSTableViewDe
         hide()
         let current = tv.selectedRange()
         guard prefixRange.location <= current.location else { return false }
+        if !tv.extraSelections.isEmpty {
+            tv.insertCompletionAtAllCarets(word)
+            return true
+        }
         let range = NSRange(location: prefixRange.location, length: current.location - prefixRange.location)
         tv.breakUndoCoalescing()
         tv.insertCompletionText(word, replacing: range)
@@ -227,6 +231,17 @@ private final class CompletionCell: NSTableCellView {
 }
 
 extension EditorTextView {
+    /// Replaces the word typed so far before each caret (or each selection) with `word`.
+    func insertCompletionAtAllCarets(_ word: String) {
+        let edits = allSelections.map { r -> TextEdit in
+            guard r.length == 0 else { return TextEdit(r, word) }
+            var a = r.location
+            while a > 0 && isWordChar(char(a - 1)) { a -= 1 }
+            return TextEdit(NSRange(location: a, length: r.location - a), word)
+        }
+        performEdits(edits, actionName: "Completion")
+    }
+
     func insertCompletionText(_ word: String, replacing range: NSRange) {
         if shouldChangeText(in: range, replacementString: word) {
             textStorage?.replaceCharacters(in: range, with: NSAttributedString(string: word, attributes: typingAttributes))

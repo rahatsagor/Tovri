@@ -4,17 +4,41 @@ extension EditorTextView {
     private var len: Int { document.length }
     private var lines: LineIndex { document.lines }
 
+    /// Full lines covered by `range`. A folded block counts as part of the line it is folded into,
+    /// so the result also covers the hidden lines and the line the fold ends on.
+    func visualLineBlock(_ range: NSRange) -> NSRange {
+        let firstLine = lines.line(containing: range.location)
+        var endLoc = NSMaxRange(range)
+        if range.length > 0 && char(endLoc - 1) == 10 { endLoc -= 1 }
+        let lastLine = lines.line(containing: max(endLoc, range.location))
+        var start = lines.start(of: firstLine)
+        var end = NSMaxRange(lines.fullRange(of: lastLine, textLength: len))
+        let tlm = tovriLayoutManager
+        guard !tlm.folds.isEmpty else { return NSRange(location: start, length: end - start) }
+        while start > 0, let f = tlm.fold(hiding: start) {
+            start = lines.start(of: lines.line(containing: f.location))
+        }
+        while true {
+            let lineEnd = end > start && char(end - 1) == 10 ? end - 1 : end
+            guard let f = tlm.fold(at: lineEnd), f.location == lineEnd else { break }
+            end = NSMaxRange(lines.fullRange(of: lines.line(containing: NSMaxRange(f)), textLength: len))
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    /// Folds inside `range`, as offsets from its start.
+    private func folds(inside range: NSRange) -> [NSRange] {
+        tovriLayoutManager.folds.compactMap { f in
+            f.location >= range.location && NSMaxRange(f) <= NSMaxRange(range)
+                ? NSRange(location: f.location - range.location, length: f.length) : nil
+        }
+    }
+
     /// Full-line ranges covered by all selections, merged into contiguous blocks.
     func selectedLineBlocks() -> [NSRange] {
         var blocks: [NSRange] = []
         for r in allSelections {
-            let firstLine = lines.line(containing: r.location)
-            var endLoc = NSMaxRange(r)
-            if r.length > 0 && char(endLoc - 1) == 10 { endLoc -= 1 }
-            let lastLine = lines.line(containing: max(endLoc, r.location))
-            let start = lines.start(of: firstLine)
-            let end = NSMaxRange(lines.fullRange(of: lastLine, textLength: len))
-            let block = NSRange(location: start, length: end - start)
+            let block = visualLineBlock(r)
             if let last = blocks.last, block.location <= NSMaxRange(last) {
                 blocks[blocks.count - 1] = NSUnionRange(last, block)
             } else {
@@ -49,7 +73,7 @@ extension EditorTextView {
                 edits.append(TextEdit(NSRange(location: r.location, length: 0), indentUnit))
             }
         }
-        performEdits(edits, selection: .preserve, actionName: "Indent")
+        performEdits(edits, selection: .preserve, actionName: "Indent", keepFolds: true)
     }
 
     @objc func outdentLines(_ sender: Any?) {
@@ -68,16 +92,32 @@ extension EditorTextView {
                 }
             }
         }
-        performEdits(edits, selection: .preserve, actionName: "Outdent")
+        performEdits(edits, selection: .preserve, actionName: "Outdent", keepFolds: true)
     }
 
     // MARK: Comments
 
     @objc func toggleComment(_ sender: Any?) {
-        guard let token = language.primaryLineComment else { toggleBlockComment(sender); return }
         let blocks = selectedLineBlocks()
         var lineRanges: [NSRange] = []
         for b in blocks { for l in lineNumbers(in: b) { lineRanges.append(lines.range(of: l, textLength: len)) } }
+        let edits: [TextEdit]
+        if let token = language.primaryLineComment {
+            edits = lineCommentEdits(token, lineRanges)
+        } else if let (open, close) = language.primaryBlockComment {
+            guard let e = blockCommentEdits(open, close, blocks) else { toggleBlockComment(sender); return }
+            edits = e
+        } else {
+            NSSound.beep()
+            return
+        }
+        performEdits(edits, selection: .preserve, actionName: "Toggle Comment", keepFolds: true)
+        if allSelections.count == 1 && selectedRange().length == 0 && blocks.count == 1 && lineNumbers(in: blocks[0]).count == 1 && sender is NSMenuItem {
+            moveDown(nil)
+        }
+    }
+
+    private func lineCommentEdits(_ token: String, _ lineRanges: [NSRange]) -> [TextEdit] {
         let nonBlank = lineRanges.filter { leadingWhitespaceLength($0) < $0.length }
         let targets = nonBlank.isEmpty ? lineRanges : nonBlank
         let tokenLen = token.utf16.count
@@ -99,31 +139,91 @@ extension EditorTextView {
                 edits.append(TextEdit(NSRange(location: r.location + min(minIndent, r.length), length: 0), token + " "))
             }
         }
-        performEdits(edits, selection: .preserve, actionName: "Toggle Comment")
-        if allSelections.count == 1 && selectedRange().length == 0 && blocks.count == 1 && lineNumbers(in: blocks[0]).count == 1 && sender is NSMenuItem {
-            moveDown(nil)
+        return edits
+    }
+
+    /// The text of a line without its leading and trailing whitespace.
+    private func lineContent(_ r: NSRange) -> NSRange {
+        let a = r.location + leadingWhitespaceLength(r)
+        var b = NSMaxRange(r)
+        while b > a && isSpaceU(char(b - 1)) { b -= 1 }
+        return NSRange(location: a, length: b - a)
+    }
+
+    private func hasText(_ s: String, at loc: Int) -> Bool {
+        let n = s.utf16.count
+        return loc >= 0 && loc + n <= len && text.substring(with: NSRange(location: loc, length: n)) == s
+    }
+
+    /// Edits removing `open` at the start of `content` and `close` at its end, each with the space
+    /// next to it.
+    private func unwrapEdits(_ open: String, _ close: String, first: NSRange, last: NSRange) -> [TextEdit] {
+        let o = open.utf16.count, c = close.utf16.count
+        let openSpace = char(first.location + o) == 32 && first.location + o < NSMaxRange(last) - c ? 1 : 0
+        let closeSpace = char(NSMaxRange(last) - c - 1) == 32 && NSMaxRange(last) - c - 1 >= first.location + o + openSpace ? 1 : 0
+        return [TextEdit(NSRange(location: first.location, length: o + openSpace), ""),
+                TextEdit(NSRange(location: NSMaxRange(last) - c - closeSpace, length: c + closeSpace), "")]
+    }
+
+    /// Toggle Comment for languages that only have block comments (CSS, HTML): every line is
+    /// wrapped on its own. Lines commented as one block are uncommented as a block. Nil when all
+    /// lines are blank.
+    private func blockCommentEdits(_ open: String, _ close: String, _ blocks: [NSRange]) -> [TextEdit]? {
+        let o = open.utf16.count, c = close.utf16.count
+        let perBlock = blocks.map { b in lineNumbers(in: b).map { lineContent(lines.range(of: $0, textLength: len)) }.filter { $0.length > 0 } }
+        let contents = perBlock.flatMap { $0 }
+        guard !contents.isEmpty else { return nil }
+        func isWrapped(_ r: NSRange) -> Bool { r.length >= o + c && hasText(open, at: r.location) && hasText(close, at: NSMaxRange(r) - c) }
+        if contents.allSatisfy(isWrapped) {
+            return contents.flatMap { unwrapEdits(open, close, first: $0, last: $0) }
+        }
+        let blockWrapped = perBlock.allSatisfy { ls in
+            guard let first = ls.first, let last = ls.last, ls.count > 1 else { return ls.isEmpty }
+            return first.length >= o && hasText(open, at: first.location) && last.length >= c && hasText(close, at: NSMaxRange(last) - c)
+        }
+        if blockWrapped {
+            return perBlock.flatMap { ls -> [TextEdit] in
+                guard let first = ls.first, let last = ls.last else { return [] }
+                return unwrapEdits(open, close, first: first, last: last)
+            }
+        }
+        return contents.filter { !isWrapped($0) }.flatMap { r in
+            [TextEdit(NSRange(location: r.location, length: 0), open + " "), TextEdit(NSRange(location: NSMaxRange(r), length: 0), " " + close)]
         }
     }
 
     @objc func toggleBlockComment(_ sender: Any?) {
         guard let (open, close) = language.primaryBlockComment ?? language.primaryLineComment.map({ ($0, "") }) else { NSSound.beep(); return }
+        let o = open.utf16.count, c = close.utf16.count
+        let isBlank: (UInt16) -> Bool = { isSpaceU($0) || $0 == 10 }
         var edits: [TextEdit] = []
         for r0 in allSelections {
-            var r = r0
-            if r.length == 0 { r = lineRange(at: r.location) }
-            let s = text.substring(with: r)
-            let trimmed = s.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix(open) && (close.isEmpty || trimmed.hasSuffix(close)) && trimmed.count >= open.count + close.count {
-                let lead = s.prefix(while: { $0 == " " || $0 == "\t" }).utf16.count
-                var inner = String(trimmed.dropFirst(open.count).dropLast(close.count))
-                if inner.hasPrefix(" ") { inner.removeFirst() }
-                if inner.hasSuffix(" ") { inner.removeLast() }
-                let start = r.location + lead
-                let tl = trimmed.utf16.count
-                edits.append(TextEdit(NSRange(location: start, length: tl), inner, selection: NSRange(location: 0, length: inner.utf16.count)))
+            let r = r0.length == 0 ? lineRange(at: r0.location) : r0
+            var a = r.location, b = NSMaxRange(r)
+            while a < b && isBlank(char(a)) { a += 1 }
+            while b > a && isBlank(char(b - 1)) { b -= 1 }
+            let caret: Int? = r0.length == 0 ? r0.location : nil
+            if a == b {
+                let s = close.isEmpty ? open + " " : open + "  " + close
+                edits.append(TextEdit(NSRange(location: caret ?? r.location, length: 0), s, selection: NSRange(location: o + 1, length: 0)))
+                continue
+            }
+            // A full-line selection ends with its newline; the comment closes before it.
+            let content = NSRange(location: a, length: b - a)
+            let n = content.length
+            if n >= o + c && hasText(open, at: a) && (c == 0 || hasText(close, at: b - c)) {
+                var lead = o, trail = c
+                if n > o + c && char(a + o) == 32 { lead += 1 }
+                if c > 0 && n > lead + c && char(b - c - 1) == 32 { trail += 1 }
+                let inner = text.substring(with: NSRange(location: a + lead, length: n - lead - trail))
+                let il = inner.utf16.count
+                let sel = caret.map { NSRange(location: min(max(0, $0 - a - lead), il), length: 0) } ?? NSRange(location: 0, length: il)
+                edits.append(TextEdit(content, inner, selection: sel))
             } else {
+                let s = text.substring(with: content)
                 let wrapped = close.isEmpty ? open + " " + s : open + " " + s + " " + close
-                edits.append(TextEdit(r, wrapped, selection: NSRange(location: 0, length: wrapped.utf16.count)))
+                let sel = caret.map { NSRange(location: min(max(0, $0 - a), n) + o + 1, length: 0) } ?? NSRange(location: 0, length: wrapped.utf16.count)
+                edits.append(TextEdit(content, wrapped, selection: sel))
             }
         }
         performEdits(edits, actionName: "Toggle Block Comment")
@@ -134,6 +234,7 @@ extension EditorTextView {
     @objc func duplicateLine(_ sender: Any?) {
         var edits: [TextEdit] = []
         var newSels: [NSRange] = []
+        var copiedFolds: [NSRange] = []
         var delta = 0
         for r in allSelections {
             if r.length > 0 {
@@ -142,7 +243,7 @@ extension EditorTextView {
                 newSels.append(NSRange(location: NSMaxRange(r) + delta, length: s.utf16.count))
                 delta += s.utf16.count
             } else {
-                let full = fullLineRange(at: r.location)
+                let full = visualLineBlock(NSRange(location: r.location, length: 0))
                 var s = text.substring(with: full)
                 let insertAt = NSMaxRange(full)
                 if !s.hasSuffix("\n") { s = "\n" + s }
@@ -150,6 +251,7 @@ extension EditorTextView {
                 let offset = r.location - full.location
                 let newLineStart = s.hasPrefix("\n") && !text.substring(with: full).hasSuffix("\n") ? insertAt + 1 : insertAt
                 newSels.append(NSRange(location: newLineStart + offset + delta, length: 0))
+                copiedFolds += folds(inside: full).map { NSRange(location: newLineStart + delta + $0.location, length: $0.length) }
                 delta += s.utf16.count
             }
         }
@@ -159,16 +261,21 @@ extension EditorTextView {
         // selection breaks that, and so do shared insertion points.
         let locations = edits.map(\.range.location)
         if unique.count != edits.count || locations != locations.sorted() { return duplicateBlocks() }
-        performEdits(edits, selection: .custom(newSels), actionName: "Duplicate")
+        performEdits(edits, selection: .custom(newSels), actionName: "Duplicate", keepFolds: true, addedFolds: copiedFolds)
     }
 
     private func duplicateBlocks() {
+        var copiedFolds: [NSRange] = []
+        var delta = 0
         let edits = selectedLineBlocks().map { b -> TextEdit in
             var s = text.substring(with: b)
+            let newLineStart = NSMaxRange(b) + delta + (s.hasSuffix("\n") ? 0 : 1)
             if !s.hasSuffix("\n") { s = "\n" + s }
+            copiedFolds += folds(inside: b).map { NSRange(location: newLineStart + $0.location, length: $0.length) }
+            delta += s.utf16.count
             return TextEdit(NSRange(location: NSMaxRange(b), length: 0), s)
         }
-        performEdits(edits, selection: .preserve, actionName: "Duplicate")
+        performEdits(edits, selection: .preserve, actionName: "Duplicate", keepFolds: true, addedFolds: copiedFolds)
     }
 
     @objc func deleteLine(_ sender: Any?) {
@@ -181,10 +288,12 @@ extension EditorTextView {
             edits.append(TextEdit(r, "", selection: NSRange(location: 0, length: 0)))
         }
         performEdits(edits, actionName: "Delete Line")
-        let loc = selectedRange().location
-        let r = lineRange(at: loc)
-        let ws = leadingWhitespaceLength(r)
-        setSelectedRange(NSRange(location: r.location + ws, length: 0))
+        // One caret per deleted block, each at the first character of the line it lands on.
+        let carets = allSelections.map { s -> NSRange in
+            let r = lineRange(at: s.location)
+            return NSRange(location: r.location + leadingWhitespaceLength(r), length: 0)
+        }
+        setAllSelections(carets, primaryLocation: carets.last?.location)
     }
 
     @objc func moveLineUp(_ sender: Any?) { moveLines(up: true) }
@@ -197,22 +306,26 @@ extension EditorTextView {
         if !up && NSMaxRange(blocks[blocks.count - 1]) >= len { return }
         var edits: [TextEdit] = []
         var shifts: [(NSRange, Int)] = []
+        // Swapping keeps the length of the text, so moved folds only move within their edit.
+        var movedFolds: [NSRange] = []
         for b in blocks {
             var bText = text.substring(with: b)
             if up {
-                let prevLine = lines.line(containing: b.location - 1)
-                let p = lines.fullRange(of: prevLine, textLength: len)
+                let p = visualLineBlock(NSRange(location: b.location - 1, length: 0))
                 var pText = text.substring(with: p)
                 if !bText.hasSuffix("\n") { bText += "\n"; pText = String(pText.dropLast()) }
                 edits.append(TextEdit(NSRange(location: p.location, length: p.length + b.length), bText + pText))
                 shifts.append((b, -p.length))
+                movedFolds += folds(inside: b).map { NSRange(location: p.location + $0.location, length: $0.length) }
+                movedFolds += folds(inside: p).map { NSRange(location: p.location + bText.utf16.count + $0.location, length: $0.length) }
             } else {
-                let nextLine = lines.line(containing: NSMaxRange(b))
-                let n = lines.fullRange(of: nextLine, textLength: len)
+                let n = visualLineBlock(NSRange(location: NSMaxRange(b), length: 0))
                 var nText = text.substring(with: n)
                 if !nText.hasSuffix("\n") { nText += "\n"; bText = String(bText.dropLast()) }
                 edits.append(TextEdit(NSRange(location: b.location, length: b.length + n.length), nText + bText))
                 shifts.append((b, nText.utf16.count))
+                movedFolds += folds(inside: n).map { NSRange(location: b.location + $0.location, length: $0.length) }
+                movedFolds += folds(inside: b).map { NSRange(location: b.location + nText.utf16.count + $0.location, length: $0.length) }
             }
         }
         let sels = allSelections.map { r -> NSRange in
@@ -221,7 +334,7 @@ extension EditorTextView {
             }
             return r
         }
-        performEdits(edits, selection: .custom(sels), actionName: up ? "Move Line Up" : "Move Line Down")
+        performEdits(edits, selection: .custom(sels), actionName: up ? "Move Line Up" : "Move Line Down", keepFolds: true, addedFolds: movedFolds)
     }
 
     @objc func joinLines(_ sender: Any?) {

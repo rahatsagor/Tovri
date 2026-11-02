@@ -89,6 +89,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         NotificationCenter.default.removeObserver(self)
         CompletionController.shared.hide()
         textView.delegate = nil
+        document.undoManager.removeAllActions(withTarget: textView)
         document.removeEditor(self)
         document.textStorage.removeLayoutManager(layoutManager)
     }
@@ -801,6 +802,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     func showFindBar(replace: Bool) {
         // Find works on the source, so bring it back beside the rendered view.
         if previewMode == .full { setPreviewMode(.split) }
+        let wasHidden = findBar?.isHidden ?? true
         if findBar == nil {
             let bar = FindBar(editor: self)
             findBar = bar
@@ -809,6 +811,14 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         guard let bar = findBar else { return }
         bar.isHidden = false
         bar.setReplaceVisible(replace)
+        // Like other editors, a selection spanning lines means "find in here".
+        let lines = document.lines
+        let selected = textView.allSelections.filter { $0.length > 0 }
+        if selected.contains(where: { lines.line(containing: $0.location) != lines.line(containing: NSMaxRange($0)) }) {
+            bar.setScope(selected)
+        } else if wasHidden {
+            bar.setScope([])
+        }
         let sel = textView.selectedRange()
         if sel.length > 0 && sel.length < 500 {
             let s = document.string.substring(with: sel)
@@ -840,25 +850,37 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
             bar.step(forward: forward)
             return
         }
-        guard let re = FindState.shared.makeRegex() else { NSSound.beep(); return }
+        guard let re = FindState.shared.makeRegex(wordBoundaries: false) else { NSSound.beep(); return }
         let text = document.string as String
         let len = document.length
         let sel = textView.selectedRange()
         let options: NSRegularExpression.MatchingOptions = [.withTransparentBounds, .withoutAnchoringBounds]
+        let isWordChar = FindState.shared.wholeWord ? FindState.wordCharTest(document.language) : nil
+        func first(in range: NSRange) -> NSRange? {
+            var found: NSRange?
+            FindState.enumerateMatches(re, in: text, range: range, isWordChar: isWordChar) { m in found = m.range; return false }
+            return found
+        }
+        func last(in range: NSRange, before limit: Int) -> NSRange? {
+            var found: NSRange?
+            FindState.enumerateMatches(re, in: text, range: range, isWordChar: isWordChar) { m in
+                if m.range.location < limit { found = m.range }
+                return true
+            }
+            return found
+        }
         var found: NSRange?
         if forward {
             var from = NSMaxRange(sel)
-            if sel.length == 0, re.firstMatch(in: text, options: options, range: sel)?.range == sel {
+            if sel.length == 0, re.firstMatch(in: text, options: options, range: sel)?.range == sel,
+               FindState.isWholeWord(sel, in: document.string, isWordChar: isWordChar) {
                 from = sel.location < len ? NSMaxRange(document.string.rangeOfComposedCharacterSequence(at: sel.location)) : len + 1
             }
-            if from <= len {
-                found = re.firstMatch(in: text, options: options, range: NSRange(location: from, length: len - from))?.range
-            }
-            if found == nil { found = re.firstMatch(in: text, range: NSRange(location: 0, length: len))?.range }
+            if from <= len { found = first(in: NSRange(location: from, length: len - from)) }
+            if found == nil { found = first(in: NSRange(location: 0, length: len)) }
         } else {
-            found = re.matches(in: text, options: options, range: NSRange(location: 0, length: sel.location))
-                .last(where: { $0.range.location < sel.location })?.range
-            if found == nil { found = re.matches(in: text, range: NSRange(location: 0, length: len)).last?.range }
+            found = last(in: NSRange(location: 0, length: sel.location), before: sel.location)
+            if found == nil { found = last(in: NSRange(location: 0, length: len), before: Int.max) }
         }
         if let r = found, r.location != NSNotFound { select(r) } else { NSSound.beep() }
     }

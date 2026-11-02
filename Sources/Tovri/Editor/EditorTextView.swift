@@ -33,6 +33,10 @@ final class EditorTextView: NSTextView {
     /// Find-bar matches (sorted). Drawn for the visible region only.
     private(set) var findMatches: [NSRange] = []
     private(set) var currentFindMatch: NSRange?
+    /// Find in Selection ranges, tinted so it's clear where the find bar searches.
+    var findScope: [NSRange] = [] {
+        didSet { if findScope != oldValue { setNeedsDisplay(visibleRect) } }
+    }
     private var extraCaretsVisible = true
     private var blinkTimer: Timer?
     var charWidth: CGFloat = 7.8
@@ -40,6 +44,10 @@ final class EditorTextView: NSTextView {
     var wholeWordNeedle: String?
     /// Column kept while repeatedly adding carets above/below, so short lines don't pull it left.
     var caretGoalColumn: Int?
+    /// For multiple selections: the fixed end of each selection extended with Shift, and the x
+    /// that Up and Down aim for, keyed by the selection they belong to.
+    private var multiAnchors: [NSRange: Int] = [:]
+    private var multiGoalX: [NSRange: CGFloat] = [:]
 
     static let fullLinePasteboardType = NSPasteboard.PasteboardType("app.tovri.fullline")
 
@@ -266,6 +274,8 @@ final class EditorTextView: NSTextView {
 
         if settings.showIndentGuides { drawIndentGuides(in: rect, theme: theme) }
 
+        if !findScope.isEmpty { drawFindScope(in: rect, theme: theme) }
+
         if !findMatches.isEmpty { drawFindMatches(in: rect, theme: theme) }
 
         if !occurrenceRanges.isEmpty {
@@ -468,6 +478,19 @@ final class EditorTextView: NSTextView {
         if hadAny || !matches.isEmpty { setNeedsDisplay(visibleRect) }
     }
 
+    private func drawFindScope(in rect: NSRect, theme: Theme) {
+        guard let lm = layoutManager, let tc = textContainer else { return }
+        let o = textContainerOrigin
+        let gr = lm.glyphRange(forBoundingRect: rect.offsetBy(dx: -o.x, dy: -o.y), in: tc)
+        let visible = lm.characterRange(forGlyphRange: gr, actualGlyphRange: nil)
+        theme.inactiveSelection.setFill()
+        for s in findScope {
+            let r = NSIntersectionRange(s, visible)
+            guard r.length > 0 else { continue }
+            for box in rects(for: r) where box.intersects(rect) { box.fill() }
+        }
+    }
+
     private func drawFindMatches(in rect: NSRect, theme: Theme) {
         guard let lm = layoutManager, let tc = textContainer else { return }
         let o = textContainerOrigin
@@ -534,6 +557,8 @@ final class EditorTextView: NSTextView {
         extraSelections = extras
         isSettingMulti = false
         caretGoalColumn = nil
+        multiAnchors.removeAll()
+        multiGoalX.removeAll()
         if scroll { scrollRangeToVisible(merged[pi]) }
         updateBracketMatch()
         updateOccurrences()
@@ -554,6 +579,10 @@ final class EditorTextView: NSTextView {
             if !extraSelections.isEmpty { extraSelections = [] }
             wholeWordNeedle = nil
             caretGoalColumn = nil
+            if !multiAnchors.isEmpty || !multiGoalX.isEmpty {
+                multiAnchors.removeAll()
+                multiGoalX.removeAll()
+            }
         }
     }
 
@@ -578,8 +607,11 @@ final class EditorTextView: NSTextView {
         if !isSettingMulti { editor?.selectionDidChange() }
     }
 
-    /// Applies non-overlapping edits as a single undoable change.
-    func performEdits(_ edits: [TextEdit], selection: SelectionUpdate = .fromEdits, actionName: String? = nil) {
+    /// Applies non-overlapping edits as a single undoable change. With `keepFolds`, folds that the
+    /// edits leave intact or only change inside stay folded, and `addedFolds` (in the edited
+    /// text's coordinates) are folded too.
+    func performEdits(_ edits: [TextEdit], selection: SelectionUpdate = .fromEdits, actionName: String? = nil,
+                      keepFolds: Bool = false, addedFolds: [NSRange] = []) {
         guard let storage = textStorage, !document.isReadOnly else { NSSound.beep(); return }
         let sorted = edits.sorted { $0.range.location < $1.range.location }
         var filtered: [TextEdit] = []
@@ -591,8 +623,13 @@ final class EditorTextView: NSTextView {
         }
         guard !filtered.isEmpty else { return }
         let oldSelections = allSelections
+        let foldsBefore = keepFolds ? tovriLayoutManager.folds : []
 
         breakUndoCoalescing()
+        // NSTextView's undo restores one selection. These run around its text change, so undo and
+        // redo bring back every caret.
+        let restoresCarets = oldSelections.count > 1
+        if restoresCarets { registerSelectionUndo(apply: oldSelections, inverse: nil) }
         let attrs = typingAttributes
         if filtered.count > 256 {
             // shouldChangeText(inRanges:) is quadratic in the number of ranges (Replace All with
@@ -627,6 +664,9 @@ final class EditorTextView: NSTextView {
         didChangeText()
         isSettingMulti = false
         if let name = actionName { undoManager?.setActionName(name) }
+        if keepFolds, let editor, !foldsBefore.isEmpty || !addedFolds.isEmpty {
+            editor.applyFolds(EditorTextView.mapFolds(foldsBefore, through: filtered) + addedFolds)
+        }
 
         switch selection {
         case .fromEdits:
@@ -650,7 +690,42 @@ final class EditorTextView: NSTextView {
         case .none:
             break
         }
+        if restoresCarets || allSelections.count > 1 { registerSelectionUndo(apply: nil, inverse: allSelections) }
         breakUndoCoalescing()
+    }
+
+    /// Registers an undo step that selects `apply` (if any) and registers its own inverse, so the
+    /// step keeps working through repeated undo and redo.
+    private func registerSelectionUndo(apply: [NSRange]?, inverse: [NSRange]?) {
+        undoManager?.registerUndo(withTarget: self) { tv in
+            if let apply { tv.setAllSelections(apply) }
+            tv.registerSelectionUndo(apply: inverse, inverse: apply)
+        }
+    }
+
+    /// Folds still valid after `edits` (sorted, non-overlapping), moved to the edited text. A fold
+    /// survives edits before it, after it, or strictly inside its hidden text.
+    static func mapFolds(_ folds: [NSRange], through edits: [TextEdit]) -> [NSRange] {
+        var out: [NSRange] = []
+        var i = 0
+        var delta = 0
+        for f in folds {
+            while i < edits.count && NSMaxRange(edits[i].range) <= f.location {
+                delta += edits[i].text.utf16.count - edits[i].range.length
+                i += 1
+            }
+            var length = f.length
+            var keep = true
+            var j = i
+            while j < edits.count && edits[j].range.location < NSMaxRange(f) {
+                let e = edits[j]
+                guard e.range.location > f.location && NSMaxRange(e.range) <= NSMaxRange(f) else { keep = false; break }
+                length += e.text.utf16.count - e.range.length
+                j += 1
+            }
+            if keep && length > 0 { out.append(NSRange(location: f.location + delta, length: length)) }
+        }
+        return out
     }
 
     static func map(_ p: Int, through edits: [TextEdit]) -> Int {
@@ -718,13 +793,18 @@ final class EditorTextView: NSTextView {
     }
 
     private func insertTextImpl(_ insertString: Any, replacementRange: NSRange) {
+        let str = (insertString as? String) ?? (insertString as? NSAttributedString)?.string ?? ""
+        if hasMarkedText() && !extraSelections.isEmpty {
+            commitMarkedTextAtAllCarets(insertString, str, replacementRange: replacementRange)
+            return
+        }
         if hasMarkedText() || replacementRange.location != NSNotFound {
             super.insertText(insertString, replacementRange: replacementRange)
             return
         }
-        let str = (insertString as? String) ?? (insertString as? NSAttributedString)?.string ?? ""
         if !extraSelections.isEmpty {
             multiInsert(str)
+            if CompletionController.shared.isVisible { CompletionController.shared.show(for: self, explicit: true) }
             return
         }
         if str.utf16.count == 1, Settings.shared.autoCloseBrackets, handleAutoPair(str.utf16.first!) {
@@ -739,17 +819,111 @@ final class EditorTextView: NSTextView {
     }
 
     private func multiInsert(_ s: String) {
-        if s.utf16.count == 1, Settings.shared.autoCloseBrackets, let c = s.utf16.first, let close = pairCloser(for: c), close != c {
-            let open = s
-            let closeS = String(utf16CodeUnits: [close], count: 1)
-            performEdits(allSelections.map { r in
-                r.length > 0
-                    ? TextEdit(r, open + text.substring(with: r) + closeS, selection: NSRange(location: 1, length: r.length))
-                    : TextEdit(r, open + closeS, selection: NSRange(location: 1, length: 0))
-            })
+        let sels = allSelections
+        if s.utf16.count == 1, Settings.shared.autoCloseBrackets, let c = s.utf16.first {
+            let actions = sels.map { pairAction(c, at: $0) }
+            if actions.allSatisfy({ if case .typeOver = $0 { return true } else { return false } }) {
+                setAllSelections(sels.map { NSRange(location: $0.location + 1, length: 0) })
+                return
+            }
+            if !actions.allSatisfy({ if case .none = $0 { return true } else { return false } }) {
+                performEdits(zip(sels, actions).map { r, action -> TextEdit in
+                    switch action {
+                    // Typed over by writing the same character again, so all carets stay one edit.
+                    case .typeOver: return TextEdit(NSRange(location: r.location, length: 1), s)
+                    case .wrap(let w): return TextEdit(r, w, selection: NSRange(location: 1, length: r.length))
+                    case .pair(let p): return TextEdit(r, p, selection: NSRange(location: 1, length: 0))
+                    case .none: return TextEdit(r, s)
+                    }
+                })
+                return
+            }
+        }
+        performEdits(sels.map { TextEdit($0, s) })
+    }
+
+    private enum PairAction {
+        /// Step over the closing character already after the caret.
+        case typeOver
+        /// Surround the selection: the replacement text.
+        case wrap(String)
+        /// Insert the opening and closing character.
+        case pair(String)
+        case none
+    }
+
+    /// What typing `c` with auto-closing brackets does at `sel`.
+    private func pairAction(_ c: UInt16, at sel: NSRange) -> PairAction {
+        let loc = sel.location
+        let next = char(NSMaxRange(sel))
+        let closer = pairCloser(for: c)
+        let isQuote = closer == c
+        if sel.length == 0 && isCloser(c) && next == c && (!isQuote || char(loc - 1) != 92) { return .typeOver }
+        guard let close = closer else { return .none }
+        let open = String(utf16CodeUnits: [c], count: 1)
+        let closeS = String(utf16CodeUnits: [close], count: 1)
+        if sel.length > 0 {
+            let inner = text.substring(with: sel)
+            if inner.contains("\n") && isQuote { return .none }
+            return .wrap(open + inner + closeS)
+        }
+        let okNext = next == 0 || next == 10 || isSpaceU(next) || isCloser(next) || next == 44 || next == 59 || next == 58
+        guard okNext else { return .none }
+        if isQuote {
+            let prev = char(loc - 1)
+            if isWordChar(prev) || prev == c || prev == 92 { return .none }
+        }
+        return .pair(open + closeS)
+    }
+
+    // MARK: Marked text with multiple carets
+
+    /// Composing text (dead keys, input methods) is shown at the primary caret only; the other
+    /// carets are shifted along with it and get the committed text.
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        guard !extraSelections.isEmpty else {
+            super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
             return
         }
-        performEdits(allSelections.map { TextEdit($0, s) })
+        let before = document.length
+        let at = hasMarkedText() ? markedRange().location : self.selectedRange().location
+        isSettingMulti = true
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        isSettingMulti = false
+        shiftExtraSelections(after: at, by: document.length - before)
+    }
+
+    private func shiftExtraSelections(after loc: Int, by delta: Int) {
+        guard delta != 0 else { return }
+        isSettingMulti = true
+        extraSelections = extraSelections.map { $0.location > loc ? NSRange(location: $0.location + delta, length: $0.length) : $0 }
+        isSettingMulti = false
+    }
+
+    private func commitMarkedTextAtAllCarets(_ insertString: Any, _ str: String, replacementRange: NSRange) {
+        let marked = markedRange()
+        let before = document.length
+        isSettingMulti = true
+        super.insertText(insertString, replacementRange: replacementRange)
+        isSettingMulti = false
+        shiftExtraSelections(after: marked.location, by: document.length - before)
+        guard !str.isEmpty, !extraSelections.isEmpty else { return }
+        let primary = selectedRange()
+        let n = str.utf16.count
+        var sels: [NSRange] = []
+        var delta = 0
+        let extras = EditorTextView.normalize(extraSelections)
+        var primaryPlaced = false
+        for r in extras {
+            if !primaryPlaced && primary.location < r.location {
+                sels.append(NSRange(location: primary.location + delta, length: 0))
+                primaryPlaced = true
+            }
+            sels.append(NSRange(location: r.location + delta + n, length: 0))
+            delta += n - r.length
+        }
+        if !primaryPlaced { sels.append(NSRange(location: primary.location + delta, length: 0)) }
+        performEdits(extras.map { TextEdit($0, str) }, selection: .custom(sels))
     }
 
     private func pairCloser(for c: UInt16) -> UInt16? {
@@ -774,39 +948,21 @@ final class EditorTextView: NSTextView {
 
     private func handleAutoPair(_ c: UInt16) -> Bool {
         let sel = selectedRange()
-        let loc = sel.location
-        let next = char(NSMaxRange(sel))
-        let closer = pairCloser(for: c)
-        let isQuote = closer == c
-
-        if sel.length == 0 && isCloser(c) && next == c {
-            if !isQuote || char(loc - 1) != 92 {
-                setSelectedRange(NSRange(location: loc + 1, length: 0))
-                return true
-            }
-        }
-        guard let close = closer else { return false }
-        if sel.length > 0 {
-            let inner = text.substring(with: sel)
-            if inner.contains("\n") && isQuote { return false }
-            let open = String(utf16CodeUnits: [c], count: 1)
-            let closeS = String(utf16CodeUnits: [close], count: 1)
-            if shouldChangeText(in: sel, replacementString: open + inner + closeS) {
-                textStorage?.replaceCharacters(in: sel, with: NSAttributedString(string: open + inner + closeS, attributes: typingAttributes))
+        switch pairAction(c, at: sel) {
+        case .typeOver:
+            setSelectedRange(NSRange(location: sel.location + 1, length: 0))
+        case .wrap(let wrapped):
+            if shouldChangeText(in: sel, replacementString: wrapped) {
+                textStorage?.replaceCharacters(in: sel, with: NSAttributedString(string: wrapped, attributes: typingAttributes))
                 didChangeText()
                 setSelectedRange(NSRange(location: sel.location + 1, length: sel.length))
             }
-            return true
+        case .pair(let pair):
+            super.insertText(pair, replacementRange: sel)
+            setSelectedRange(NSRange(location: sel.location + 1, length: 0))
+        case .none:
+            return false
         }
-        let okNext = next == 0 || next == 10 || isSpaceU(next) || isCloser(next) || next == 44 || next == 59 || next == 58
-        guard okNext else { return false }
-        if isQuote {
-            let prev = char(loc - 1)
-            if isWordChar(prev) || prev == c || prev == 92 { return false }
-        }
-        let pair = String(utf16CodeUnits: [c, close], count: 2)
-        super.insertText(pair, replacementRange: sel)
-        setSelectedRange(NSRange(location: loc + 1, length: 0))
         return true
     }
 
@@ -1077,15 +1233,7 @@ final class EditorTextView: NSTextView {
         }
         if !extraSelections.isEmpty {
             if EditorTextView.movementSelectors.contains(name) {
-                var results: [NSRange] = []
-                isSettingMulti = true
-                for r in allSelections {
-                    super.setSelectedRanges([NSValue(range: r)], affinity: .downstream, stillSelecting: false)
-                    super.doCommand(by: selector)
-                    results.append(selectedRange())
-                }
-                isSettingMulti = false
-                setAllSelections(results, primaryLocation: results.last?.location)
+                moveAllSelections(name)
                 return
             }
             if let move = EditorTextView.deletionSelectors[name] {
@@ -1104,6 +1252,80 @@ final class EditorTextView: NSTextView {
             }
         }
         super.doCommand(by: selector)
+    }
+
+    /// Runs a movement command for every selection. NSTextView forgets which end of a selection
+    /// is anchored and where Up and Down aim once the selection is set from code, so both are kept
+    /// per selection: an extended selection moves its other end with the plain movement.
+    private func moveAllSelections(_ name: String) {
+        let suffix = "AndModifySelection:"
+        let modify = name.hasSuffix(suffix)
+        let base = modify ? String(name.dropLast(suffix.count)) + ":" : name
+        let vertical = base == "moveUp:" || base == "moveDown:"
+        let anchors = multiAnchors
+        let goals = multiGoalX
+        var results: [(range: NSRange, anchor: Int?, goal: CGFloat?)] = []
+        isSettingMulti = true
+        for r in allSelections {
+            if modify {
+                var anchor = anchors[r] ?? r.location
+                if anchor != NSMaxRange(r) { anchor = r.location }
+                let head = anchor == r.location ? NSMaxRange(r) : r.location
+                var goal: CGFloat?
+                let newHead: Int
+                if vertical {
+                    (newHead, goal) = moveVertically(from: head, up: base == "moveUp:", goal: goals[r])
+                } else {
+                    newHead = moveCaret(from: head, base)
+                }
+                results.append((NSRange(location: min(anchor, newHead), length: abs(newHead - anchor)), anchor, goal))
+            } else if vertical && r.length == 0 {
+                let (loc, goal) = moveVertically(from: r.location, up: base == "moveUp:", goal: goals[r])
+                results.append((NSRange(location: loc, length: 0), nil, goal))
+            } else {
+                super.setSelectedRanges([NSValue(range: r)], affinity: .downstream, stillSelecting: false)
+                super.doCommand(by: NSSelectorFromString(name))
+                results.append((selectedRange(), nil, nil))
+            }
+        }
+        isSettingMulti = false
+        setAllSelections(results.map(\.range), primaryLocation: results.last?.range.location)
+        for x in results {
+            if let a = x.anchor, x.range.length > 0 { multiAnchors[x.range] = a }
+            if let g = x.goal { multiGoalX[x.range] = g }
+        }
+    }
+
+    private func moveCaret(from head: Int, _ selector: String) -> Int {
+        super.setSelectedRanges([NSValue(range: NSRange(location: head, length: 0))], affinity: .downstream, stillSelecting: false)
+        switch selector {
+        // These have no plain counterpart; they go to the paragraph's end, or the next one's.
+        case "moveParagraphForward:":
+            if head >= document.length || char(head) == 10 { super.doCommand(by: #selector(moveForward(_:))) }
+            super.doCommand(by: #selector(moveToEndOfParagraph(_:)))
+        case "moveParagraphBackward:":
+            if head == 0 || char(head - 1) == 10 { super.doCommand(by: #selector(moveBackward(_:))) }
+            super.doCommand(by: #selector(moveToBeginningOfParagraph(_:)))
+        default:
+            super.doCommand(by: NSSelectorFromString(selector))
+        }
+        return selectedRange().location
+    }
+
+    /// Moves a caret one line up or down, aiming at `goal` (the x it started from) so short lines
+    /// on the way don't pull it left.
+    private func moveVertically(from head: Int, up: Bool, goal: CGFloat?) -> (Int, CGFloat) {
+        let before = caretRect(at: head)
+        let x = goal ?? before.minX
+        super.setSelectedRanges([NSValue(range: NSRange(location: head, length: 0))], affinity: .downstream, stillSelecting: false)
+        super.doCommand(by: up ? #selector(moveUp(_:)) : #selector(moveDown(_:)))
+        var loc = selectedRange().location
+        let after = caretRect(at: loc)
+        if abs(after.minY - before.minY) > 0.5 {
+            loc = min(characterIndexForInsertion(at: NSPoint(x: x + 1, y: after.midY)), document.length)
+            if let f = tovriLayoutManager.fold(hiding: loc), loc < NSMaxRange(f) { loc = NSMaxRange(f) }
+        }
+        return (loc, x)
     }
 
     // MARK: Mouse
@@ -1160,7 +1382,7 @@ final class EditorTextView: NSTextView {
         let sels = allSelections
         let pb = NSPasteboard.general
         if sels.count == 1 && sels[0].length == 0 {
-            let r = fullLineRange(at: sels[0].location)
+            let r = visualLineBlock(sels[0])
             var s = text.substring(with: r)
             if !s.hasSuffix("\n") { s += "\n" }
             pb.declareTypes([.string, EditorTextView.fullLinePasteboardType], owner: nil)
@@ -1181,7 +1403,7 @@ final class EditorTextView: NSTextView {
         let sels = allSelections
         if sels.count == 1 && sels[0].length == 0 {
             copy(sender)
-            let r = fullLineRange(at: sels[0].location)
+            let r = visualLineBlock(sels[0])
             performEdits([TextEdit(r, "", selection: NSRange(location: 0, length: 0))], actionName: "Cut")
             return
         }

@@ -21,11 +21,23 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A **Backup** settings pane. **Export…** saves your preferences, key
   bindings and custom themes to a file, and **Import…** brings them back,
   on the same Mac or another one.
+- **Find in Selection** (⌥⌘L) in the find bar. It turns on by itself when you
+  open the bar with several lines selected, and Replace All then changes only
+  the selection.
+- Regular expression replacements understand `\n` (new line), `\t` (tab)
+  and `\\` (backslash).
 
 ### Changed
 
 - Changing the line ending in the status bar is now an unsaved change you can
   undo, instead of saving the file right away.
+- Whole Word finds searches that start or end with punctuation, such as
+  `foo.` or `$name`, and follows each language's word characters.
+- With several cursors, Shift and the arrow keys extend each selection in
+  both directions, Up and Down keep each cursor's column, brackets, quotes and
+  accented letters go to every cursor, and Undo brings back all the cursors.
+- Delete Line, Move Line, Duplicate Line and cutting a line on a folded line
+  act on the whole folded block, and moved or duplicated blocks stay folded.
 - Saving keeps a file's hidden flag and updates every hard link to it, and
   Save All and saving when you quit trim whitespace and add the final newline
   the same way ⌘S does.
@@ -51,6 +63,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
   never applied.
 - Tovri could crash when a file it was reading was cut short by another
   program, as log rotation does.
+- Syntax colors could go wrong further down a long file after Replace All or
+  a multi-cursor edit followed by typing above it.
+- Toggle Comment in CSS, HTML and XML broke code when whole lines were
+  selected.
+- Putting the caret at the end of a folded line unfolded it.
+- Delete Line with several cursors left only one cursor.
+- Format JSON rejected valid JSON with very large numbers, very deep nesting
+  or lone `\u` escapes. Errors now say the line and column.
+- Clicking a change marker on the last line of a file opened the wrong
+  change.
 - Files ignored only by your global Git ignore file, such as `.DS_Store`,
   showed as new in the sidebar and the Changes list.
 - `tovri -w` waited forever over SSH or with a custom `TMPDIR`.

@@ -103,7 +103,9 @@ extension EditorView {
 
     /// Fold at the caret: the caret line if it has a body, otherwise the enclosing block.
     func foldAtCaret() {
-        let caret = textView.selectedRange().location
+        var caret = textView.selectedRange().location
+        // Right after the "⋯" the caret is on the folded line, not the line the fold ends on.
+        if let f = layoutManager.fold(hiding: caret) { caret = f.location }
         var line = foldLines.line(containing: caret)
         if foldableRange(forLine: line) == nil {
             let own = indentColumns(line) ?? Int.max
@@ -121,7 +123,7 @@ extension EditorView {
     func unfoldAtCaret() {
         let caret = textView.selectedRange().location
         let lr = foldLines.fullRange(of: foldLines.line(containing: caret), textLength: document.length)
-        let hits = folds.filter { NSLocationInRange($0.location, lr) || NSLocationInRange(caret, $0) }
+        let hits = folds.filter { NSLocationInRange($0.location, lr) || ($0.location <= caret && caret <= NSMaxRange($0)) }
         if hits.isEmpty { NSSound.beep(); return }
         applyFolds(folds.filter { f in !hits.contains(f) })
     }
@@ -152,17 +154,23 @@ extension EditorView {
             }
         }
         if changed {
-            DispatchQueue.main.async { [weak self] in self?.applyFolds(out) }
+            // Applies whatever folds exist by then, so folds re-added right after the edit
+            // (moving or duplicating a folded line) survive.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.applyFolds(self.folds)
+            }
             layoutManager.setFoldsSilently(out)
         }
     }
 
-    /// Opens any fold hiding the given range so navigation never lands in hidden text.
+    /// Opens any fold hiding the given range so navigation never lands in hidden text. Both ends
+    /// of a fold are visible caret positions: before and after the "⋯" placeholder.
     func revealFolds(containing range: NSRange) {
         guard !folds.isEmpty else { return }
         let hits = folds.filter { f in
-            (range.location > f.location && range.location <= NSMaxRange(f)) ||
-            (NSMaxRange(range) > f.location && NSMaxRange(range) <= NSMaxRange(f) && range.length > 0)
+            (range.location > f.location && range.location < NSMaxRange(f)) ||
+            (NSMaxRange(range) > f.location && NSMaxRange(range) < NSMaxRange(f) && range.length > 0)
         }
         if !hits.isEmpty { applyFolds(folds.filter { !hits.contains($0) }) }
     }

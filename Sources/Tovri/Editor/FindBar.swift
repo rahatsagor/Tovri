@@ -8,18 +8,90 @@ final class FindState {
     var caseSensitive = false
     var wholeWord = false
 
-    func makeRegex(query q: String? = nil) -> NSRegularExpression? {
+    /// With `wordBoundaries` false, Whole Word is left to `enumerateMatches`, which uses an
+    /// editor's own word characters. Otherwise it's built into the pattern with the default word
+    /// characters (`isWordU`) rather than `\b`, so `$var` or `foo.` match the same way.
+    func makeRegex(query q: String? = nil, wordBoundaries: Bool = true) -> NSRegularExpression? {
         let q = q ?? query
         guard !q.isEmpty else { return nil }
         var pattern = regex ? q : NSRegularExpression.escapedPattern(for: q)
-        if wholeWord { pattern = "\\b(?:" + pattern + ")\\b" }
+        if wholeWord && wordBoundaries {
+            let word = "[A-Za-z0-9_\\x{80}-\\x{10FFFF}]"
+            pattern = "(?<!" + word + ")(?:" + pattern + ")(?!" + word + ")"
+        }
         var opts: NSRegularExpression.Options = [.anchorsMatchLines]
         if !caseSensitive { opts.insert(.caseInsensitive) }
         return try? NSRegularExpression(pattern: pattern, options: opts)
     }
 
     func replacementString(for match: NSTextCheckingResult, in text: String, regex re: NSRegularExpression) -> String {
-        regex ? re.replacementString(for: match, in: text, offset: 0, template: replacement) : replacement
+        regex ? re.replacementString(for: match, in: text, offset: 0, template: FindState.regexTemplate(replacement)) : replacement
+    }
+
+    /// NSRegularExpression templates only know `$1` and `\` escapes, so `\n` would insert "n".
+    /// Turns `\n` and `\t` into a newline and a tab and keeps `\\` a backslash.
+    static func regexTemplate(_ s: String) -> String {
+        guard s.contains("\\") else { return s }
+        var out = ""
+        var it = s.makeIterator()
+        while let c = it.next() {
+            guard c == "\\" else { out.append(c); continue }
+            guard let n = it.next() else { out += "\\\\"; break }
+            switch n {
+            case "n": out.append("\n")
+            case "t": out.append("\t")
+            case "\\": out += "\\\\"
+            default: out.append("\\"); out.append(n)
+            }
+        }
+        return out
+    }
+
+    /// The editor's word characters for `language` (see `EditorTextView.isWordChar`).
+    static func wordCharTest(_ language: Language) -> (UInt16) -> Bool {
+        let extra = Set(language.identifierChars.utf16).subtracting([45])
+        return { isWordU($0) || extra.contains($0) }
+    }
+
+    /// Calls `body` for each match in `range` until it returns false. With `isWordChar` (Whole
+    /// Word), a match counts only when the characters just before and after it aren't word
+    /// characters, so queries such as `foo.` or `$var` work and the language's rule applies.
+    static func enumerateMatches(_ re: NSRegularExpression, in text: String, range: NSRange, isWordChar: ((UInt16) -> Bool)?,
+                                 _ body: (NSTextCheckingResult) -> Bool) {
+        let options: NSRegularExpression.MatchingOptions = [.withTransparentBounds, .withoutAnchoringBounds]
+        guard let isWordChar else {
+            re.enumerateMatches(in: text, options: options, range: range) { m, _, stop in
+                guard let m, m.range.location != NSNotFound else { return }
+                if !body(m) { stop.pointee = true }
+            }
+            return
+        }
+        let ns = text as NSString
+        let len = ns.length
+        let end = NSMaxRange(range)
+        var pos = range.location
+        func step(_ i: Int) -> Int { i < len ? i + ns.rangeOfComposedCharacterSequence(at: i).length : i + 1 }
+        while pos <= end {
+            guard let m = re.firstMatch(in: text, options: options, range: NSRange(location: pos, length: end - pos)),
+                  m.range.location != NSNotFound else { return }
+            let r = m.range
+            let before: UInt16 = r.location > 0 ? ns.character(at: r.location - 1) : 0
+            let after: UInt16 = NSMaxRange(r) < len ? ns.character(at: NSMaxRange(r)) : 0
+            if !isWordChar(before) && !isWordChar(after) {
+                if !body(m) { return }
+                pos = r.length == 0 ? step(r.location) : NSMaxRange(r)
+            } else {
+                pos = step(r.location)
+            }
+        }
+    }
+
+    /// Whether `r` passes the Whole Word check of `enumerateMatches`.
+    static func isWholeWord(_ r: NSRange, in text: NSString, isWordChar: ((UInt16) -> Bool)?) -> Bool {
+        guard let isWordChar else { return true }
+        let before: UInt16 = r.location > 0 ? text.character(at: r.location - 1) : 0
+        let after: UInt16 = NSMaxRange(r) < text.length ? text.character(at: NSMaxRange(r)) : 0
+        return !isWordChar(before) && !isWordChar(after)
     }
 }
 
@@ -40,12 +112,13 @@ final class FindBar: NSView, NSTextFieldDelegate {
     private lazy var caseButton: ToolButton = ToolButton(title: "Aa", tooltip: "Match Case (⌥⌘C)\nOnly find text with exactly the same uppercase and lowercase letters.") { [weak self] in self?.toggleOption(\.caseSensitive) }
     private lazy var wordButton: ToolButton = ToolButton(title: "ab", tooltip: "Whole Word (⌥⌘W)\nOnly match complete words, not parts of longer words.") { [weak self] in self?.toggleOption(\.wholeWord) }
     private lazy var regexButton: ToolButton = ToolButton(title: ".*", tooltip: "Regular Expression (⌥⌘R)\nTreat the search as a regular expression. Use $1, $2… in Replace to insert captured groups.") { [weak self] in self?.toggleOption(\.regex) }
+    private lazy var scopeButton: ToolButton = ToolButton(symbol: "selection.pin.in.out", tooltip: "Find in Selection (⌥⌘L)\nOnly find and replace inside the text that was selected when this was turned on.") { [weak self] in self?.toggleScope() }
     private lazy var prevButton: ToolButton = ToolButton(symbol: "chevron.up", tooltip: "Previous match (⇧↩ or ⇧⌘G)") { [weak self] in self?.step(forward: false) }
     private lazy var nextButton: ToolButton = ToolButton(symbol: "chevron.down", tooltip: "Next match (↩ or ⌘G)") { [weak self] in self?.step(forward: true) }
     private lazy var allButton: ToolButton = ToolButton(symbol: "text.cursor", tooltip: "Select all matches as multiple cursors (⌥↩)") { [weak self] in self?.selectAllMatches() }
     private lazy var closeButton: ToolButton = ToolButton(symbol: "xmark", tooltip: "Close the find bar (⎋)") { [weak self] in self?.dismiss() }
     private lazy var replaceButton: ToolButton = ToolButton(title: "Replace", tooltip: "Replace the current match and go to the next one (↩ in the Replace field)") { [weak self] in self?.replaceCurrent() }
-    private lazy var replaceAllButton: ToolButton = ToolButton(title: "All", tooltip: "Replace every match in the document (⌥↩ in the Replace field). Undo with ⌘Z.") { [weak self] in self?.replaceAll() }
+    private lazy var replaceAllButton: ToolButton = ToolButton(title: "All", tooltip: "Replace every match in the document, or in the selection with Find in Selection on (⌥↩ in the Replace field). Undo with ⌘Z.") { [weak self] in self?.replaceAll() }
 
     private(set) var replaceVisible = false
     var preferredHeight: CGFloat { replaceVisible ? 76 : 42 }
@@ -61,6 +134,8 @@ final class FindBar: NSView, NSTextFieldDelegate {
     private var snapshot: NSString?
     private var snapshotVersion = -1
     private static let syncLimit = 300_000
+    /// Find in Selection: the ranges searched instead of the whole document, kept in step with edits.
+    private(set) var scope: [NSRange] = []
 
     init(editor: EditorView) {
         self.editor = editor
@@ -72,7 +147,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         layer?.shadowRadius = 12
         layer?.shadowOffset = CGSize(width: 0, height: -4)
         layer?.borderWidth = 1
-        for v: NSView in [toggleReplace, findField, countLabel, caseButton, wordButton, regexButton, prevButton, nextButton,
+        for v: NSView in [toggleReplace, findField, countLabel, caseButton, wordButton, regexButton, scopeButton, prevButton, nextButton,
                           allButton, closeButton, replaceField, replaceButton, replaceAllButton] { addSubview(v) }
         findField.field.delegate = self
         replaceField.field.delegate = self
@@ -130,6 +205,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         place(nextButton, 24, y: y1)
         place(prevButton, 24, y: y1)
         x -= 4
+        place(scopeButton, 26, y: y1)
         place(regexButton, 26, y: y1)
         place(wordButton, 26, y: y1)
         place(caseButton, 26, y: y1)
@@ -174,7 +250,33 @@ final class FindBar: NSView, NSTextFieldDelegate {
         search(selectNearest: false, debounce: 0)
     }
 
+    /// Limits finding and replacing to `ranges`; empty searches the whole document again.
+    func setScope(_ ranges: [NSRange]) { applyScope(ranges.filter { $0.length > 0 }) }
+
+    /// Keeps empty ranges: once edits remove all of the scope, nothing matches rather than the whole file.
+    private func applyScope(_ ranges: [NSRange]) {
+        scope = EditorTextView.normalize(ranges)
+        scopeButton.isOn = !scope.isEmpty
+        editor.textView.findScope = scope.filter { $0.length > 0 }
+    }
+
+    private func toggleScope() {
+        if scope.isEmpty {
+            let sels = editor.textView.allSelections.filter { $0.length > 0 }
+            // The selection is often just the current match; searching only inside it isn't useful.
+            if sels.isEmpty || (sels.count == 1 && current >= 0 && current < matches.count && sels[0] == matches[current]) {
+                NSSound.beep()
+                return
+            }
+            setScope(sels)
+        } else {
+            setScope([])
+        }
+        search(selectNearest: false, debounce: 0)
+    }
+
     func dismiss() {
+        setScope([])
         generation += 1
         searching = false
         pendingSelectNearest = false
@@ -195,6 +297,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         case "c": toggleOption(\.caseSensitive); return true
         case "w": toggleOption(\.wholeWord); return true
         case "r": toggleOption(\.regex); return true
+        case "l": toggleScope(); return true
         case "f": setReplaceVisible(!replaceVisible); return true
         default: return super.performKeyEquivalent(with: event)
         }
@@ -245,6 +348,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
 
     /// Reloads replace the whole buffer, so neither cached matches nor an in-flight search is valid.
     func documentDidReload() {
+        setScope([])
         snapshot = nil
         snapshotVersion = -1
         matches = []
@@ -261,8 +365,16 @@ final class FindBar: NSView, NSTextFieldDelegate {
     /// Keeps highlights roughly in place while the user edits, then re-searches when they pause.
     func documentChanged(range: NSRange, delta: Int) {
         guard !isHidden else { return }
+        let oldEnd = range.location + range.length - delta
+        if !scope.isEmpty {
+            applyScope(scope.map { s in
+                if oldEnd <= s.location { return NSRange(location: s.location + delta, length: s.length) }
+                if range.location >= NSMaxRange(s) { return s }
+                let start = min(s.location, range.location)
+                return NSRange(location: start, length: max(NSMaxRange(s) + delta, NSMaxRange(range)) - start)
+            })
+        }
         if !matches.isEmpty {
-            let oldEnd = range.location + range.length - delta
             matches = matches.compactMap { m in
                 if NSMaxRange(m) <= range.location { return m }
                 if m.location >= oldEnd { return NSRange(location: m.location + delta, length: m.length) }
@@ -292,14 +404,16 @@ final class FindBar: NSView, NSTextFieldDelegate {
     private func runSearch(_ gen: Int) {
         let selectNearest = pendingSelectNearest
         pendingSelectNearest = false
-        guard let re = FindState.shared.makeRegex() else {
+        guard let re = FindState.shared.makeRegex(wordBoundaries: false) else {
             apply([], selectNearest: false)
             updateCount(invalid: !FindState.shared.query.isEmpty)
             return
         }
         let doc = editor.document
+        let ranges = scope.isEmpty ? [NSRange(location: 0, length: doc.length)] : scope
+        let isWordChar = wordCharTest
         if doc.length <= FindBar.syncLimit {
-            apply(FindBar.collect(re, in: doc.string as String, length: doc.length), selectNearest: selectNearest)
+            apply(FindBar.collect(re, in: doc.string as String, ranges: ranges, isWordChar: isWordChar), selectNearest: selectNearest)
             return
         }
         searching = true
@@ -310,7 +424,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         }
         guard let snapshot = self.snapshot else { return }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            let ms = FindBar.collect(re, in: snapshot as String, length: snapshot.length)
+            let ms = FindBar.collect(re, in: snapshot as String, ranges: ranges, isWordChar: isWordChar)
             DispatchQueue.main.async {
                 guard let self, gen == self.generation else { return }
                 self.searching = false
@@ -319,12 +433,19 @@ final class FindBar: NSView, NSTextFieldDelegate {
         }
     }
 
-    private static func collect(_ re: NSRegularExpression, in text: String, length: Int) -> [NSRange] {
+    /// Whole Word's test for this editor's language, or nil when Whole Word is off.
+    private var wordCharTest: ((UInt16) -> Bool)? {
+        FindState.shared.wholeWord ? FindState.wordCharTest(editor.document.language) : nil
+    }
+
+    private static func collect(_ re: NSRegularExpression, in text: String, ranges: [NSRange],
+                                isWordChar: ((UInt16) -> Bool)?) -> [NSRange] {
         var out: [NSRange] = []
-        re.enumerateMatches(in: text, range: NSRange(location: 0, length: length)) { m, _, stop in
-            guard let r = m?.range, r.location != NSNotFound else { return }
-            out.append(r)
-            if out.count >= FindBar.maxMatches { stop.pointee = true }
+        for range in ranges where out.count < FindBar.maxMatches {
+            FindState.enumerateMatches(re, in: text, range: range, isWordChar: isWordChar) { m in
+                out.append(m.range)
+                return out.count < FindBar.maxMatches
+            }
         }
         return out
     }
@@ -409,12 +530,14 @@ final class FindBar: NSView, NSTextFieldDelegate {
     }
 
     func replaceCurrent() {
-        guard let re = FindState.shared.makeRegex() else { return }
+        guard let re = FindState.shared.makeRegex(wordBoundaries: false) else { return }
         let tv = editor.textView
         let sel = tv.selectedRange()
         let text = editor.document.string as String
         let options: NSRegularExpression.MatchingOptions = [.withTransparentBounds, .withoutAnchoringBounds]
-        if let m = re.firstMatch(in: text, options: options, range: sel), m.range == sel {
+        let inScope = scope.isEmpty || scope.contains { $0.location <= sel.location && NSMaxRange(sel) <= NSMaxRange($0) }
+        if inScope, let m = re.firstMatch(in: text, options: options, range: sel), m.range == sel,
+           FindState.isWholeWord(sel, in: editor.document.string, isWordChar: wordCharTest) {
             let rep = FindState.shared.replacementString(for: m, in: text, regex: re)
             origin = NSRange(location: sel.location + rep.utf16.count, length: 0)
             tv.performEdits([TextEdit(sel, rep)], actionName: "Replace")
@@ -432,12 +555,16 @@ final class FindBar: NSView, NSTextFieldDelegate {
     }
 
     func replaceAll() {
-        guard let re = FindState.shared.makeRegex() else { return }
+        guard let re = FindState.shared.makeRegex(wordBoundaries: false) else { return }
         let text = editor.document.string as String
+        let ranges = scope.isEmpty ? [NSRange(location: 0, length: editor.document.length)] : scope
+        let isWordChar = wordCharTest
         var edits: [TextEdit] = []
-        re.enumerateMatches(in: text, range: NSRange(location: 0, length: editor.document.length)) { m, _, _ in
-            guard let m, m.range.location != NSNotFound else { return }
-            edits.append(TextEdit(m.range, FindState.shared.replacementString(for: m, in: text, regex: re)))
+        for range in ranges {
+            FindState.enumerateMatches(re, in: text, range: range, isWordChar: isWordChar) { m in
+                edits.append(TextEdit(m.range, FindState.shared.replacementString(for: m, in: text, regex: re)))
+                return true
+            }
         }
         guard !edits.isEmpty else { NSSound.beep(); return }
         editor.textView.performEdits(edits, selection: .preserve, actionName: "Replace All")

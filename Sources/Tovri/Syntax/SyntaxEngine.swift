@@ -32,10 +32,11 @@ final class LineBuffer {
 
 /// Holds lexer states at the start of every line and keeps them up to date lazily.
 ///
-/// `states[0..<validUpTo]` are correct for the current text. `states[validUpTo..<knownUpTo]`
-/// were correct before the most recent edits and the text of those lines has not changed since,
-/// so when re-lexing reaches a line whose new start state equals its old one, everything up to
-/// `knownUpTo` becomes valid again without re-lexing (state convergence).
+/// `states[0..<validUpTo]` are correct for the current text. `states[validUpTo..<knownUpTo]` are
+/// some `unknown` lines (inserted by edits) followed by states that were correct before the most
+/// recent edits and still follow one another for the current text, so when re-lexing reaches a
+/// line whose new start state equals its known old one, everything up to `knownUpTo` becomes
+/// valid again without re-lexing (state convergence).
 final class SyntaxEngine {
     static let unknown: UInt32 = .max
     /// Lines longer than this are not colored (state is still tracked) to keep typing responsive.
@@ -72,8 +73,10 @@ final class SyntaxEngine {
         states.replaceSubrange(lo..<hi, with: repeatElement(SyntaxEngine.unknown, count: k))
         let delta = k - r
         if validUpTo > a + 1 {
-            knownUpTo = max(knownUpTo, validUpTo)
-            if knownUpTo > a + r + 1 { knownUpTo += delta } else { knownUpTo = a + 1 }
+            // Only the valid lines below the edit still chain onto each other. An older known
+            // region past validUpTo may hold unknown lines or states the valid region never
+            // re-checked, so it can't be carried over.
+            knownUpTo = validUpTo > a + r + 1 ? validUpTo + delta : a + 1
             validUpTo = a + 1
         } else if knownUpTo > a + 1 {
             knownUpTo = a + 1
@@ -98,7 +101,7 @@ final class SyntaxEngine {
             let next = validUpTo
             let old = states[next]
             states[next] = s
-            if next < knownUpTo && old == s {
+            if next < knownUpTo && old == s && old != SyntaxEngine.unknown {
                 validUpTo = knownUpTo
             } else {
                 validUpTo = next + 1
