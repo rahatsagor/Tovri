@@ -146,8 +146,15 @@ final class ProjectSymbolIndex {
 /// A definition from the project index or from an open document.
 struct WorkspaceSymbol {
     enum Target {
-        case document(Document, NSRange)
+        case document(DocumentReference, NSRange)
         case file(root: URL, relativePath: String)
+    }
+
+    /// Weak, so a list of symbols doesn't keep a closed document, and its unsaved edits, alive.
+    struct DocumentReference {
+        weak var document: Document?
+        let url: URL?
+        init(_ document: Document) { self.document = document; url = document.url }
     }
 
     let name: String
@@ -160,7 +167,7 @@ struct WorkspaceSymbol {
     func isDefinition(in doc: Document, at range: NSRange) -> Bool {
         switch target {
         case .document(let d, let r):
-            return d === doc && NSLocationInRange(range.location, NSRange(location: r.location, length: r.length + 1))
+            return d.document === doc && NSLocationInRange(range.location, NSRange(location: r.location, length: r.length + 1))
         case .file(let root, let rel):
             guard doc.url?.standardizedFileURL.path == root.appendingPathComponent(rel).standardizedFileURL.path else { return false }
             let line = doc.lines.line(containing: range.location)
@@ -171,7 +178,7 @@ struct WorkspaceSymbol {
 
     func belongs(to doc: Document) -> Bool {
         switch target {
-        case .document(let d, _): return d === doc
+        case .document(let d, _): return d.document === doc
         case .file(let root, let rel): return doc.url?.standardizedFileURL.path == root.appendingPathComponent(rel).standardizedFileURL.path
         }
     }

@@ -283,20 +283,32 @@ final class TabBarView: NSView, NSViewToolTipOwner {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let di = dragIndex else { return }
+        guard dragIndex != nil else { return }
         let p = convert(event.locationInWindow, from: nil)
         if !isDragging && abs(p.x - dragStartX) < 5 { return }
         isDragging = true
-        dragX = min(max(leadingInset, p.x - dragMouseOffset), bounds.width - frames[di].width)
-        let center = dragX + frames[di].width / 2 + scrollOffset
-        var target = di
-        if di > 0 && center < frames[di - 1].midX { target = di - 1 }
-        if di + 1 < frames.count && center > frames[di + 1].midX { target = di + 1 }
-        if target != di {
-            delegate?.tabBar(self, didMove: di, to: target)
-            dragIndex = target
-        }
+        drag(to: p)
         needsDisplay = true
+    }
+
+    /// Moves the dragged tab past every neighbor its center has crossed, however far the mouse
+    /// went since the last event.
+    private func drag(to p: NSPoint) {
+        guard var di = dragIndex, di < frames.count else { return }
+        let maxX = max(leadingInset, bounds.width - trailingInset - frames[di].width)
+        dragX = min(max(leadingInset, p.x - dragMouseOffset), maxX)
+        // Bounded, in case the delegate doesn't reorder the tabs.
+        for _ in 0..<frames.count {
+            let center = dragX + frames[di].width / 2 + scrollOffset
+            var target = di
+            if di > 0 && center < frames[di - 1].midX { target = di - 1 }
+            else if di + 1 < frames.count && center > frames[di + 1].midX { target = di + 1 }
+            guard target != di else { break }
+            delegate?.tabBar(self, didMove: di, to: target)
+            guard target < frames.count else { break }
+            di = target
+            dragIndex = di
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -307,6 +319,7 @@ final class TabBarView: NSView, NSViewToolTipOwner {
                 delegate?.tabBar(self, didClose: c)
             }
         }
+        if isDragging { drag(to: p) }
         dragIndex = nil
         isDragging = false
         updateHover(p)

@@ -7,15 +7,33 @@ enum Fuzzy {
         var positions: [Int]
     }
 
-    @inline(__always) static func lower(_ c: UInt16) -> UInt16 { (c >= 65 && c <= 90) ? c + 32 : c }
+    @inline(__always) static func lower(_ c: UInt16) -> UInt16 {
+        if c < 128 { return (c >= 65 && c <= 90) ? c + 32 : c }
+        return c < 0x2000 ? folded[Int(c)] : c
+    }
+
+    /// Lowercase letters without accents for Latin, Greek and Cyrillic (É, é and e all become e),
+    /// built on first use so ASCII-only matching never pays for it. Letters that fold to more
+    /// than one character (ß) stay as they are, the same on both sides of a match.
+    private static let folded: [UInt16] = (0..<0x2000).map { i in
+        let c = UInt16(i)
+        guard i >= 128, let scalar = Unicode.Scalar(c) else { return c }
+        let f = Array(String(Character(scalar)).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).utf16)
+        return f.count == 1 ? f[0] : c
+    }
+
+    @inline(__always) private static func isCombiningMark(_ c: UInt16) -> Bool { c >= 0x300 && c <= 0x36F }
 
     @inline(__always) private static func isBoundary(_ prev: UInt16, _ cur: UInt16) -> Bool {
         if prev == 47 || prev == 95 || prev == 45 || prev == 46 || prev == 32 || prev == 92 || prev == 58 { return true }
         return prev >= 97 && prev <= 122 && cur >= 65 && cur <= 90
     }
 
+    /// Names can be stored decomposed (é as e plus a combining accent, as HFS+ does); the accent
+    /// is dropped from the query and simply skipped in names, so both forms match.
     static func prepare(_ query: String) -> [UInt16] {
-        query.utf16.filter { $0 != 32 }.map(lower)
+        let s = query.utf16.contains { $0 >= 128 } ? query.precomposedStringWithCanonicalMapping : query
+        return s.utf16.compactMap { $0 == 32 || isCombiningMark($0) ? nil : lower($0) }
     }
 
     static func match(_ q: [UInt16], _ c: [UInt16], basenameStart: Int = 0, wantPositions: Bool = true) -> Match? {

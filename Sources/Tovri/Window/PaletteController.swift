@@ -137,10 +137,10 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
     // MARK: Presentation
 
     func show(mode: Mode, initial: String = "") {
+        cancelShownList()
         self.mode = mode
         listTag = nil
         source = []
-        onCancel = nil
         switch mode {
         case .files: field.placeholder = "Search files by name (append :line or @symbol)"
         case .commands: field.placeholder = "Search commands"; source = controller.paletteCommands()
@@ -156,6 +156,7 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
 
     func showList(placeholder: String, items: [PaletteItem], selectedIndex: Int = 0, label: String = "", tip: String = "",
                   tag: String? = nil, onCancel: (() -> Void)? = nil) {
+        cancelShownList()
         mode = .list
         listTag = tag
         source = items
@@ -232,16 +233,38 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         guard isVisible else { return }
         listTag = nil
         backdrop.removeFromSuperview()
-        if cancelled {
-            if let r = restore {
-                r.editor.textView.setAllSelections([r.selection], scroll: false)
-                r.editor.scrollPosition = r.scroll
-            }
-            onCancel?()
-        }
+        if cancelled { cancelShownList() }
         onCancel = nil
         restore = nil
+        releaseItems()
         if cancelled { controller.activeEditor?.focus() }
+    }
+
+    /// Undoes what moving through the list previewed (a caret position, a theme), as when it's
+    /// cancelled, before another list replaces it.
+    private func cancelShownList() {
+        guard isVisible else { return }
+        if let r = restore {
+            r.editor.textView.setAllSelections([r.selection], scroll: false)
+            r.editor.scrollPosition = r.scroll
+        }
+        restore = nil
+        let cancel = onCancel
+        onCancel = nil
+        cancel?()
+    }
+
+    /// Items capture editors and documents; a closed palette must not keep a closed tab's
+    /// document alive, or reopening its file would bring back edits the person chose not to save.
+    private func releaseItems() {
+        source = []
+        results = []
+        symbolCache = []
+        workspaceSymbols = nil
+        narrowing = nil
+        loadGeneration += 1
+        _ = filterGeneration.advance()
+        table.reloadData()
     }
 
     // MARK: Filtering
@@ -314,16 +337,22 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
             return [PaletteItem(title: "Type a line number between 1 and \(e.document.lines.count)", action: {})]
         }
         let col = parts.count > 1 ? max(0, parts[1] &- 1) : 0
-        let preview = { e.goTo(line: line, column: col) }
+        let preview = { [weak e] in
+            guard let e else { return }
+            e.goTo(line: line, column: col)
+        }
         return [PaletteItem(title: "Go to line \(line)" + (parts.count > 1 ? ", column \(parts[1])" : ""), icon: "arrow.right.to.line",
-                            preview: preview, action: { preview(); e.focus() })]
+                            preview: preview, action: { [weak e] in preview(); e?.focus() })]
     }
 
     private func symbolItems() -> [PaletteItem] {
         guard let e = controller.activeEditor else { return [] }
         return symbolCache.map { sym in
-            let preview = { e.select(sym.range) }
-            return PaletteItem(title: sym.name, detail: "line \(sym.line + 1)", icon: "number", preview: preview, action: { preview(); e.focus() })
+            let preview = { [weak e] in
+                guard let e else { return }
+                e.select(sym.range)
+            }
+            return PaletteItem(title: sym.name, detail: "line \(sym.line + 1)", icon: "number", preview: preview, action: { [weak e] in preview(); e?.focus() })
         }
     }
 

@@ -3,36 +3,63 @@ import AppKit
 final class FileNode: NSObject {
     let url: URL
     let isDirectory: Bool
+    /// A symlink to a folder. FileManager won't list a folder through its link, so its
+    /// children are read from the folder it points to.
+    let isLink: Bool
+    /// A link to this folder or one above it; expanding it would never end.
+    let isLoop: Bool
     weak var parent: FileNode?
     var children: [FileNode]?
 
     var name: String { url.lastPathComponent }
     var path: String { url.path }
+    var isExpandable: Bool { isDirectory && !isLoop }
 
-    init(url: URL, isDirectory: Bool, parent: FileNode?) {
+    init(url: URL, isDirectory: Bool, parent: FileNode?, isLink: Bool = false, isLoop: Bool = false) {
         self.url = url
         self.isDirectory = isDirectory
+        self.isLink = isLink
+        self.isLoop = isLoop
         self.parent = parent
     }
 
     func loadChildren() {
+        guard !isLoop else { children = []; return }
         let s = Settings.shared
         let hidden = s.hiddenPatterns
         let fm = FileManager.default
         let opts: FileManager.DirectoryEnumerationOptions = s.showHiddenFiles ? [] : [.skipsHiddenFiles]
-        let urls = (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey], options: opts)) ?? []
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey]
+        let listed = isLink ? URL(fileURLWithPath: url.realPathURL.path, isDirectory: true) : url
+        let urls = (try? fm.contentsOfDirectory(at: listed, includingPropertiesForKeys: keys, options: opts)) ?? []
         var existing: [String: FileNode] = [:]
         for c in children ?? [] { existing[c.url.lastPathComponent] = c }
         var result: [FileNode] = []
-        for u in urls {
-            let name = u.lastPathComponent
+        var realPath: String?
+        for found in urls {
+            let name = found.lastPathComponent
             if hidden.contains(name) { continue }
-            let vals = try? u.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
-            let isDir = (vals?.isDirectory ?? false)
-            if let e = existing[name], e.isDirectory == isDir {
+            // Inside a linked folder, paths stay under the link, where the project shows them.
+            let u = isLink ? url.appendingPathComponent(name) : found
+            let vals = try? found.resourceValues(forKeys: Set(keys))
+            var isDir = (vals?.isDirectory ?? false)
+            var isLink = false
+            var isLoop = false
+            if vals?.isSymbolicLink == true {
+                var target: ObjCBool = false
+                if fm.fileExists(atPath: u.path, isDirectory: &target), target.boolValue {
+                    isDir = true
+                    isLink = true
+                    let own = realPath ?? url.realPathURL.path
+                    realPath = own
+                    let linked = u.realPathURL.path
+                    isLoop = own == linked || own.hasPrefix(linked.hasSuffix("/") ? linked : linked + "/")
+                }
+            }
+            if let e = existing[name], e.isDirectory == isDir, e.isLink == isLink, e.isLoop == isLoop {
                 result.append(e)
             } else {
-                result.append(FileNode(url: u, isDirectory: isDir, parent: self))
+                result.append(FileNode(url: u, isDirectory: isDir, parent: self, isLink: isLink, isLoop: isLoop))
             }
         }
         result.sort { a, b in
@@ -114,7 +141,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     weak var delegate: SidebarDelegate?
     private let titleLabel = NSTextField(labelWithString: "")
     private let scroll = OverlayScrollView(frame: .zero)
-    private let outline = SidebarOutlineView()
+    let outline = SidebarOutlineView()
     private let placeholder = NSTextField(labelWithString: "No Folder Open")
     private lazy var openButton = ToolButton(title: "Open Folder…", tooltip: "Open a project folder to browse and search its files (⌥⌘O)") { [weak self] in
         guard let self else { return }
@@ -347,8 +374,12 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 
     func reveal(_ url: URL, select: Bool = true, expand: Bool = true) {
-        guard let root, url.path.hasPrefix(root.path + "/") else { return }
-        let rel = url.path.dropFirst(root.path.count + 1).split(separator: "/")
+        guard let root else { return }
+        // A file opened through a symlink (/tmp/x) can be in a root kept by its real path (/private/tmp/x).
+        var path = url.path
+        if !path.hasPrefix(root.path + "/") { path = url.realPathURL.path }
+        guard path.hasPrefix(root.path + "/") else { return }
+        let rel = path.dropFirst(root.path.count + 1).split(separator: "/")
         var node = root
         for comp in rel {
             if node.children == nil { node.loadChildren(); nodesByPath[norm(node.path)] = node }
@@ -380,7 +411,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        (item as? FileNode)?.isDirectory ?? false
+        (item as? FileNode)?.isExpandable ?? false
     }
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? { HoverRowView() }
@@ -467,7 +498,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     // MARK: Actions
 
-    private var selectedNode: FileNode? {
+    var selectedNode: FileNode? {
         let row = outline.selectedRow
         return row >= 0 ? outline.item(atRow: row) as? FileNode : nil
     }
@@ -499,56 +530,63 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         if isShowingChanges, let v = changesView { v.focus() } else { window?.makeFirstResponder(outline) }
     }
 
-    private var menuNode: FileNode?
-
     private func contextMenu(row: Int) -> NSMenu? {
         guard let root else { return nil }
         let node = row >= 0 ? (outline.item(atRow: row) as? FileNode ?? root) : root
-        menuNode = node
         if row >= 0 { outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
         let m = NSMenu()
-        func add(_ title: String, _ sel: Selector) { m.addItem(withTitle: title, action: sel, keyEquivalent: "").target = self }
-        add("New File…", #selector(newFile))
-        add("New Folder…", #selector(newFolder))
+        func add(_ title: String, _ sel: Selector) {
+            let item = m.addItem(withTitle: title, action: sel, keyEquivalent: "")
+            item.target = self
+            // Each command acts on the row it was opened for, not on whatever is selected later.
+            item.representedObject = node
+        }
+        add("New File…", #selector(newFile(_:)))
+        add("New Folder…", #selector(newFolder(_:)))
         m.addItem(.separator())
         if node !== root {
-            add("Rename…", #selector(rename))
-            add("Duplicate", #selector(duplicate))
-            add("Move to Trash", #selector(trashMenu))
+            add("Rename…", #selector(rename(_:)))
+            add("Duplicate", #selector(duplicate(_:)))
+            add("Move to Trash", #selector(trashMenu(_:)))
             m.addItem(.separator())
         }
         if node !== root && !node.isDirectory {
-            add("Quick Look", #selector(quickLookMenu))
-            if MainWindowController.prefersQuickLook(node.url) { add("Open as Text", #selector(openAsTextMenu)) }
-            add("Open in Default App", #selector(openInDefaultApp))
+            add("Quick Look", #selector(quickLookMenu(_:)))
+            if MainWindowController.prefersQuickLook(node.url) { add("Open as Text", #selector(openAsTextMenu(_:))) }
+            add("Open in Default App", #selector(openInDefaultApp(_:)))
         }
-        add("Reveal in Finder", #selector(revealInFinder))
-        add("Open in Terminal", #selector(openInTerminal))
-        add("Copy Path", #selector(copyPath))
-        add("Copy Relative Path", #selector(copyRelativePath))
+        add("Reveal in Finder", #selector(revealInFinder(_:)))
+        add("Open in Terminal", #selector(openInTerminal(_:)))
+        add("Copy Path", #selector(copyPath(_:)))
+        add("Copy Relative Path", #selector(copyRelativePath(_:)))
         m.addItem(.separator())
-        add("Find in Folder…", #selector(findInFolder))
+        add("Find in Folder…", #selector(findInFolder(_:)))
         add("Refresh", #selector(refreshMenu))
         return m
     }
 
-    @objc private func quickLookMenu() {
-        guard let node = menuNode ?? selectedNode else { return }
+    /// The row a context menu command was chosen for, or the selection for other senders.
+    private func node(for sender: Any?) -> FileNode? {
+        ((sender as? NSMenuItem)?.representedObject as? FileNode) ?? selectedNode
+    }
+
+    @objc private func quickLookMenu(_ sender: Any?) {
+        guard let node = node(for: sender) else { return }
         delegate?.sidebar(self, quickLook: node.url)
     }
 
-    @objc private func openAsTextMenu() {
-        guard let node = menuNode ?? selectedNode else { return }
+    @objc private func openAsTextMenu(_ sender: Any?) {
+        guard let node = node(for: sender) else { return }
         delegate?.sidebar(self, openAsText: node.url)
     }
 
-    @objc private func openInDefaultApp() {
-        guard let node = menuNode ?? selectedNode else { return }
+    @objc private func openInDefaultApp(_ sender: Any?) {
+        guard let node = node(for: sender) else { return }
         NSWorkspace.shared.open(node.url)
     }
 
-    private var targetDirectory: URL? {
-        guard let n = menuNode ?? selectedNode ?? root else { return nil }
+    private func targetDirectory(for node: FileNode?) -> URL? {
+        guard let n = node ?? root else { return nil }
         return n.isDirectory ? n.url : n.url.deletingLastPathComponent()
     }
 
@@ -576,22 +614,18 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         NSAlert(error: error).runModal()
     }
 
-    private func newFileInRoot() {
-        menuNode = selectedNode ?? root
-        newFile()
-    }
+    private func newFileInRoot() { createFile(in: selectedNode ?? root) }
 
-    private func newFolderAction() {
-        menuNode = selectedNode ?? root
-        newFolder()
-    }
+    private func newFolderAction() { createFolder(in: selectedNode ?? root) }
 
     func collapseAll() {
         outline.collapseItem(nil, collapseChildren: true)
     }
 
-    @objc private func newFile() {
-        guard let dir = targetDirectory, let name = prompt("New File", "untitled.txt", selectBaseName: true) else { return }
+    @objc private func newFile(_ sender: Any?) { createFile(in: node(for: sender) ?? root) }
+
+    private func createFile(in node: FileNode?) {
+        guard let dir = targetDirectory(for: node), let name = prompt("New File", "untitled.txt", selectBaseName: true) else { return }
         let url = dir.appendingPathComponent(name)
         do {
             try SidebarView.createNewFile(at: url)
@@ -607,16 +641,18 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         try Data().write(to: url, options: .withoutOverwriting)
     }
 
-    @objc private func newFolder() {
-        guard let dir = targetDirectory, let name = prompt("New Folder", "New Folder") else { return }
+    @objc private func newFolder(_ sender: Any?) { createFolder(in: node(for: sender) ?? root) }
+
+    private func createFolder(in node: FileNode?) {
+        guard let dir = targetDirectory(for: node), let name = prompt("New Folder", "New Folder") else { return }
         do {
             try FileManager.default.createDirectory(at: dir.appendingPathComponent(name), withIntermediateDirectories: true)
             reloadDirectory(dir)
         } catch { showError(error) }
     }
 
-    @objc private func rename() {
-        guard let node = menuNode ?? selectedNode, node !== root,
+    @objc private func rename(_ sender: Any?) {
+        guard let node = node(for: sender), node !== root,
               let name = prompt("Rename", node.name, selectBaseName: !node.isDirectory), name != node.name else { return }
         let dest = node.url.deletingLastPathComponent().appendingPathComponent(name)
         do {
@@ -626,8 +662,8 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         } catch { showError(error) }
     }
 
-    @objc private func duplicate() {
-        guard let node = menuNode ?? selectedNode, node !== root else { return }
+    @objc private func duplicate(_ sender: Any?) {
+        guard let node = node(for: sender), node !== root else { return }
         let dir = node.url.deletingLastPathComponent()
         let base = node.url.deletingPathExtension().lastPathComponent
         let ext = node.url.pathExtension
@@ -644,11 +680,13 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         } catch { showError(error) }
     }
 
-    @objc private func trashMenu() { trashSelected() }
+    @objc private func trashMenu(_ sender: Any?) { trash(node(for: sender)) }
 
-    private func trashSelected() {
-        guard let node = menuNode ?? selectedNode, node !== root else { return }
-        menuNode = nil
+    /// ⌘⌫ always means the selected row.
+    private func trashSelected() { trash(selectedNode) }
+
+    private func trash(_ node: FileNode?) {
+        guard let node, node !== root else { return }
         let alert = NSAlert()
         alert.messageText = "Move “\(node.name)” to the Trash?"
         alert.addButton(withTitle: "Move to Trash")
@@ -660,34 +698,34 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         }
     }
 
-    @objc private func revealInFinder() {
-        guard let n = menuNode ?? selectedNode ?? root else { return }
+    @objc private func revealInFinder(_ sender: Any?) {
+        guard let n = node(for: sender) ?? root else { return }
         NSWorkspace.shared.activateFileViewerSelecting([n.url])
     }
 
-    @objc private func openInTerminal() {
-        guard let dir = targetDirectory else { return }
+    @objc private func openInTerminal(_ sender: Any?) {
+        guard let dir = targetDirectory(for: node(for: sender)) else { return }
         let config = NSWorkspace.OpenConfiguration()
         if let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
             NSWorkspace.shared.open([dir], withApplicationAt: terminal, configuration: config)
         }
     }
 
-    @objc private func copyPath() {
-        guard let n = menuNode ?? selectedNode ?? root else { return }
+    @objc private func copyPath(_ sender: Any?) {
+        guard let n = node(for: sender) ?? root else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(n.url.path, forType: .string)
     }
 
-    @objc private func copyRelativePath() {
-        guard let n = menuNode ?? selectedNode ?? root, let r = root else { return }
+    @objc private func copyRelativePath(_ sender: Any?) {
+        guard let n = node(for: sender) ?? root, let r = root else { return }
         let rel = n.url.path.hasPrefix(r.path + "/") ? String(n.url.path.dropFirst(r.path.count + 1)) : n.name
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(rel, forType: .string)
     }
 
-    @objc private func findInFolder() {
-        guard let dir = targetDirectory else { return }
+    @objc private func findInFolder(_ sender: Any?) {
+        guard let dir = targetDirectory(for: node(for: sender)) else { return }
         delegate?.sidebar(self, findInFolder: dir)
     }
 
@@ -696,7 +734,6 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         guard let root else { return }
         refresh(node: root, recursive: true)
     }
-
     private func reloadDirectory(_ url: URL) {
         if let n = nodesByPath[norm(url.path)] { refresh(node: n, recursive: false) }
     }

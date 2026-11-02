@@ -29,8 +29,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Word Wrap** is now ⌥⌘Z, so you can type Ω, ż and other Option-Z
+  characters again.
 - Changing the line ending in the status bar is now an unsaved change you can
   undo, instead of saving the file right away.
+- Find in Files stops at the first 10,000 matches and says so, searches what's
+  on screen in files with unsaved changes, and searches UTF-16 files.
 - Whole Word finds searches that start or end with punctuation, such as
   `foo.` or `$name`, and follows each language's word characters.
 - With several cursors, Shift and the arrow keys extend each selection in
@@ -38,6 +42,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   accented letters go to every cursor, and Undo brings back all the cursors.
 - Delete Line, Move Line, Duplicate Line and cutting a line on a folded line
   act on the whole folded block, and moved or duplicated blocks stay folded.
+- Goto Anything matches accented letters regardless of case or accents.
+- Close All Tabs asks about one tab at a time across all columns, and Cancel
+  stops it.
+- Commands that can't do anything, such as Jump Back with no history, are
+  greyed out.
 - Saving keeps a file's hidden flag and updates every hard link to it, and
   Save All and saving when you quit trim whitespace and add the final newline
   the same way ⌘S does.
@@ -63,6 +72,21 @@ and versions follow [Semantic Versioning](https://semver.org/).
   never applied.
 - Tovri could crash when a file it was reading was cut short by another
   program, as log rotation does.
+- Switching to a layout with fewer columns could leave no tab selected, so
+  ⌘W closed the window.
+- Sidebar commands could act on the item you right-clicked earlier instead of
+  the selected one, including Move to Trash.
+- A very broad Find in Files search could freeze Tovri.
+- Jump Back and Jump Forward broke after one of their files was closed.
+- Folders opened through a symlink didn't update the sidebar or show Git
+  colors, and symlinked folders inside a project couldn't be expanded.
+- A theme previewed in the theme picker stayed on when you opened another
+  palette.
+- Excludes containing a slash, such as the default `vendor/bundle`, never
+  matched.
+- Dragging a tab quickly dropped it short of where you let go.
+- Reopening a window with its sidebar hidden turned the sidebar on for new
+  windows, and opening Find in Files and pressing Esc changed your find text.
 - Syntax colors could go wrong further down a long file after Replace All or
   a multi-cursor edit followed by typing above it.
 - Toggle Comment in CSS, HTML and XML broke code when whole lines were

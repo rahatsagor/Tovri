@@ -90,25 +90,85 @@ final class ProjectIndex {
     static func enumerate(root: URL, excludes: Set<String>, limit: Int) -> [String] {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in true }) else { return [] }
-        let rootPath = root.standardizedFileURL.path
-        let prefixLen = rootPath.hasSuffix("/") ? rootPath.count : rootPath.count + 1
+        // FileManager doesn't list a folder given by a symlink, and reports paths with every
+        // link resolved (/tmp as /private/tmp), so the walk starts from the real path.
+        let real = root.realPathURL
+        guard let en = fm.enumerator(at: URL(fileURLWithPath: real.path, isDirectory: true), includingPropertiesForKeys: keys,
+                                     options: [], errorHandler: { _, _ in true }) else { return [] }
+        let list = ExcludeList(excludes)
+        // Standardizing also drops a leading /private, so the forms are compared as standardized paths.
+        let prefixes = Set([real.standardizedFileURL.path, root.standardizedFileURL.path]).map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+        func relative(_ url: URL) -> String? {
+            let path = url.standardizedFileURL.path
+            guard let p = prefixes.first(where: { path.hasPrefix($0) }), path.count > p.count else { return nil }
+            return String(path.dropFirst(p.count))
+        }
         var out: [String] = []
         for case let url as URL in en {
             let name = url.lastPathComponent
             let v = try? url.resourceValues(forKeys: Set(keys))
             let isDir = v?.isDirectory == true
-            if excludes.contains(name) || name == ".DS_Store" {
+            if list.names.contains(name) || name == ".DS_Store" {
                 // skipDescendants() on a file skips the rest of its parent directory.
                 if isDir { en.skipDescendants() }
                 continue
             }
-            if isDir { continue }
-            let path = url.standardizedFileURL.path
-            guard path.count > prefixLen else { continue }
-            out.append(String(path.dropFirst(prefixLen)))
+            if isDir {
+                if list.hasPaths, let rel = relative(url), list.excludes(relativePath: rel) { en.skipDescendants() }
+                continue
+            }
+            // Links to folders aren't followed, so a link back to a parent can't loop, and they aren't files.
+            if v?.isSymbolicLink == true {
+                var linkedDir: ObjCBool = false
+                if fm.fileExists(atPath: url.path, isDirectory: &linkedDir), linkedDir.boolValue { continue }
+            }
+            guard let rel = relative(url) else { continue }
+            if list.hasPaths && list.excludes(relativePath: rel) { continue }
+            out.append(rel)
             if out.count >= limit { break }
         }
         return out
+    }
+}
+
+/// Names of files and folders to skip, from Settings. An entry with a slash, like
+/// `vendor/bundle`, is a path: it matches that folder anywhere in the project, or only at the
+/// top when it starts with a slash.
+struct ExcludeList {
+    let names: Set<String>
+    private let anywhere: [(exact: String, prefix: String, suffix: String, inner: String)]
+    private let anchored: [(exact: String, prefix: String)]
+    var hasPaths: Bool { !anywhere.isEmpty || !anchored.isEmpty }
+
+    init(_ entries: Set<String>) {
+        var names = Set<String>()
+        var anywhere: [(String, String, String, String)] = []
+        var anchored: [(String, String)] = []
+        for e in entries {
+            guard e.contains("/") else { names.insert(e); continue }
+            let p = e.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !p.isEmpty else { continue }
+            if e.hasPrefix("/") { anchored.append((p, p + "/")) } else { anywhere.append((p, p + "/", "/" + p, "/" + p + "/")) }
+        }
+        self.names = names
+        self.anywhere = anywhere
+        self.anchored = anchored
+    }
+
+    /// Whether `rel`, a path below the project folder, is or is inside an excluded path.
+    func excludes(relativePath rel: String) -> Bool {
+        for p in anywhere where rel == p.exact || rel.hasPrefix(p.prefix) || rel.hasSuffix(p.suffix) || rel.contains(p.inner) { return true }
+        for p in anchored where rel == p.exact || rel.hasPrefix(p.prefix) { return true }
+        return false
+    }
+}
+
+extension URL {
+    /// The path with every symlink resolved, including /tmp as /private/tmp, which
+    /// `resolvingSymlinksInPath()` leaves alone. FSEvents and FileManager report paths this way.
+    var realPathURL: URL {
+        guard isFileURL, let p = realpath(path, nil) else { return standardizedFileURL }
+        defer { free(p) }
+        return URL(fileURLWithPath: String(cString: p), isDirectory: hasDirectoryPath)
     }
 }

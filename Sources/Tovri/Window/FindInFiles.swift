@@ -10,6 +10,11 @@ final class FileSearcher {
         var root: URL
         var include: [String]
         var exclude: [String]
+        /// Current text of open documents with unsaved edits, by path relative to `root`;
+        /// searched instead of the file on disk.
+        var unsaved: [String: String] = [:]
+        /// The languages of documents in `unsaved`, whose word characters Whole Word uses.
+        var languages: [String: Language] = [:]
     }
 
     struct Result {
@@ -17,13 +22,38 @@ final class FileSearcher {
         var matches: Int
         var files: Int
         var scanned: Int
+        /// The search stopped at `maxMatches`, `maxFiles` or `maxMatchesPerFile`; `text` has the first ones.
+        var limited = false
+    }
+
+    static let maxMatches = 10_000
+    static let maxFiles = 2_000
+    static let maxMatchesPerFile = 5_000
+
+    private struct Found {
+        var text: String
+        var matches: Int
+        var truncated: Bool
     }
 
     private let lock = NSLock()
     private var _cancelled = false
+    private var found = (matches: 0, files: 0)
     var isCancelled: Bool {
         lock.lock(); defer { lock.unlock() }
         return _cancelled
+    }
+
+    private var hasEnough: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return found.matches >= FileSearcher.maxMatches || found.files >= FileSearcher.maxFiles
+    }
+
+    private func record(_ matches: Int) {
+        lock.lock()
+        found.matches += matches
+        found.files += 1
+        lock.unlock()
     }
 
     func cancel() {
@@ -42,12 +72,24 @@ final class FileSearcher {
         return false
     }
 
-    func run(_ o: Options) -> Result? {
+    /// The search's pattern. Whole Word is left to `wordTest`, which uses the editor's rule.
+    static func regex(for o: Options) -> NSRegularExpression? {
         let st = FindState()
         st.regex = o.regex
         st.caseSensitive = o.caseSensitive
         st.wholeWord = o.wholeWord
-        guard let re = st.makeRegex(query: o.query) else { return nil }
+        return st.makeRegex(query: o.query, wordBoundaries: false)
+    }
+
+    /// Whole Word's word characters for the file at `rel`, the same as in its editor.
+    static func wordTest(_ o: Options, path rel: String) -> ((UInt16) -> Bool)? {
+        guard o.wholeWord else { return nil }
+        let language = o.languages[rel] ?? LanguageRegistry.shared.language(forFileName: (rel as NSString).lastPathComponent)
+        return FindState.wordCharTest(language)
+    }
+
+    func run(_ o: Options) -> Result? {
+        guard let re = FileSearcher.regex(for: o) else { return nil }
         let excludes = Settings.shared.searchExcludes.union(Settings.shared.hiddenPatterns)
         var files = FileSearcher.files(in: o.root, excludes: excludes, limit: 500_000)
         if !o.include.isEmpty || !o.exclude.isEmpty {
@@ -58,26 +100,34 @@ final class FileSearcher {
                 return true
             }
         }
-        var outputs = [String?](repeating: nil, count: files.count)
-        var counts = [Int](repeating: 0, count: files.count)
+        var results = [Found?](repeating: nil, count: files.count)
         let root = o.root
+        let unsaved = o.unsaved
         let chunk = 64
         let chunks = (files.count + chunk - 1) / chunk
-        outputs.withUnsafeMutableBufferPointer { outBuf in
-            counts.withUnsafeMutableBufferPointer { countBuf in
-                let outPtr = outBuf.baseAddress!
-                let countPtr = countBuf.baseAddress!
+        var finished = [Bool](repeating: false, count: chunks)
+        results.withUnsafeMutableBufferPointer { resultBuf in
+            finished.withUnsafeMutableBufferPointer { doneBuf in
+                let resultPtr = resultBuf.baseAddress!
+                let donePtr = doneBuf.baseAddress!
                 DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                    // Chunks start in order, so once enough is found the ones not yet started
+                    // all come after every finished one and the results stay a complete prefix.
+                    if self.hasEnough { return }
                     let start = c * chunk
                     let end = min(files.count, start + chunk)
                     for i in start..<end {
                         if self.isCancelled { return }
                         let url = root.appendingPathComponent(files[i])
-                        if let (text, n) = FileSearcher.search(url, path: url.path, re) {
-                            outPtr[i] = text
-                            countPtr[i] = n
+                        let isWordChar = FileSearcher.wordTest(o, path: files[i])
+                        let hit = unsaved[files[i]].map { FileSearcher.search(text: $0, path: url.path, re, isWordChar: isWordChar) }
+                            ?? FileSearcher.search(url, path: url.path, re, isWordChar: isWordChar)
+                        if let hit {
+                            resultPtr[i] = hit
+                            self.record(hit.matches)
                         }
                     }
+                    donePtr[c] = true
                 }
             }
         }
@@ -85,13 +135,32 @@ final class FileSearcher {
         var text = ""
         var total = 0
         var fileCount = 0
-        for (i, out) in outputs.enumerated() {
-            guard let out else { continue }
-            text += out
-            total += counts[i]
+        var limited = false
+        for (i, found) in results.enumerated() {
+            guard finished[i / chunk] else { limited = true; break }
+            guard let found else { continue }
+            if total >= FileSearcher.maxMatches || fileCount >= FileSearcher.maxFiles { limited = true; break }
+            text += found.text
+            total += found.matches
             fileCount += 1
+            if found.truncated { limited = true }
         }
-        return Result(text: text, matches: total, files: fileCount, scanned: files.count)
+        return Result(text: text, matches: total, files: fileCount, scanned: files.count, limited: limited)
+    }
+
+    /// The Find Results text: a header, the matches by file, and a summary.
+    static func report(_ r: Result, for o: Options, elapsed: TimeInterval) -> String {
+        let time = String(format: "%.2f", elapsed)
+        let matches = "\(r.matches.formatted()) match\(r.matches == 1 ? "" : "es")"
+        let files = "\(r.files.formatted()) file\(r.files == 1 ? "" : "s")"
+        var text = "Searching \(r.scanned.formatted()) files for “\(o.query)” in \(o.root.path)\n\n"
+        text += r.text
+        if r.limited {
+            text += "Showing the first \(matches) in \(files) (\(time)s). There are more: narrow the search or use Include and Exclude to see them.\n"
+        } else {
+            text += "\(matches) across \(files) (\(time)s)\n"
+        }
+        return text
     }
 
     /// In a Git repository, the files Git doesn't ignore; elsewhere, or with Git turned off in
@@ -101,48 +170,82 @@ final class FileSearcher {
         guard Settings.shared.gitEnabled, let listed = GitRepository.find(for: dir)?.unignoredFiles(in: dir) else {
             return ProjectIndex.enumerate(root: root, excludes: excludes, limit: limit)
         }
+        let list = ExcludeList(excludes)
         var out: [String] = []
         for rel in listed {
             let parts = rel.split(separator: "/")
-            if parts.last == ".DS_Store" || parts.contains(where: { excludes.contains(String($0)) }) { continue }
+            if parts.last == ".DS_Store" || parts.contains(where: { list.names.contains(String($0)) }) { continue }
+            if list.hasPaths && list.excludes(relativePath: rel) { continue }
             out.append(rel)
             if out.count >= limit { break }
         }
         return out
     }
 
-    private static func search(_ url: URL, path: String, _ re: NSRegularExpression) -> (String, Int)? {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe), data.count < 25_000_000, !data.isEmpty else { return nil }
-        if data.prefix(8000).contains(0) { return nil }
-        guard let s = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return nil }
+    static let maxFileSize = 25_000_000
+
+    /// The text of a file as the editor shows it, with LF line endings, or nil for binary files.
+    static func text(of data: Data) -> String? {
+        let utf16 = data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF])
+        if !utf16 {
+            let binary = data.withUnsafeBytes { raw -> Bool in
+                guard let base = raw.baseAddress, raw.count > 0 else { return false }
+                return memchr(base, 0, min(raw.count, 8000)) != nil
+            }
+            if binary { return nil }
+        }
+        let decoded = TextEncoding.decode(data)
+        guard !decoded.isBinary else { return nil }
+        return LineEnding.normalize(decoded.text, rawData: decoded.encoding == .utf8 ? data : nil).0
+    }
+
+    private static func search(_ url: URL, path: String, _ re: NSRegularExpression, isWordChar: ((UInt16) -> Bool)?) -> Found? {
+        // Only regular files: opening a FIFO would wait forever.
+        var info = stat()
+        guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size > 0, info.st_size < FileSearcher.maxFileSize else { return nil }
+        guard let data = try? Document.readFile(url), !data.isEmpty, data.count < FileSearcher.maxFileSize,
+              let s = text(of: data), let found = search(text: s, path: path, re, isWordChar: isWordChar) else { return nil }
+        return found
+    }
+
+    /// One line of Find Results: its number and its text, shortened.
+    static func resultLine(_ line: Int, _ content: String) -> String {
+        var content = content
+        if content.count > 300 { content = String(content.prefix(300)) + "…" }
+        content = content.replacingOccurrences(of: "\t", with: "    ")
+        let num = String(line + 1)
+        return String(repeating: " ", count: max(1, 6 - num.count)) + num + ": " + content + "\n"
+    }
+
+    private static func search(text s: String, path: String, _ re: NSRegularExpression, isWordChar: ((UInt16) -> Bool)?) -> Found? {
         let ns = s as NSString
         let len = ns.length
         var out = ""
         var count = 0
+        var truncated = false
         var lastLine = -1
         var line = 0
         var pos = 0
         var lineStart = 0
-        re.enumerateMatches(in: s, range: NSRange(location: 0, length: len)) { m, _, stop in
-            guard let r = m?.range, r.length > 0 else { return }
+        FindState.enumerateMatches(re, in: s, range: NSRange(location: 0, length: len), isWordChar: isWordChar) { m in
+            let r = m.range
+            guard r.length > 0 else { return true }
+            if count == FileSearcher.maxMatchesPerFile { truncated = true; return false }
             while pos < r.location {
                 if ns.character(at: pos) == 10 { line += 1; lineStart = pos + 1 }
                 pos += 1
             }
             count += 1
-            if line == lastLine { return }
+            if line == lastLine { return true }
             lastLine = line
             var e = r.location
             while e < len && ns.character(at: e) != 10 { e += 1 }
-            var content = ns.substring(with: NSRange(location: lineStart, length: e - lineStart))
-            if content.count > 300 { content = String(content.prefix(300)) + "…" }
-            content = content.replacingOccurrences(of: "\t", with: "    ")
-            let num = String(line + 1)
-            out += String(repeating: " ", count: max(1, 6 - num.count)) + num + ": " + content + "\n"
-            if count > 5000 { stop.pointee = true }
+            out += resultLine(line, ns.substring(with: NSRange(location: lineStart, length: e - lineStart)))
+            return true
         }
         guard count > 0 else { return nil }
-        return (path + ":\n" + out + "\n", count)
+        return Found(text: path + ":\n" + out + "\n", matches: count, truncated: truncated)
     }
 }
 
@@ -204,14 +307,16 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
         titleLabel.textColor = theme.chromeSecondary
         [findField, whereField, includeField, excludeField].forEach { $0.applyTheme() }
         let st = FindState.shared
+        // The selection only becomes the shared query when the search runs, so Esc leaves it alone.
+        var query = st.query
         if let e = controller.activeEditor {
             let sel = e.textView.selectedRange()
             if sel.length > 0 && sel.length < 300 {
                 let s = e.document.string.substring(with: sel)
-                if !s.contains("\n") { st.query = s }
+                if !s.contains("\n") { query = s }
             }
         }
-        findField.stringValue = st.query
+        findField.stringValue = query
         errorLabel.stringValue = ""
         caseButton.isOn = st.caseSensitive
         wordButton.isOn = st.wholeWord

@@ -187,7 +187,8 @@ enum MainMenu {
         add(view, "Markdown Preview", #selector(MainWindowController.toggleMarkdownPreview(_:)), "v", [.command, .shift])
         add(view, "Markdown Preview Side by Side", #selector(MainWindowController.toggleMarkdownPreviewSplit(_:)), "v", [.command, .option])
         view.addItem(.separator())
-        add(view, "Word Wrap", #selector(MainWindowController.toggleWordWrap(_:)), "z", [.option])
+        // Not Option-Z alone: an Option-only shortcut takes the key before typing, so Ω or ż couldn't be entered.
+        add(view, "Word Wrap", #selector(MainWindowController.toggleWordWrap(_:)), "z", [.command, .option])
         add(view, "Line Numbers", #selector(MainWindowController.toggleLineNumbers(_:)))
         add(view, "Indent Guides", #selector(MainWindowController.toggleIndentGuides(_:)))
         add(view, "Invisible Characters", #selector(MainWindowController.toggleInvisibles(_:)))

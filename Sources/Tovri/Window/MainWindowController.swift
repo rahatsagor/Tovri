@@ -311,19 +311,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
         if groups.count > n {
             let target = groups[n - 1]
+            let removedActive = activeGroupIndex >= n ? activeTab?.document : nil
             for g in groups[n...] {
                 while !g.tabs.isEmpty {
                     let doc = g.tabs[0].document
-                    let sel = g.tabs[0].editor?.textView.selectedRange()
-                    g.removeTab(at: 0)
+                    guard let tab = g.detachTab(at: 0) else { break }
                     if target.index(of: doc) == nil {
                         let t = target.add(doc, select: false)
-                        t.pendingSelection = sel
+                        t.pendingSelection = tab.pendingSelection
+                        t.pendingScroll = tab.pendingScroll
                     }
                 }
                 g.container.removeFromSuperview()
             }
             groups.removeLast(groups.count - n)
+            // Tabs added without selecting them leave a group that was empty with no editor shown.
+            if let doc = removedActive, let i = target.index(of: doc) {
+                target.select(i)
+            } else if target.selectedIndex < 0, !target.tabs.isEmpty {
+                target.select(0, focus: false)
+            }
         }
         groupDividers.forEach { $0.removeFromSuperview() }
         groupDividers = []
@@ -542,8 +549,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     func editor(_ editor: EditorView, openFindResultPath path: String, line: Int) {
         let target = groups.count > 1 ? groups.first(where: { $0 !== group(containing: editor) }) : nil
+        // The results' own search, not whatever the find bar holds now.
+        let search = lastFindInFiles.flatMap { $0.results === editor.document ? $0.regex : nil }
         open(url: URL(fileURLWithPath: path), line: line, group: target)
-        if let e = activeEditor, let re = FindState.shared.makeRegex() {
+        if let e = activeEditor, let re = search ?? FindState.shared.makeRegex() {
             let r = e.document.lines.range(of: line - 1, textLength: e.document.length)
             if let m = re.firstMatch(in: e.document.string as String, range: r) { e.select(m.range) }
         }
@@ -691,16 +700,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     func openFolder(_ url: URL) {
-        if folderURL != nil && folderURL != url, let app = NSApp.delegate as? AppDelegate {
+        if let current = folderURL, current.path != url.realPathURL.path, let app = NSApp.delegate as? AppDelegate {
             app.newWindow(folder: url)
             return
         }
         setFolder(url)
     }
 
+    /// The folder is kept by its real path: FileManager can't list a folder through a symlink,
+    /// and FSEvents, the file tree and Git all report real paths (/private/tmp, not /tmp).
     func setFolder(_ url: URL?) {
         watcher?.stop()
         watcher = nil
+        let url = url.map { URL(fileURLWithPath: $0.realPathURL.path, isDirectory: true) }
         folderURL = url
         sidebar.setRoot(url)
         if let url {
@@ -719,10 +731,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 }
             }
             RecentFiles.shared.add(url)
-            if !sidebarVisible {
-                sidebarVisible = true
-                Settings.shared.sidebarVisible = true
-            }
+            // Shown for this window only. The setting is the person's own choice from View → Sidebar,
+            // and restoring a window that had its sidebar hidden must not turn it back on.
+            sidebarVisible = true
         } else {
             projectIndex = nil
         }
@@ -947,6 +958,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let g = activeGroup
         if g.selectedIndex >= 0 {
             closeTab(in: g, at: g.selectedIndex)
+        } else if !g.tabs.isEmpty {
+            g.select(0)
         } else if groups.count > 1 {
             setLayout(.single)
         } else {
@@ -968,11 +981,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     @objc func closeAllTabs(_ sender: Any?) {
-        for g in groups { closeTabs(in: g, where: { _ in true }) }
+        closeTabsInAllGroups(where: { _ in true })
     }
 
     @objc func closeSavedTabs(_ sender: Any?) {
-        for g in groups { closeTabs(in: g, where: { !$0.isDirty }) }
+        closeTabsInAllGroups(where: { !$0.isDirty })
+    }
+
+    /// One tab at a time across every group, so a Cancel stops the whole command. A tab that
+    /// asks about saving is shown first.
+    private func closeTabsInAllGroups(where pred: @escaping (Document) -> Bool) {
+        for g in groups {
+            guard let i = g.tabs.firstIndex(where: { pred($0.document) }) else { continue }
+            if g.tabs[i].document.isDirty {
+                activate(group: g)
+                g.select(i)
+            }
+            closeTab(in: g, at: i) { [weak self] ok in
+                if ok { self?.closeTabsInAllGroups(where: pred) }
+            }
+            return
+        }
     }
 
     private func closeTabs(in g: EditorGroup, where pred: @escaping (Document) -> Bool) {
@@ -1412,10 +1441,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     @objc func copyRelativePath(_ sender: Any?) {
         guard let url = activeDocument?.url else { return }
-        var s = url.lastPathComponent
-        if let r = folderURL?.path, url.path.hasPrefix(r + "/") { s = String(url.path.dropFirst(r.count + 1)) }
+        let s = pathInFolder(url) ?? url.lastPathComponent
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
+    }
+
+    /// `url`'s path inside the open folder, also for a file opened through a symlink to it.
+    func pathInFolder(_ url: URL) -> String? {
+        guard let root = folderURL?.path else { return nil }
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        let path = url.standardizedFileURL.path
+        if path.hasPrefix(prefix) { return String(path.dropFirst(prefix.count)) }
+        let real = url.realPathURL.path
+        return real.hasPrefix(prefix) ? String(real.dropFirst(prefix.count)) : nil
     }
 
     // MARK: Find
@@ -1427,54 +1465,80 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     @objc func useSelectionForFindCommand(_ sender: Any?) { activeEditor?.useSelectionForFind() }
     @objc func showFindInFiles(_ sender: Any?) { findInFilesPanel.show(folder: nil) }
 
+    /// The search shown in the Find Results tab, used when a result is opened.
+    private struct FindInFilesSearch {
+        weak var results: Document?
+        let regex: NSRegularExpression?
+    }
+    private var lastFindInFiles: FindInFilesSearch?
+
     func runFindInFiles(_ options: FileSearcher.Options) {
         searcher?.cancel()
         let s = FileSearcher()
         searcher = s
+        var options = options
+        options.unsaved = unsavedTexts(under: options.root)
         statusBar.message = "Searching for “\(options.query)”…"
         let started = Date()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, options] in
             let result = s.run(options)
+            let text = result.map { FileSearcher.report($0, for: options, elapsed: Date().timeIntervalSince(started)) }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.searcher === s else { return }
                 self.searcher = nil
                 self.statusBar.message = nil
-                guard let result else {
+                guard let text else {
                     if !s.isCancelled { NSSound.beep() }
                     return
                 }
-                let elapsed = String(format: "%.2f", Date().timeIntervalSince(started))
-                var text = "Searching \(result.scanned) files for “\(options.query)” in \(options.root.path)\n\n"
-                text += result.text
-                text += "\(result.matches) match\(result.matches == 1 ? "" : "es") across \(result.files) file\(result.files == 1 ? "" : "s") (\(elapsed)s)\n"
                 let st = FindState()
                 st.regex = options.regex
                 st.caseSensitive = options.caseSensitive
                 st.wholeWord = options.wholeWord
-                self.showFindResults(text, highlight: st.makeRegex(query: options.query))
+                let re = st.makeRegex(query: options.query)
+                let doc = self.showFindResults(text, highlight: re)
+                self.lastFindInFiles = FindInFilesSearch(results: doc, regex: re)
             }
         }
     }
 
-    private func showFindResults(_ text: String, highlight re: NSRegularExpression?) {
-        var shown = false
+    /// Open documents with unsaved edits inside `root`, by path relative to it, so Find in Files
+    /// searches what's on screen rather than the older file on disk.
+    private func unsavedTexts(under root: URL) -> [String: String] {
+        var out: [String: String] = [:]
+        let rootPath = root.realPathURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        for d in (NSApp.delegate as? AppDelegate)?.controllers.flatMap({ $0.allOpenDocuments() }) ?? allOpenDocuments() where d.isDirty {
+            guard let path = d.url?.realPathURL.path, path.hasPrefix(prefix) else { continue }
+            out[String(path.dropFirst(prefix.count))] = d.string.copy() as? String
+        }
+        return out
+    }
+
+    @discardableResult
+    func showFindResults(_ text: String, highlight re: NSRegularExpression?) -> Document {
+        var shown: Document?
         for g in groups {
             if let i = g.tabs.firstIndex(where: { $0.document.isFindResults }) {
                 g.tabs[i].document.replaceAllContent(text)
                 activate(group: g)
                 g.select(i)
-                shown = true
+                shown = g.tabs[i].document
                 break
             }
         }
-        if !shown {
-            let doc = Document(text: text, name: "Find Results", language: LanguageRegistry.shared.findResults)
+        let doc: Document
+        if let shown {
+            doc = shown
+        } else {
+            doc = Document(text: text, name: "Find Results", language: LanguageRegistry.shared.findResults)
             doc.isReadOnly = true
             doc.isTransient = true
             activeGroup.add(doc)
         }
         activeEditor?.goTo(line: 1)
         if let re { activeEditor?.highlightFindResults(re) }
+        return doc
     }
 
     // MARK: Palette
@@ -1489,7 +1553,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let all = LanguageRegistry.shared.all
         let items = all.map { lang in
             PaletteItem(title: lang.name, detail: lang.extensions.prefix(4).map { "." + $0 }.joined(separator: " "),
-                        icon: lang === doc.language ? "checkmark" : nil) { doc.setLanguage(lang) }
+                        icon: lang === doc.language ? "checkmark" : nil) { [weak doc] in doc?.setLanguage(lang) }
         }
         palette.showList(placeholder: "Set syntax", items: items, selectedIndex: all.firstIndex { $0 === doc.language } ?? 0, label: "Syntax")
     }
@@ -1589,17 +1653,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let assemble = { [weak self] () -> [WorkspaceSymbol] in
             guard let self else { return [] }
             let root = self.folderURL?.standardizedFileURL
-            let rootPrefix = root.map { $0.path + "/" }
             var out: [WorkspaceSymbol] = []
             var overridden = Set<String>()
             for d in self.allOpenDocuments() {
                 let path = d.url?.standardizedFileURL.path
-                let rel = path.flatMap { p in rootPrefix.flatMap { p.hasPrefix($0) ? String(p.dropFirst($0.count)) : nil } }
+                let rel = d.url.flatMap { self.pathInFolder($0) }
                 if rel != nil && !d.isDirty { continue }
                 if let rel { overridden.insert(rel) }
                 let shown = rel ?? path.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? d.displayName
                 for s in d.symbols() {
-                    out.append(WorkspaceSymbol(name: s.name, units: Array(s.name.utf16), target: .document(d, s.range),
+                    out.append(WorkspaceSymbol(name: s.name, units: Array(s.name.utf16), target: .document(.init(d), s.range),
                                                line: s.line, column: s.range.location - d.lines.start(of: s.line), displayPath: shown))
                 }
             }
@@ -1875,7 +1938,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     func jump(to symbol: WorkspaceSymbol) {
         switch symbol.target {
-        case .document(let d, let range):
+        case .document(let ref, let range):
+            guard let d = ref.document else {
+                // Closed since the list was made: open the file, if it has one, at the symbol's line.
+                if let url = ref.url { open(url: url, line: symbol.line + 1, column: symbol.column + 1) } else { NSSound.beep() }
+                return
+            }
             recordHistory()
             if let (g, i) = locate(d) {
                 activate(group: g)
@@ -1899,8 +1967,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     // MARK: History
 
+    /// Set while Jump Back or Forward opens a point, which must not truncate the forward entries.
+    private var isNavigatingHistory = false
+
     private func recordHistory() {
-        guard let e = activeEditor else { return }
+        guard !isNavigatingHistory, let e = activeEditor else { return }
         let point = HistoryPoint(e.document, e.textView.selectedRange().location)
         if historyIndex < history.count - 1 { history.removeLast(history.count - 1 - historyIndex) }
         if let last = history.last, last.doc === point.doc, abs(last.location - point.location) < 2 { return }
@@ -1925,6 +1996,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     private func go(to point: HistoryPoint) {
+        isNavigatingHistory = true
+        defer { isNavigatingHistory = false }
         if let doc = point.doc {
             if let (g, i) = locate(doc) {
                 activate(group: g)
@@ -2156,6 +2229,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             return activeDocument?.url != nil
         case #selector(closeFolder(_:)): return folderURL != nil
         case #selector(closeOtherTabs(_:)): return activeGroup.tabs.count > 1
+        case #selector(closeTabsToRight(_:)): return activeGroup.selectedIndex >= 0 && activeGroup.selectedIndex < activeGroup.tabs.count - 1
+        case #selector(closeAllTabs(_:)): return groups.contains { !$0.tabs.isEmpty }
+        case #selector(selectNextTabCommand(_:)), #selector(selectPreviousTabCommand(_:)), #selector(selectTabByNumber(_:)):
+            return !activeGroup.tabs.isEmpty
+        case #selector(jumpBack(_:)): return historyIndex >= 0 && historyIndex < history.count
+        case #selector(jumpForward(_:)): return historyIndex + 2 < history.count
+        case #selector(printActiveDocument(_:)): return activeEditor != nil
         case #selector(moveTabLeft(_:)): return activeGroup.selectedIndex > 0
         case #selector(moveTabRight(_:)): return activeGroup.selectedIndex >= 0 && activeGroup.selectedIndex < activeGroup.tabs.count - 1
         case #selector(moveTabToNextGroup(_:)), #selector(splitTabRight(_:)): return activeTab != nil
@@ -2170,7 +2250,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             return s.gitGutter && activeEditor != nil
         case #selector(showChangedFiles(_:)): return s.gitEnabled
         case #selector(showFileHistory(_:)): return s.gitChangesAndHistory && activeDocument?.url != nil
-        case #selector(reopenClosedTab(_:)): return !closedTabs.isEmpty
+        case #selector(reopenClosedTab(_:)): return closedTabs.last { FileManager.default.fileExists(atPath: $0.path) } != nil
         case #selector(toggleMarkdownPreview(_:)):
             menuItem.state = activeEditor?.previewMode == .full ? .on : .off
             return activeEditor?.isMarkdown == true
