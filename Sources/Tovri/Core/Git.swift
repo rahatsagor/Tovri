@@ -83,8 +83,23 @@ final class GitRepository {
            let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
             candidates.append(s + "/usr/bin/git")
         }
-        return candidates.first { fm.isExecutableFile(atPath: $0) }
+        return candidates.first { path in
+            fm.isExecutableFile(atPath: path)
+                && runProcess(URL(fileURLWithPath: path), ["--version"], environment: ["LC_ALL": "C", "PATH": "/usr/bin:/bin"], timeout: 5)
+                    .map { isSupported(version: String(decoding: $0, as: UTF8.self)) } == true
+        }
     }()
+
+    /// Tovri's safety settings reach git in GIT_CONFIG_COUNT variables, which git ignores before
+    /// 2.31. An older git would run with the repository's own settings, so it isn't used at all.
+    static func isSupported(version output: String) -> Bool {
+        // "git version 2.39.5 (Apple Git-154)"
+        let words = output.split(separator: " ")
+        guard words.count >= 3, words[0] == "git", words[1] == "version" else { return false }
+        let parts = words[2].split(separator: ".").map { Int($0.prefix { $0.isNumber }) }
+        guard parts.count >= 2, let major = parts[0], let minor = parts[1] else { return false }
+        return major > 2 || (major == 2 && minor >= 31)
+    }
 
     private init(root: URL) { self.root = root }
 
@@ -163,42 +178,108 @@ final class GitRepository {
         return String(p.dropFirst(r.count + 1))
     }
 
+    typealias ConfigSetting = (key: String, value: String)
+
     /// Settings that let a repository run programs. A cloned or downloaded `.git` folder is
     /// untrusted, and Tovri runs git on its own whenever files change, so these are always off.
-    private static let safetyOptions = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+    static let safetySettings: [ConfigSetting] = [
+        ("core.fsmonitor", "false"),
+        ("core.hooksPath", "/dev/null"),
+        // Showing a signed commit runs the signature program, which the repository can name.
+        ("log.showSignature", "false"),
+        ("gpg.program", "false"),
+        ("gpg.openpgp.program", "false"),
+        ("gpg.ssh.program", "false"),
+        ("gpg.x509.program", "false"),
+        ("protocol.allow", "never"),
+    ]
 
-    private func run(_ args: [String]) -> Data? {
-        // `git config` only reads settings, so it can safely list the filters to neutralize.
-        let filters = rawRun(["config", "-z", "--get-regexp", "^filter\\."]).map(GitRepository.filterOverrides) ?? []
-        return rawRun(filters + args)
+    /// The user's home and config folders, so git reads their global config and ignore file the
+    /// way it does in Terminal. That config is the user's own; the safety settings and filter
+    /// overrides take precedence over it as they do over the repository's.
+    static var userEnvironment: [String: String] = {
+        var env = ["HOME": ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()]
+        if let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdg.isEmpty { env["XDG_CONFIG_HOME"] = xdg }
+        return env
+    }()
+
+    /// The environment for every git command. Settings are passed in GIT_CONFIG_KEY_<n> and
+    /// GIT_CONFIG_VALUE_<n> rather than `-c`, which splits at the first `=`: for a filter named
+    /// `x=y`, `-c filter.x=y.clean=` sets `filter.x` instead and leaves the filter running.
+    static func environment(_ settings: [ConfigSetting]) -> [String: String] {
+        var env = userEnvironment
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        // No fetch may run, including the lazy fetch of a partial clone's missing objects.
+        // GIT_NO_LAZY_FETCH needs git 2.44; an empty GIT_ALLOW_PROTOCOL refuses every transport
+        // on any version and, unlike protocol.allow, can't be relaxed by protocol.<name>.allow.
+        env["GIT_NO_LAZY_FETCH"] = "1"
+        env["GIT_ALLOW_PROTOCOL"] = ""
+        // Paths are file names, not patterns, so `[ab].txt` or `:x` mean only that file.
+        env["GIT_LITERAL_PATHSPECS"] = "1"
+        env["LC_ALL"] = "C"
+        env["PATH"] = "/usr/bin:/bin"
+        env["GIT_CONFIG_COUNT"] = String(settings.count)
+        for (i, s) in settings.enumerated() {
+            env["GIT_CONFIG_KEY_\(i)"] = s.key
+            env["GIT_CONFIG_VALUE_\(i)"] = s.value
+        }
+        return env
+    }
+
+    private func run(_ args: [String], acceptedStatuses: Set<Int32> = [0]) -> Data? {
+        guard let filters = configuredFilters() else { return nil }
+        return rawRun(args, GitRepository.safetySettings + GitRepository.filterSettings(names: filters), acceptedStatuses: acceptedStatuses)
+    }
+
+    /// Names of the filter drivers in the repository's and the user's config. `git config` only
+    /// reads settings, so it can safely list them. It exits with 1 when there are none; any other
+    /// failure returns nil, and no command runs.
+    private func configuredFilters() -> Set<String>? {
+        rawRun(["config", "-z", "--get-regexp", "^filter\\."], GitRepository.safetySettings, acceptedStatuses: [0, 1])
+            .flatMap(GitRepository.filterNames)
+    }
+
+    /// Filter names in `git config -z --get-regexp ^filter\.` output. Each entry is the key, a
+    /// newline and the value. A key can't contain a newline, but a filter's name can contain dots,
+    /// `=`, spaces and quotes, so it ends at the key's last dot. Nil when a name isn't UTF-8 and
+    /// so can't be passed to git to switch the filter off.
+    static func filterNames(_ configOutput: Data) -> Set<String>? {
+        var names = Set<String>()
+        for entry in configOutput.split(separator: 0) {
+            guard let key = String(bytes: entry.prefix { $0 != 10 }, encoding: .utf8) else { return nil }
+            guard key.hasPrefix("filter."), let dot = key.lastIndex(of: "."), dot >= key.index(key.startIndex, offsetBy: 7) else { continue }
+            names.insert(String(key[key.index(key.startIndex, offsetBy: 7)..<dot]))
+        }
+        return names
     }
 
     /// Empty commands for every configured clean/smudge/process filter, so `status` can't run them.
-    static func filterOverrides(_ configOutput: Data) -> [String] {
-        var names = Set<String>()
-        for entry in configOutput.split(separator: 0) {
-            let key = String(decoding: entry.prefix { $0 != 10 }, as: UTF8.self)
-            guard key.hasPrefix("filter."), let dot = key.lastIndex(of: "."), dot > key.index(key.startIndex, offsetBy: 6) else { continue }
-            names.insert(String(key[key.index(key.startIndex, offsetBy: 7)..<dot]))
-        }
-        return names.sorted().flatMap { name in
-            ["clean=", "smudge=", "process=", "required=false"].flatMap { ["-c", "filter.\(name).\($0)"] }
+    static func filterSettings(_ configOutput: Data) -> [ConfigSetting]? {
+        filterNames(configOutput).map { filterSettings(names: $0) }
+    }
+
+    static func filterSettings(names: Set<String>) -> [ConfigSetting] {
+        names.sorted().flatMap { name in
+            [("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")].map { ("filter.\(name).\($0.0)", $0.1) }
         }
     }
 
-    private func rawRun(_ args: [String]) -> Data? {
+    private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0]) -> Data? {
         guard let git = GitRepository.executable else { return nil }
-        return GitRepository.runProcess(URL(fileURLWithPath: git), ["-C", root.path] + GitRepository.safetyOptions + args,
-                                        environment: ["GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1", "LC_ALL": "C", "PATH": "/usr/bin:/bin"])
+        // A repository's core.worktree could point git at another folder, so a restore would
+        // write files outside the one shown. The work tree is always the folder holding `.git`.
+        return GitRepository.runProcess(URL(fileURLWithPath: git), ["-C", root.path, "--work-tree=" + root.path] + args,
+                                        environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses)
     }
 
     /// Longest a git command may run before it is stopped.
     static let timeout: TimeInterval = 30
 
-    /// Standard output of a successful run, or nil if it failed or ran past `timeout`. The
-    /// output is read on another thread, so a stalled network volume, or a child process
-    /// that keeps the pipe open, can't hold the caller past the timeout.
-    static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout) -> Data? {
+    /// Standard output of a run that exited with one of `acceptedStatuses`, or nil if it failed
+    /// or ran past `timeout`. The output is read on another thread, so a stalled network volume,
+    /// or a child process that keeps the pipe open, can't hold the caller past the timeout.
+    static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout,
+                           acceptedStatuses: Set<Int32> = [0]) -> Data? {
         final class Output: @unchecked Sendable { var data = Data() }
         let p = Process()
         p.executableURL = executable
@@ -228,12 +309,14 @@ final class GitRepository {
             }
             return nil
         }
-        return p.terminationReason == .exit && p.terminationStatus == 0 ? output.data : nil
+        return p.terminationReason == .exit && acceptedStatuses.contains(p.terminationStatus) ? output.data : nil
     }
+
+    static let statusArguments = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]
 
     func status(_ completion: @escaping ([String: GitFileStatus]) -> Void) {
         GitRepository.queue.async {
-            let data = self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"])
+            let data = self.run(GitRepository.statusArguments)
             let result = data.map(GitRepository.parseStatus) ?? [:]
             DispatchQueue.main.async { completion(result) }
         }
@@ -280,9 +363,8 @@ final class GitRepository {
     /// just read to skip running `git status` again.
     func changedFiles(status known: [String: GitFileStatus]? = nil, _ completion: @escaping ([ChangedFile]) -> Void) {
         GitRepository.queue.async {
-            let status = known ?? self.run(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"])
-                .map(GitRepository.parseStatus) ?? [:]
-            let counts = status.isEmpty ? [:] : (self.run(["diff", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
+            let status = known ?? self.run(GitRepository.statusArguments).map(GitRepository.parseStatus) ?? [:]
+            let counts = status.isEmpty ? [:] : (self.run(["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
             var out: [ChangedFile] = []
             for (path, st) in status where st != .ignored {
                 var f = ChangedFile(path: path, status: st)
@@ -321,9 +403,19 @@ final class GitRepository {
         return result
     }
 
+    /// Lines in a regular file of up to 4 MB that isn't binary, following a symlink to its target.
     static func lineCount(of url: URL) -> Int? {
-        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= 4_000_000,
-              let data = try? Data(contentsOf: url), !data.contains(0) else { return nil }
+        let limit = 4_000_000
+        // O_NONBLOCK keeps a FIFO from blocking the open, and fstat checks what was actually
+        // opened, so a link to /dev/zero or a huge file is refused before anything is read.
+        let fd = open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size <= limit else { return nil }
+        let data: Data
+        do { data = try file.read(upToCount: limit + 1) ?? Data() } catch { return nil }
+        guard data.count <= limit, !data.contains(0) else { return nil }
         guard !data.isEmpty else { return 0 }
         let newlines = data.reduce(0) { $1 == 10 ? $0 + 1 : $0 }
         return newlines + (data.last == 10 ? 0 : 1)
@@ -375,7 +467,7 @@ final class GitRepository {
         GitRepository.queue.async {
             // -z writes each path as-is, ending in NUL; without it git quotes and escapes
             // non-ASCII names, tabs, quotes and newlines.
-            let data = self.run(["log", "--follow", "-z", "-n", String(limit), "--format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s", "--name-only", "--", rel])
+            let data = self.run(["log", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--follow", "-z", "-n", String(limit), "--format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s", "--name-only", "--", rel])
             let commits = data.map { GitRepository.parseHistory($0, fallbackPath: rel) } ?? []
             DispatchQueue.main.async { completion(commits) }
         }
@@ -404,7 +496,7 @@ final class GitRepository {
     /// Raw bytes of `path` (relative to the repository) in `commit`, or nil if it isn't there.
     func contents(of path: String, at commit: String, _ completion: @escaping (Data?) -> Void) {
         GitRepository.queue.async {
-            let data = self.run(["show", commit + ":" + path])
+            let data = self.run(["show", "--no-textconv", commit + ":" + path])
             DispatchQueue.main.async { completion(data) }
         }
     }
@@ -414,7 +506,7 @@ final class GitRepository {
     func headContents(of url: URL, _ completion: @escaping (Data?) -> Void) {
         guard let rel = relativePath(url) else { completion(nil); return }
         GitRepository.queue.async {
-            let data = self.run(["show", "HEAD:" + rel])
+            let data = self.run(["show", "--no-textconv", "HEAD:" + rel])
             DispatchQueue.main.async { completion(data) }
         }
     }

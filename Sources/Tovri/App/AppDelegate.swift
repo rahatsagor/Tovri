@@ -110,9 +110,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// app can fire a tovri:// URL, but it can't plant such a file.
     private static func cliTempFile(_ path: String, prefix: String) -> URL? {
         let file = URL(fileURLWithPath: path).standardizedFileURL
-        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath().path
+        // The CLI writes to `getconf DARWIN_USER_TEMP_DIR`, which is usually the app's own
+        // temporary folder too; both are private to this user.
+        var tmpDirs = [NSTemporaryDirectory()]
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        if confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) > 0 { tmpDirs.append(String(cString: buffer)) }
+        let allowed = Set(tmpDirs.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
         guard file.lastPathComponent.hasPrefix(prefix),
-              file.deletingLastPathComponent().resolvingSymlinksInPath().path == tmpDir,
+              allowed.contains(file.deletingLastPathComponent().resolvingSymlinksInPath().path),
               let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
               attrs[.type] as? FileAttributeType == .typeRegular,
               (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid()

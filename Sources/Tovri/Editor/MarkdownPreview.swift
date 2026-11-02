@@ -15,6 +15,8 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
 
     private let webView: WKWebView
     private let messages = PreviewMessageProxy()
+    private let resources = PreviewResourceHandler()
+    private let remoteBar = RemoteContentBar()
     private var loaded = false
     private var pendingBody: (html: String, base: String)?
     private var pendingLine: Int?
@@ -29,17 +31,20 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
 
     override init(frame: NSRect) {
         let config = WKWebViewConfiguration()
-        config.setURLSchemeHandler(PreviewResourceHandler(), forURLScheme: MarkdownPreviewView.scheme)
+        config.setURLSchemeHandler(resources, forURLScheme: MarkdownPreviewView.scheme)
         config.userContentController.add(messages, name: "tovri")
         config.websiteDataStore = .nonPersistent()
         webView = WKWebView(frame: frame, configuration: config)
         super.init(frame: frame)
         messages.onLine = { [weak self] line in self?.topLine = line }
-        messages.onRemoteContent = { [weak self] in self?.onRequestRemoteContent?() }
+        messages.onRemoteContentBlocked = { [weak self] in self?.remoteContentWasBlocked() }
         webView.setValue(false, forKey: "drawsBackground")
         webView.navigationDelegate = self
         webView.allowsMagnification = true
         addSubview(webView)
+        remoteBar.isHidden = true
+        remoteBar.onLoad = { [weak self] in self?.onRequestRemoteContent?() }
+        addSubview(remoteBar)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -51,8 +56,18 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
     override func layout() {
         super.layout()
         let inset: CGFloat = showsDivider ? 1 : 0
-        webView.frame = NSRect(x: inset, y: 0, width: max(0, bounds.width - inset), height: bounds.height)
+        let bar = remoteBar.isHidden ? 0 : RemoteContentBar.height
+        remoteBar.frame = NSRect(x: inset, y: bounds.height - bar, width: max(0, bounds.width - inset), height: bar)
+        webView.frame = NSRect(x: inset, y: 0, width: max(0, bounds.width - inset), height: max(0, bounds.height - bar))
     }
+
+    /// Called when the page blocked a remote image or video.
+    func remoteContentWasBlocked() {
+        guard !allowsRemoteContent, remoteBar.isHidden else { return }
+        remoteBar.isHidden = false
+        needsLayout = true
+    }
+
 
     override func draw(_ dirtyRect: NSRect) {
         let theme = ThemeManager.shared.active
@@ -90,6 +105,10 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
     /// Loads the page shell (styles for the current theme); content is then swapped in via JS.
     func loadShell(theme: Theme, fontSize: CGFloat) {
         loaded = false
+        resources.startPage()
+        remoteBar.isHidden = true
+        remoteBar.applyTheme(theme)
+        needsLayout = true
         webView.loadHTMLString(MarkdownPreviewView.shell(theme: theme, fontSize: fontSize, allowRemote: allowsRemoteContent),
                                baseURL: MarkdownPreviewView.pageURL)
     }
@@ -152,7 +171,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         return out
     }
 
-    private static func shell(theme t: Theme, fontSize: CGFloat, allowRemote: Bool) -> String {
+    static func shell(theme t: Theme, fontSize: CGFloat, allowRemote: Bool) -> String {
         let remote = allowRemote ? "*" : ""
         let fg = css(t.foreground), muted = css(t.chromeSecondary), accent = css(t.color(.link) ?? t.accent)
         let border = css(t.chromeBorder), codeBg = css(t.fieldBackground), bg = t.translucent ? "transparent" : css(t.background)
@@ -196,9 +215,6 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         .front-matter { opacity: .75; }
         kbd { font-family: \(mono); font-size: .8em; border: 1px solid \(border); border-bottom-width: 2px; border-radius: 4px; padding: .1em .4em; }
         mark { background: \(css(t.findMatch)); color: inherit; }
-        #remote { display: none; position: sticky; top: 0; z-index: 10; margin: -32px -40px 16px; padding: 8px 40px;
-                  font-size: 12px; color: \(muted); background: \(codeBg); border-bottom: 1px solid \(border); }
-        #remote.shown { display: block; } #remote a { cursor: pointer; margin-left: .6em; }
         @media print {
           :root { color-scheme: light; }
           html, body { background: #fff !important; }
@@ -210,7 +226,6 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
           blockquote, h6, .front-matter { color: #59636e; }
           pre, pre code { white-space: pre-wrap; }
           pre, img, tr { break-inside: avoid; }
-          #remote { display: none !important; }
           \(t.isDark ? "pre code span { color: inherit !important; }" : "")
         }
         ::-webkit-scrollbar { width: 12px; height: 12px; background: transparent; }
@@ -236,13 +251,11 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
           }
           window.scrollTo(0, Math.max(0, y - 16));
         }
+        let remoteBlocked = false;
         document.addEventListener('securitypolicyviolation', e => {
-          if (/^https?:/.test(e.blockedURI)) document.getElementById('remote').classList.add('shown');
-        });
-        document.addEventListener('click', e => {
-          if (e.target.id !== 'remote-load') return;
-          e.preventDefault();
-          window.webkit.messageHandlers.tovri.postMessage({ remote: true });
+          if (remoteBlocked || !/^https?:/.test(e.blockedURI)) return;
+          remoteBlocked = true;
+          window.webkit.messageHandlers.tovri.postMessage({ remoteBlocked: true });
         });
         document.addEventListener('click', e => {
           const a = e.target.closest && e.target.closest('a[href^="#"]');
@@ -268,7 +281,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
             window.webkit.messageHandlers.tovri.postMessage(line);
           });
         }, { passive: true });
-        </script></head><body><div id="remote">Remote images are blocked to protect your privacy.<a id="remote-load" href="#">Load Remote Images</a></div><div id="content"></div></body></html>
+        </script></head><body><div id="content"></div></body></html>
         """
     }
 }
@@ -276,11 +289,65 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
 /// Breaks the retain cycle between WKUserContentController and the preview view.
 private final class PreviewMessageProxy: NSObject, WKScriptMessageHandler {
     var onLine: ((Int) -> Void)?
-    var onRemoteContent: (() -> Void)?
+    var onRemoteContentBlocked: (() -> Void)?
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         if let n = message.body as? Int { onLine?(n) } else if let d = message.body as? Double { onLine?(Int(d)) }
-        else if let d = message.body as? [String: Any], d["remote"] as? Bool == true { onRemoteContent?() }
+        else if let d = message.body as? [String: Any], d["remoteBlocked"] as? Bool == true { onRemoteContentBlocked?() }
     }
+}
+
+/// Offers to load the remote images a document asked for. It is a native view rather than part
+/// of the page because the document's own HTML and CSS could restyle an in-page button to cover
+/// the whole preview, so that any click would load them.
+private final class RemoteContentBar: NSView {
+    static let height: CGFloat = 30
+    private let label = NSTextField(labelWithString: "Remote images are blocked to protect your privacy.")
+    private let button = NSButton(title: "Load Remote Images", target: nil, action: nil)
+    private var theme: Theme?
+    var onLoad: (() -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        label.font = .systemFont(ofSize: 12)
+        label.lineBreakMode = .byTruncatingTail
+        button.isBordered = false
+        button.target = self
+        button.action = #selector(load)
+        addSubview(label)
+        addSubview(button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func applyTheme(_ t: Theme) {
+        theme = t
+        label.textColor = t.chromeSecondary
+        button.attributedTitle = NSAttributedString(string: "Load Remote Images", attributes: [
+            .font: NSFont.systemFont(ofSize: 12), .foregroundColor: t.color(.link) ?? t.accent])
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    @objc private func load() { onLoad?() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let t = theme else { return }
+        t.fieldBackground.setFill()
+        bounds.fill()
+        t.chromeBorder.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+    }
+
+    override func layout() {
+        super.layout()
+        let b = button.fittingSize
+        let l = label.fittingSize
+        let labelWidth = max(0, min(l.width, bounds.width - 16 - 8 - b.width - 12))
+        label.frame = NSRect(x: 16, y: floor((bounds.height - l.height) / 2), width: labelWidth, height: l.height)
+        button.frame = NSRect(x: label.frame.maxX + 8, y: floor((bounds.height - b.height) / 2), width: b.width, height: b.height)
+    }
+
+    override func resetCursorRects() { addCursorRect(button.frame, cursor: .pointingHand) }
 }
 
 /// Serves images and media referenced by the previewed document. Other file types are refused,
@@ -288,8 +355,18 @@ private final class PreviewMessageProxy: NSObject, WKScriptMessageHandler {
 private final class PreviewResourceHandler: NSObject, WKURLSchemeHandler {
     private static let allowed: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tif", "tiff", "avif", "heic",
                                                "mp4", "m4v", "mov", "webm", "mp3", "m4a", "wav", "ogg", "oga", "ogv"]
-    private static let maxSize = 64 * 1024 * 1024
+    static let maxSize = 64 * 1024 * 1024
     private var stopped = Set<ObjectIdentifier>()
+    private var budget = PreviewResourceBudget()
+    private let reads: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 2
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+
+    /// A new page starts with the whole budget; WebKit drops the old page's copies.
+    func startPage() { budget = PreviewResourceBudget() }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url, url.host == "file" else { fail(task); return }
@@ -297,11 +374,9 @@ private final class PreviewResourceHandler: NSObject, WKURLSchemeHandler {
         let ext = (path as NSString).pathExtension.lowercased()
         guard PreviewResourceHandler.allowed.contains(ext) else { fail(task); return }
         let id = ObjectIdentifier(task)
-        DispatchQueue.global(qos: .userInitiated).async {
-            // stat follows symlinks, so a link to a huge or special file is measured as its target.
-            var info = stat()
-            let isSmallFile = stat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG && info.st_size <= PreviewResourceHandler.maxSize
-            let data = isSmallFile ? FileManager.default.contents(atPath: path) : nil
+        let budget = self.budget
+        reads.addOperation {
+            let data = PreviewResourceHandler.read(path, admittedBy: budget, as: PreviewResourceBudget.key(for: url))
             DispatchQueue.main.async {
                 guard self.stopped.remove(id) == nil else { return }
                 guard let data else { self.fail(task); return }
@@ -317,7 +392,51 @@ private final class PreviewResourceHandler: NSObject, WKURLSchemeHandler {
         stopped.insert(ObjectIdentifier(task))
     }
 
+    /// The file at `path` if it is a regular file of up to `maxSize` that fits in `budget`.
+    static func read(_ path: String, admittedBy budget: PreviewResourceBudget, as key: String) -> Data? {
+        // O_NONBLOCK keeps a FIFO from blocking the open. fstat follows symlinks and measures the
+        // file actually opened, so a link to a huge or special file is refused as its target.
+        let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size <= maxSize,
+              budget.admit(key, size: Int(info.st_size)) else { return nil }
+        let data: Data
+        do { data = try file.read(upToCount: maxSize + 1) ?? Data() } catch { return nil }
+        return data.count <= maxSize ? data : nil
+    }
+
     private func fail(_ task: WKURLSchemeTask) {
         task.didFailWithError(URLError(.fileDoesNotExist))
+    }
+}
+
+/// Limits how much the preview's page may load from disk in total. WebKit keeps its own copy of
+/// every resource, one per URL, so a document listing `big.mp4?1`, `big.mp4?2` and so on would
+/// otherwise hold a full copy of the file for each. A URL loaded again, as happens whenever the
+/// document is edited, costs nothing more.
+final class PreviewResourceBudget {
+    static let limit = 256 * 1024 * 1024
+    private let lock = NSLock()
+    private var admitted: [String: Int] = [:]
+    private(set) var total = 0
+
+    /// The URL as WebKit tells resources apart. The fragment is dropped since it never selects
+    /// different data; the query is kept because WebKit stores each query as a separate copy.
+    static func key(for url: URL) -> String {
+        guard var c = URLComponents(url: url, resolvingAgainstBaseURL: true) else { return url.absoluteString }
+        c.fragment = nil
+        return c.string ?? url.absoluteString
+    }
+
+    func admit(_ key: String, size: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if admitted[key] != nil { return true }
+        guard size <= PreviewResourceBudget.limit - total else { return false }
+        admitted[key] = size
+        total += size
+        return true
     }
 }

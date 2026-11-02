@@ -41,10 +41,10 @@ final class SecurityTests: XCTestCase {
 
     func testFilterOverridesCoverEveryConfiguredFilter() {
         let config = Data("filter.lfs.clean\ngit-lfs clean\u{0}filter.my.odd.name.smudge\nx\u{0}".utf8)
-        let args = GitRepository.filterOverrides(config)
-        XCTAssertTrue(args.contains("filter.lfs.clean="))
-        XCTAssertTrue(args.contains("filter.my.odd.name.process="))
-        XCTAssertTrue(args.contains("filter.lfs.required=false"))
+        let settings = (GitRepository.filterSettings(config) ?? []).map { "\($0.key)=\($0.value)" }
+        XCTAssertTrue(settings.contains("filter.lfs.clean="))
+        XCTAssertTrue(settings.contains("filter.my.odd.name.process="))
+        XCTAssertTrue(settings.contains("filter.lfs.required=false"))
     }
 
     func testCommandLinePositionsAreClamped() {

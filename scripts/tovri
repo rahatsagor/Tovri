@@ -58,8 +58,14 @@ if [ -z "$APP" ]; then
 fi
 launch() { if [ -n "$APP" ]; then open -a "$APP" "$@"; else open -b "$BUNDLE" "$@"; fi; }
 WAITDIR="$HOME/Library/Application Support/Tovri/Wait"
+# Tovri reads requests only from this user's own temporary folder. TMPDIR can point elsewhere,
+# or be unset over SSH, so the folder is looked up instead of using mktemp -t.
+TMPROOT=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)
+[ -n "$TMPROOT" ] && [ -d "$TMPROOT" ] || TMPROOT="${TMPDIR:-/tmp}"
+TMPROOT="${TMPROOT%/}"
 URLS=()
 MARKERS=()
+REQUESTS=()
 
 add_wait() {
     if [ $WAIT -eq 1 ]; then
@@ -75,13 +81,14 @@ add_wait() {
 # Tovri only acts on requests stored in files this user created, so web pages can't drive it.
 add_request() {
     local req
-    req=$(mktemp -t tovri-req)
+    req=$(mktemp "$TMPROOT/tovri-req.XXXXXXXX") || exit 1
     printf '%s' "$QUERY" > "$req"
+    REQUESTS+=("$req")
     URLS+=("tovri://open?req=$(hex "$req")")
 }
 
 if [ $STDIN -eq 1 ]; then
-    TMP=$(mktemp -t tovri-stdin)
+    TMP=$(mktemp "$TMPROOT/tovri-stdin.XXXXXXXX") || exit 1
     cat > "$TMP"
     QUERY="stdin=$(hex "$TMP")"
     [ $NEW -eq 1 ] && QUERY+="&new=1" && NEW=0
@@ -115,14 +122,32 @@ fi
 
 launch "${URLS[@]}" || exit $?
 
+unread_request() {
+    local r
+    for r in "${REQUESTS[@]}"; do [ -e "$r" ] && return 0; done
+    return 1
+}
+
 if [ $WAIT -eq 1 ]; then
     ticks=0
+    running=0
     for m in "${MARKERS[@]}"; do
         while [ -e "$m" ]; do
             sleep 0.2
             ticks=$((ticks + 1))
-            # Give Tovri time to launch, then stop waiting if it quit or crashed.
-            if [ $ticks -gt 50 ] && [ $((ticks % 10)) -eq 0 ] && ! pgrep -x -U "$(id -u)" Tovri >/dev/null; then
+            [ $((ticks % 10)) -eq 0 ] || continue
+            if pgrep -x -U "$(id -u)" Tovri >/dev/null; then
+                running=$((running + 1))
+                # Tovri deletes each request it accepts. One still there after Tovri has been
+                # running for 20 seconds was refused, so nothing will ever release the wait.
+                if [ $running -ge 10 ] && unread_request; then
+                    echo "tovri: Tovri didn't accept the request, so there is nothing to wait for." >&2
+                    rm -f "${MARKERS[@]}" "${REQUESTS[@]}"
+                    [ -n "${TMP:-}" ] && rm -f "$TMP"
+                    exit 1
+                fi
+            elif [ $ticks -gt 50 ]; then
+                # Give Tovri time to launch, then stop waiting if it quit or crashed.
                 rm -f "${MARKERS[@]}"
                 exit 0
             fi

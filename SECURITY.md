@@ -20,17 +20,22 @@ Only the latest release receives fixes.
 - **Markdown preview.** The preview is the only web view in Tovri. Its page
   allows only Tovri's own script, so scripts, forms and frames in a Markdown
   file never run. From disk it can read only image and media files, and
-  only small ones. Remote images and media are blocked
-  until you click **Load Remote Images** or allow them in
+  only small ones, up to 256 MB per preview. Remote images and media are
+  blocked until you click **Load Remote Images** in the bar above the preview
+  (which the document can't draw or click itself) or allow them in
   **Settings → Files**, because loading them tells the sender when and where
   the document was read. Links to local files open in Tovri, in Quick Look or
   as a folder; they never launch an app or a script. Web and email links open
   in your default browser or mail app.
-- **Git.** Tovri only reads from Git: the branch, file status and the last
-  committed copy of a file. It never commits, checks out or fetches. A
+- **Git.** Tovri only reads from Git: the branch, file status, history and
+  committed copies of files. It never commits, checks out or fetches. A
   repository's own configuration can name programs for Git to run, so Tovri
-  runs Git with hooks and `core.fsmonitor` turned off and every configured
-  filter neutralized. Browsing a cloned folder doesn't run anything from its
+  runs Git with hooks, `core.fsmonitor`, signature checking and every network
+  transport turned off, every configured filter neutralized, and the work tree
+  pinned to the repository's folder. These settings are passed in a way the
+  repository can't override, and Tovri doesn't use Git versions older
+  than 2.31, which ignore them. Browsing a cloned folder doesn't run
+  anything from its
   `.git` folder.
 - **EditorConfig.** `.editorconfig` files only set indentation, whitespace
   and line endings. Their patterns are matched in linear time, so a hostile

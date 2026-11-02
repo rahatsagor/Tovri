@@ -22,6 +22,24 @@ and versions follow [Semantic Versioning](https://semver.org/).
   bindings and custom themes to a file, and **Import…** brings them back,
   on the same Mac or another one.
 
+### Fixed
+
+- Files ignored only by your global Git ignore file, such as `.DS_Store`,
+  showed as new in the sidebar and the Changes list.
+- `tovri -w` waited forever over SSH or with a custom `TMPDIR`.
+
+### Security
+
+- A repository could make Git run one of its own programs through File
+  History (signature checking), through filters with unusual names, through
+  submodules, or by allowing a network transport. Tovri now turns all of these
+  off in a way the repository can't override.
+- A Markdown file could make an ordinary click load remote images. The
+  button is now outside the document, and very large previews stop loading
+  media after 256 MB.
+- A symlink to a device such as `/dev/zero` in a repository could make the
+  Changes list read forever.
+
 ## [0.3.0] - 2026-11-01
 
 ### Added
