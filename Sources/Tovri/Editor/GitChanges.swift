@@ -127,7 +127,8 @@ final class GitChangeCard: NSView {
         }
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
-        setAccessibilityLabel("Change since the last commit: \(title.stringValue)")
+        setAccessibilityLabel(editor.comparisonLabel.map { "Change compared with \($0): \(title.stringValue)" }
+                              ?? "Change since the last commit: \(title.stringValue)")
         applyTheme()
     }
 

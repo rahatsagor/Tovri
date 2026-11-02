@@ -29,9 +29,24 @@ enum SnippetHighlighter {
     }
 }
 
-/// Compare with Last Commit, shown in the editor itself: lines removed since the last commit are
-/// drawn struck through in gaps above the lines that replaced them, and added or changed lines
-/// are tinted. Exists only while an editor is comparing.
+/// What an editor compares with when it isn't the last commit.
+enum ComparisonSource: Equatable {
+    /// A commit chosen in File History.
+    case commit
+    /// The file on disk, while the document has unsaved edits.
+    case saved
+    case clipboard
+    case file(URL)
+    /// An earlier version kept by Local History.
+    case snapshot(LocalHistory.Snapshot)
+
+    /// Comparing with commits is a Git feature and follows Settings → Git; the others always work.
+    var usesGit: Bool { self == .commit }
+}
+
+/// A comparison shown in the editor itself (with the last commit, or any other text): lines
+/// removed since then are drawn struck through in gaps above the lines that replaced them, and
+/// added or changed lines are tinted. Exists only while an editor is comparing.
 final class InlineDiff {
     private(set) var gaps = TovriLayoutManager.Gaps()
     /// Added or changed lines of the current text.

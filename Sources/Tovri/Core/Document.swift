@@ -543,6 +543,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         var text = textStorage.mutableString as String
         if lineEnding != .lf { text = text.replacingOccurrences(of: "\n", with: lineEnding.string) }
         guard let data = encoding.encode(text) else { throw DocumentError.encodingFailed(encoding) }
+        LocalHistory.shared.recordBeforeOverwrite(of: resolved, with: data)
         try Document.writeFile(data, replacing: resolved)
         let nameChanged = url != dest
         let wasUntitled = url == nil

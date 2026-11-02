@@ -66,6 +66,11 @@ a `sudo` command for you to run yourself instead of asking for your password.
   they are not encrypted, so they are as safe as the rest of your home
   folder. Turn hot exit off in **Settings → Files** if you edit secrets you
   don't want kept on disk.
+- Local History keeps earlier versions of files you save over, and their
+  original paths, only on your Mac, in
+  `~/Library/Application Support/Tovri/History`, readable only by your user
+  account. It is never uploaded or shared, and **File → Clear Local
+  History…** deletes it.
 
 ## Network
 

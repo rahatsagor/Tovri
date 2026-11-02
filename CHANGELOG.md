@@ -21,6 +21,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A **Backup** settings pane. **Export…** saves your preferences, key
   bindings and custom themes to a file, and **Import…** brings them back,
   on the same Mac or another one.
+- **Compare with Saved**, **Compare with Clipboard** and **Compare with
+  File…** in the File menu show the differences right in the editor, the same
+  way Compare with Last Commit does, and Revert Change undoes single changes.
+- **Local History.** Tovri keeps earlier versions of a file each time you
+  save over it, up to 50 versions or 30 days per file, only on your Mac.
+  **File → Local History…** compares the file with an earlier version, and
+  **Restore This Version** brings it back as a change you can undo. **Clear
+  Local History…** deletes them.
 - **Find in Selection** (⌥⌘L) in the find bar. It turns on by itself when you
   open the bar with several lines selected, and Replace All then changes only
   the selection.

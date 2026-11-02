@@ -246,8 +246,8 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         textView.applyFontMetrics()
         layoutManager.showInvisibles = s.showInvisibles
         textView.scrollPastEnd = s.scrollPastEnd
-        if comparisonLabel == nil ? !s.gitGutter : !s.gitChangesAndHistory { setComparing(false) }
-        if !s.gitGutter { closeChangeCard() }
+        if comparisonLabel == nil ? !s.gitGutter : comparisonUsesGit && !s.gitChangesAndHistory { setComparing(false) }
+        if !s.gitGutter && comparisonUsesGit { closeChangeCard() }
         inlineDiff?.invalidateRendering()
         gutter.showsNumbers = s.showLineNumbers
         gutter.updateStyle()
@@ -466,6 +466,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
             // A comparison with an earlier commit may still be computing.
             comparisonBase = nil
             comparisonLabel = nil
+            comparisonSource = nil
             baseDiffGeneration += 1
             baseLineDiff = LineDiff()
             gutter.needsDisplay = true
@@ -474,6 +475,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         closeChangeCard()
         comparisonBase = nil
         comparisonLabel = nil
+        comparisonSource = nil
         baseDiffGeneration += 1
         baseLineDiff = LineDiff()
         preservingViewport {
@@ -484,9 +486,13 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         return true
     }
 
-    /// Text compared with instead of the last commit (File History), and how to name it.
-    private var comparisonBase: String?
+    /// Text compared with instead of the last commit (File History, the saved file, the
+    /// clipboard, another file, Local History), how to name it, and where it came from.
+    private(set) var comparisonBase: String?
     private(set) var comparisonLabel: String?
+    private(set) var comparisonSource: ComparisonSource?
+    /// Comparisons with commits follow Settings → Git; the saved file, the clipboard and Local History don't.
+    private var comparisonUsesGit: Bool { comparisonSource?.usesGit ?? true }
     private var baseDiffGeneration = 0
     private var baseDiffScheduled = false
     private var baseLineDiff = LineDiff()
@@ -495,7 +501,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     /// The changes the gutter, change card, Revert and Next/Previous Change work with: against the
     /// commit chosen in File History while comparing with it, otherwise against HEAD.
     var lineDiff: LineDiff {
-        if comparisonLabel != nil { return Settings.shared.gitChangesAndHistory ? baseLineDiff : LineDiff() }
+        if comparisonLabel != nil { return !comparisonUsesGit || Settings.shared.gitChangesAndHistory ? baseLineDiff : LineDiff() }
         return Settings.shared.gitGutter ? document.gitDiff : LineDiff()
     }
 
@@ -506,11 +512,12 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     /// Compares the editor with `base`, e.g. the file in an earlier commit, the same way
     /// Compare with Last Commit does. `completion` runs once the comparison is shown.
-    func compare(withBase base: String, label: String, completion: ((InlineDiff) -> Void)? = nil) {
-        guard Settings.shared.gitChangesAndHistory else { return }
+    func compare(withBase base: String, label: String, source: ComparisonSource = .commit, completion: ((InlineDiff) -> Void)? = nil) {
+        guard !source.usesGit || Settings.shared.gitChangesAndHistory else { return }
         closeChangeCard()
         comparisonBase = base
         comparisonLabel = label
+        comparisonSource = source
         baseLineDiff = LineDiff()
         baseDiffVersion = -1
         computeBaseDiff(completion)
@@ -538,7 +545,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
             DispatchQueue.main.async {
                 guard let self, generation == self.baseDiffGeneration, self.comparisonBase != nil else { return }
                 // Turned off in Settings while diffing.
-                guard Settings.shared.gitChangesAndHistory else { self.setComparing(false); return }
+                guard !self.comparisonUsesGit || Settings.shared.gitChangesAndHistory else { self.setComparing(false); return }
                 // An edit arrived while diffing; its own recompute is already scheduled.
                 guard version == self.document.editVersion else { self.scheduleBaseDiff(); return }
                 let inline = InlineDiff(diff: diff, lineCount: self.document.lines.count)

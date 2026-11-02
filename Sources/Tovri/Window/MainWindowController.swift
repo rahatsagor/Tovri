@@ -177,7 +177,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     private(set) var projectIndex: ProjectIndex?
     private var symbolIndex: ProjectSymbolIndex?
     private var watcher: FileWatcher?
-    private lazy var palette = PaletteController(controller: self)
+    private(set) lazy var palette = PaletteController(controller: self)
     private lazy var findInFilesPanel = FindInFilesPanel(controller: self)
     private var closedTabs: [URL] = []
     private var sidebarVisible: Bool
@@ -426,6 +426,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     @objc private func documentStateChanged(_ n: Notification) {
         guard let d = n.object as? Document else { return }
         if d.url != nil { updateSidebarDirtyMarks() }
+        comparisonDocumentStateChanged(d)
         guard d === activeDocument else { return }
         updateTitle()
         updateStatusBar()
@@ -2200,6 +2201,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Validation
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if let enabled = validateComparisonItem(menuItem) { return enabled }
         let s = Settings.shared
         switch menuItem.action {
         case #selector(toggleSidebarCommand(_:)): menuItem.state = isSidebarShown ? .on : .off
