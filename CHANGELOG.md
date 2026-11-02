@@ -34,6 +34,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
   **File → Local History…** compares the file with an earlier version, and
   **Restore This Version** brings it back as a change you can undo. **Clear
   Local History…** deletes them.
+- The **Changes** list shows staged and unstaged changes separately.
+  Right-click a file, or press Space and ⌘⌫, to stage, unstage or discard its
+  changes, open them as a patch or reveal it in Finder, and use **Stage All**
+  and **Unstage All** in the section headers. Discard Changes asks first and
+  puts new files and a copy of changed files in the Trash. Files that use a
+  Git filter, such as Git LFS, are left to Terminal.
 - **Find in Selection** (⌥⌘L) in the find bar. It turns on by itself when you
   open the bar with several lines selected, and Replace All then changes only
   the selection.

@@ -68,8 +68,8 @@ struct LineDiff {
     }
 }
 
-/// Thin, read-only Git integration: branch, file status and HEAD contents. Commands run on a
-/// background queue; nothing runs unless a real git binary is installed.
+/// Thin Git integration: branch, file status and HEAD contents, and staging or discarding from the
+/// Changes list. Commands run on a background queue; nothing runs unless a real git binary is installed.
 final class GitRepository {
     let root: URL
     private static var cache: [String: GitRepository] = [:]
@@ -322,10 +322,64 @@ final class GitRepository {
         }
     }
 
+    /// One entry of `git status --porcelain=v1`: the file's state in the index (X) and in the work
+    /// tree (Y).
+    struct StatusEntry: Equatable {
+        var path: String
+        /// The path before a rename or copy.
+        var originalPath: String?
+        var index: Character
+        var workTree: Character
+
+        var isConflicted: Bool {
+            index == "U" || workTree == "U" || (index == "A" && workTree == "A") || (index == "D" && workTree == "D")
+        }
+
+        /// The change a commit would record, or nil when nothing is staged.
+        var staged: GitFileStatus? {
+            guard !isConflicted else { return nil }
+            switch index {
+            case "M", "T": return .modified
+            case "A", "C": return .added
+            case "D": return .deleted
+            case "R": return .renamed
+            default: return nil
+            }
+        }
+
+        /// The change in the work tree that isn't staged, or nil when there is none.
+        var unstaged: GitFileStatus? {
+            if isConflicted { return .conflicted }
+            switch (index, workTree) {
+            case ("?", "?"): return .untracked
+            case ("!", _): return nil
+            case (_, "M"), (_, "T"): return .modified
+            case (_, "D"): return .deleted
+            // An intent-to-add file (`git add -N`) is added, or renamed, in the work tree only.
+            case (_, "A"): return .added
+            case (_, "R"), (_, "C"): return .renamed
+            default: return nil
+            }
+        }
+
+        /// The file's state as a whole, as the sidebar colors it.
+        var status: GitFileStatus {
+            switch (index, workTree) {
+            case ("?", "?"): return .untracked
+            case ("!", "!"): return .ignored
+            case _ where isConflicted: return .conflicted
+            case ("R", _), (_, "R"): return .renamed
+            case ("A", _), ("C", _), (_, "C"): return .added
+            case ("D", _), (_, "D"): return .deleted
+            default: return .modified
+            }
+        }
+    }
+
     /// Parses `git status --porcelain=v1 -z`. Renames and copies, in the index or (for
     /// intent-to-add files) the work tree, are followed by an extra field holding the old path.
-    static func parseStatus(_ data: Data) -> [String: GitFileStatus] {
-        var result: [String: GitFileStatus] = [:]
+    static func parseStatusEntries(_ data: Data) -> [StatusEntry] {
+        var result: [StatusEntry] = []
         let parts = data.split(separator: 0, omittingEmptySubsequences: true)
         var i = 0
         while i < parts.count {
@@ -334,28 +388,30 @@ final class GitRepository {
             guard entry.count > 3 else { continue }
             let x = Character(Unicode.Scalar(entry[entry.startIndex]))
             let y = Character(Unicode.Scalar(entry[entry.startIndex + 1]))
-            let path = String(decoding: entry.dropFirst(3), as: UTF8.self)
-            if "RC".contains(x) || "RC".contains(y) { i += 1 }
-            let s: GitFileStatus
-            switch (x, y) {
-            case ("?", "?"): s = .untracked
-            case ("!", "!"): s = .ignored
-            case ("U", _), (_, "U"), ("A", "A"), ("D", "D"): s = .conflicted
-            case ("R", _), (_, "R"): s = .renamed
-            case ("A", _), ("C", _), (_, "C"): s = .added
-            case ("D", _), (_, "D"): s = .deleted
-            default: s = .modified
+            var e = StatusEntry(path: String(decoding: entry.dropFirst(3), as: UTF8.self), index: x, workTree: y)
+            if "RC".contains(x) || "RC".contains(y) {
+                if i < parts.count { e.originalPath = String(decoding: parts[i], as: UTF8.self) }
+                i += 1
             }
-            result[path] = s
+            result.append(e)
         }
         return result
     }
 
-    struct ChangedFile {
+    static func parseStatus(_ data: Data) -> [String: GitFileStatus] {
+        var result: [String: GitFileStatus] = [:]
+        for e in parseStatusEntries(data) { result[e.path] = e.status }
+        return result
+    }
+
+    struct ChangedFile: Equatable {
         var path: String
         var status: GitFileStatus
         var added: Int?
         var removed: Int?
+        /// In the Changes list, whether this is the file's staged change rather than its work-tree change.
+        var staged = false
+        var originalPath: String?
     }
 
     /// Files with uncommitted changes and their line counts against HEAD. Untracked files count
@@ -378,6 +434,43 @@ final class GitRepository {
             out.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
             DispatchQueue.main.async { completion(out) }
         }
+    }
+
+    /// The Changes list: each file's staged change, counted against HEAD, and its unstaged change,
+    /// counted against the staged copy. A file with both is listed twice.
+    func changeList(_ completion: @escaping ([ChangedFile]) -> Void) {
+        GitRepository.queue.async {
+            let entries = self.run(GitRepository.statusArguments).map(GitRepository.parseStatusEntries) ?? []
+            let out = self.changeList(entries)
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    private func changeList(_ entries: [StatusEntry]) -> [ChangedFile] {
+        let diff = ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z"]
+        let stagedCounts = entries.contains { $0.staged != nil }
+            ? run(diff + ["--cached", "--"]).map(GitRepository.parseNumstat) ?? [:] : [:]
+        let unstagedCounts = entries.contains { $0.unstaged != nil && $0.unstaged != .untracked }
+            ? run(diff + ["--"]).map(GitRepository.parseNumstat) ?? [:] : [:]
+        var out: [ChangedFile] = []
+        for e in entries {
+            if let st = e.staged {
+                var f = ChangedFile(path: e.path, status: st, staged: true, originalPath: e.originalPath)
+                if let c = stagedCounts[e.path] { (f.added, f.removed) = (c.added, c.removed) }
+                out.append(f)
+            }
+            if let st = e.unstaged {
+                var f = ChangedFile(path: e.path, status: st, originalPath: e.staged == nil ? e.originalPath : nil)
+                if let c = unstagedCounts[e.path] {
+                    (f.added, f.removed) = (c.added, c.removed)
+                } else if st == .untracked, let n = GitRepository.lineCount(of: root.appendingPathComponent(e.path)) {
+                    (f.added, f.removed) = (n, 0)
+                }
+                out.append(f)
+            }
+        }
+        out.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        return out
     }
 
     /// Parses `git diff --numstat -z`. Binary files report "-" and get no counts.
@@ -448,6 +541,196 @@ final class GitRepository {
                 }
             }
             DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    // MARK: Staging and discarding
+
+    /// What staging, unstaging or discarding did, file by file.
+    struct ActionResult {
+        enum Refusal: Equatable { case filtered, conflicted, notBackedUp }
+        var done: [String] = []
+        /// Files left as they were, and why.
+        var refused: [(path: String, reason: Refusal)] = []
+        /// Files git reported an error for.
+        var failed: [String] = []
+    }
+
+    /// Stage, unstage and discard each take git's index lock, so they run one at a time.
+    private static let actionQueue = DispatchQueue(label: "app.tovri.git-actions", qos: .userInitiated)
+
+    func perform(_ action: @escaping (GitRepository) -> ActionResult, completion: @escaping (ActionResult) -> Void) {
+        GitRepository.actionQueue.async {
+            let result = action(self)
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    static func moveToTrash(_ url: URL) throws { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
+
+    /// The files among `paths` whose `filter` attribute names a filter driver in the repository's
+    /// or the user's config, such as Git LFS. Tovri switches filters off, so `git add` would store
+    /// such a file without its clean step, and `git restore` would write what is stored (an LFS
+    /// pointer) without its smudge step. `check-attr` only reads attribute files. Nil if git failed.
+    func filteredPaths(_ paths: [String]) -> Set<String>? {
+        guard !paths.isEmpty else { return [] }
+        guard let drivers = configuredFilters() else { return nil }
+        guard !drivers.isEmpty else { return [] }
+        var out = Set<String>()
+        for chunk in GitRepository.chunks(paths) {
+            guard let data = run(["check-attr", "-z", "filter", "--"] + chunk) else { return nil }
+            // Each answer is the path, the attribute and its value, in the order the paths were given.
+            let fields = data.split(separator: 0, omittingEmptySubsequences: false)
+            guard fields.count >= chunk.count * 3 else { return nil }
+            for (k, path) in chunk.enumerated() where drivers.contains(String(decoding: fields[k * 3 + 2], as: UTF8.self)) {
+                out.insert(path)
+            }
+        }
+        return out
+    }
+
+    /// `git add` for the files' work-tree changes, deletions included. Runs on the calling thread.
+    func stage(_ files: [ChangedFile]) -> ActionResult {
+        var result = ActionResult()
+        let paths = GitRepository.unique(files.map(\.path))
+        // Staging a deletion stores no content, so no filter would run for it.
+        let deleted = Set(files.filter { $0.status == .deleted }.map(\.path))
+        guard let filtered = filteredPaths(paths.filter { !deleted.contains($0) }) else {
+            result.failed = paths
+            return result
+        }
+        result.refused = paths.filter(filtered.contains).map { ($0, .filtered) }
+        runInChunks(["add", "-A", "--"], paths.filter { !filtered.contains($0) }, into: &result)
+        return result
+    }
+
+    /// Puts the staged copies of the files back to HEAD's, leaving the work tree alone. Runs on the
+    /// calling thread.
+    func unstage(_ files: [ChangedFile]) -> ActionResult {
+        var result = ActionResult()
+        for f in GitRepository.unique(files, by: \.path) {
+            // A staged rename is undone at both its new and its old path. `reset` also works
+            // before the first commit, where `restore --staged` has no HEAD to restore from.
+            let paths = [f.path] + (f.originalPath.map { [$0] } ?? [])
+            if run(["reset", "-q", "--"] + paths) != nil { result.done.append(f.path) } else { result.failed.append(f.path) }
+        }
+        return result
+    }
+
+    /// Throws away the files' work-tree changes. New files are moved to the Trash. Changed and
+    /// deleted files are restored from their staged copy, which is the last commit's when nothing
+    /// is staged, after a copy of each as it is now has been put in the Trash. Nothing is restored
+    /// unless that copy is safely there. Runs on the calling thread.
+    func discard(_ files: [ChangedFile], trash: (URL) throws -> Void = GitRepository.moveToTrash) -> ActionResult {
+        var result = ActionResult()
+        var tracked: [String] = []
+        var untracked: [String] = []
+        for f in GitRepository.unique(files, by: \.path) {
+            switch f.status {
+            case .conflicted: result.refused.append((f.path, .conflicted))
+            case .untracked: untracked.append(f.path)
+            default: tracked.append(f.path)
+            }
+        }
+        if let filtered = filteredPaths(tracked) {
+            result.refused += tracked.filter(filtered.contains).map { ($0, .filtered) }
+            tracked.removeAll(where: filtered.contains)
+        } else {
+            result.failed += tracked
+            tracked = []
+        }
+        if !tracked.isEmpty && !backUp(tracked, trash: trash) {
+            result.refused += tracked.map { ($0, .notBackedUp) }
+            tracked = []
+        }
+        for path in untracked {
+            do {
+                try trash(root.appendingPathComponent(path))
+                result.done.append(path)
+            } catch {
+                result.refused.append((path, .notBackedUp))
+            }
+        }
+        runInChunks(["restore", "--worktree", "--"], tracked, into: &result)
+        return result
+    }
+
+    /// Copies the files as they are now into one folder and moves it to the Trash. Deleted files
+    /// have nothing to keep. False if any copy couldn't be made or the Trash refused the folder.
+    private func backUp(_ paths: [String], trash: (URL) throws -> Void) -> Bool {
+        let fm = FileManager.default
+        var present: [(path: String, url: URL)] = []
+        for p in paths {
+            let url = root.appendingPathComponent(p)
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { continue }
+            // Copying a FIFO or a device would block or read without end.
+            let type = info.st_mode & S_IFMT
+            guard type == S_IFREG || type == S_IFLNK else { return false }
+            present.append((p, url))
+        }
+        guard !present.isEmpty else { return true }
+        // On the repository's volume, so copies are clones and the folder goes to that volume's Trash.
+        let parent = (try? fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: root, create: true))
+            ?? fm.temporaryDirectory.appendingPathComponent("Tovri-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: parent) }
+        let date = DateFormatter()
+        date.locale = Locale(identifier: "en_US_POSIX")
+        date.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let folder = parent.appendingPathComponent("Discarded changes in \(root.lastPathComponent) \(date.string(from: Date()))")
+        do {
+            for (p, url) in present {
+                let copy = folder.appendingPathComponent(p)
+                try fm.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.copyItem(at: url, to: copy)
+            }
+            try trash(folder)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func runInChunks(_ command: [String], _ paths: [String], into result: inout ActionResult) {
+        for chunk in GitRepository.chunks(paths) {
+            if run(command + chunk) != nil { result.done += chunk } else { result.failed += chunk }
+        }
+    }
+
+    /// Keeps each command line well under the system's argument limit.
+    private static func chunks(_ paths: [String], size: Int = 500) -> [[String]] {
+        stride(from: 0, to: paths.count, by: size).map { Array(paths[$0..<min($0 + size, paths.count)]) }
+    }
+
+    private static func unique(_ paths: [String]) -> [String] {
+        var seen = Set<String>()
+        return paths.filter { seen.insert($0).inserted }
+    }
+
+    private static func unique(_ files: [ChangedFile], by key: KeyPath<ChangedFile, String>) -> [ChangedFile] {
+        var seen = Set<String>()
+        return files.filter { seen.insert($0[keyPath: key]).inserted }
+    }
+
+    /// The files' changes as `git diff` writes them: staged changes against HEAD, the others
+    /// against the staged copy, and new files in full.
+    func patch(for files: [ChangedFile], _ completion: @escaping (String) -> Void) {
+        GitRepository.queue.async {
+            let diff = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=all"]
+            var out = Data()
+            let staged = GitRepository.unique(files.filter(\.staged).flatMap { [$0.path] + ($0.originalPath.map { [$0] } ?? []) })
+            for chunk in GitRepository.chunks(staged) { out += self.run(diff + ["--cached", "--"] + chunk) ?? Data() }
+            let unstaged = GitRepository.unique(files.filter { !$0.staged && $0.status != .untracked }.map(\.path))
+            for chunk in GitRepository.chunks(unstaged) { out += self.run(diff + ["--"] + chunk) ?? Data() }
+            for f in GitRepository.unique(files.filter { !$0.staged && $0.status == .untracked }, by: \.path) {
+                var info = stat()
+                let type = lstat(self.root.appendingPathComponent(f.path).path, &info) == 0 ? info.st_mode & S_IFMT : 0
+                guard type == S_IFREG || type == S_IFLNK else { continue }
+                // Exits with 1 when the files differ, which a new file always does.
+                out += self.run(diff + ["--no-index", "--", "/dev/null", f.path], acceptedStatuses: [0, 1]) ?? Data()
+            }
+            let text = String(decoding: out, as: UTF8.self)
+            DispatchQueue.main.async { completion(text) }
         }
     }
 

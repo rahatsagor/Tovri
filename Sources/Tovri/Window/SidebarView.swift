@@ -80,6 +80,7 @@ protocol SidebarDelegate: AnyObject {
     /// The Changes list was shown and wants current files and line counts.
     func sidebarNeedsChanges(_ sidebar: SidebarView)
     func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction)
+    func sidebar(_ sidebar: SidebarView, changes: [GitRepository.ChangedFile], action: ChangeListAction)
 }
 
 final class SidebarOutlineView: NSOutlineView {
@@ -168,7 +169,8 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     func setChangeCount(_ n: Int) { tabs.changeCount = n }
 
     func setChanges(_ files: [GitRepository.ChangedFile]) {
-        tabs.changeCount = files.count
+        // A file with staged and unstaged changes is listed twice but counts once.
+        tabs.changeCount = Set(files.map(\.path)).count
         changesView?.setFiles(files)
     }
 
@@ -184,6 +186,10 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
             v.onAction = { [weak self] f, action in
                 guard let self else { return }
                 self.delegate?.sidebar(self, change: f, action: action)
+            }
+            v.onListAction = { [weak self] files, action in
+                guard let self else { return }
+                self.delegate?.sidebar(self, changes: files, action: action)
             }
             addSubview(v)
             changesView = v

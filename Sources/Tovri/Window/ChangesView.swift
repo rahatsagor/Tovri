@@ -1,7 +1,10 @@
 import AppKit
 
 /// What the sidebar's Changes list asks the window to do with a file.
-enum SidebarChangeAction { case open, compare, history, reveal }
+enum SidebarChangeAction { case open, compare, history }
+
+/// What the Changes list asks the window to do with the selected files.
+enum ChangeListAction { case stage, unstage, discard, patch, reveal }
 
 /// Files / Changes switcher at the top of the sidebar, shown only with Changes and file history on.
 final class SidebarTabs: NSView {
@@ -90,14 +93,28 @@ final class SidebarTabs: NSView {
     }
 }
 
-/// The sidebar's list of files with uncommitted changes and the lines each adds and removes.
+/// The sidebar's list of files with uncommitted changes and the lines each adds and removes, in
+/// a Staged Changes section and a Changes section for what isn't staged.
 final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate {
     var onAction: ((GitRepository.ChangedFile, SidebarChangeAction) -> Void)?
+    var onListAction: (([GitRepository.ChangedFile], ChangeListAction) -> Void)?
     private(set) var files: [GitRepository.ChangedFile] = []
     private let scroll = OverlayScrollView(frame: .zero)
     private let list = SidebarOutlineView()
     private let empty = NSTextField(labelWithString: "No uncommitted changes")
-    private var menuFile: GitRepository.ChangedFile?
+    private var menuFiles: [GitRepository.ChangedFile] = []
+    private var menuSection: [GitRepository.ChangedFile] = []
+
+    /// A section header, when `file` is nil, or one file in the section.
+    private final class Row {
+        let staged: Bool
+        let file: GitRepository.ChangedFile?
+        init(staged: Bool, file: GitRepository.ChangedFile?) {
+            self.staged = staged
+            self.file = file
+        }
+    }
+    private var rows: [Row] = []
 
     override var isFlipped: Bool { true }
 
@@ -114,11 +131,17 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         list.style = .plain
         list.focusRingType = .none
         list.backgroundColor = .clear
+        list.allowsMultipleSelection = true
         list.dataSource = self
         list.delegate = self
         list.target = self
         list.action = #selector(clicked)
-        list.onReturn = { [weak self] in self?.perform(.open, row: self?.list.selectedRow ?? -1) }
+        list.onReturn = { [weak self] in
+            guard let self, let f = self.selectedFiles.first, self.selectedFiles.count == 1 else { return }
+            self.onAction?(f, .open)
+        }
+        list.onSpace = { [weak self] in self?.toggleStaged() }
+        list.onDelete = { [weak self] in self?.discardSelected() }
         list.menuProvider = { [weak self] row in self?.menu(row: row) }
         list.setAccessibilityLabel("Changed files")
         scroll.documentView = list
@@ -133,13 +156,21 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private static func key(_ f: GitRepository.ChangedFile) -> String { (f.staged ? "s\0" : "w\0") + f.path }
+
     func setFiles(_ new: [GitRepository.ChangedFile]) {
-        let selected = list.selectedRow >= 0 && list.selectedRow < files.count ? files[list.selectedRow].path : nil
+        let selected = Set(selectedFiles.map(ChangesView.key))
         files = new
-        list.reloadData()
-        if let selected, let i = files.firstIndex(where: { $0.path == selected }) {
-            list.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
+        rows = []
+        for staged in [true, false] {
+            let section = new.filter { $0.staged == staged }
+            guard !section.isEmpty else { continue }
+            rows.append(Row(staged: staged, file: nil))
+            rows += section.map { Row(staged: staged, file: $0) }
         }
+        list.reloadData()
+        let keep = IndexSet(rows.indices.filter { rows[$0].file.map { selected.contains(ChangesView.key($0)) } ?? false })
+        if !keep.isEmpty { list.selectRowIndexes(keep, byExtendingSelection: false) }
         empty.isHidden = !files.isEmpty
     }
 
@@ -157,44 +188,156 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         empty.frame = NSRect(x: 10, y: 24, width: bounds.width - 20, height: 18)
     }
 
-    @objc private func clicked() { perform(.open, row: list.clickedRow) }
+    private var selectedFiles: [GitRepository.ChangedFile] {
+        list.selectedRowIndexes.compactMap { $0 < rows.count ? rows[$0].file : nil }
+    }
 
-    private func perform(_ action: SidebarChangeAction, row: Int) {
-        guard row >= 0, row < files.count else { return }
-        onAction?(files[row], action)
+    private func section(staged: Bool) -> [GitRepository.ChangedFile] { files.filter { $0.staged == staged } }
+
+    @objc private func clicked() {
+        let row = list.clickedRow
+        guard row >= 0, row < rows.count, let f = rows[row].file else { return }
+        // Command- and Shift-clicks change the selection without opening anything.
+        let flags = NSApp.currentEvent?.modifierFlags ?? []
+        guard !flags.contains(.command), !flags.contains(.shift) else { return }
+        onAction?(f, .open)
+    }
+
+    /// Space stages the selected files, or unstages them when they are all staged.
+    private func toggleStaged() {
+        let sel = selectedFiles
+        let unstaged = sel.filter { !$0.staged }
+        if !unstaged.isEmpty { onListAction?(unstaged, .stage) } else if !sel.isEmpty { onListAction?(sel, .unstage) }
+    }
+
+    private func discardSelected() {
+        let targets = selectedFiles.filter { !$0.staged && $0.status != .conflicted }
+        if targets.isEmpty { NSSound.beep() } else { onListAction?(targets, .discard) }
     }
 
     private func menu(row: Int) -> NSMenu? {
-        guard row >= 0, row < files.count else { return nil }
-        menuFile = files[row]
+        guard row >= 0, row < rows.count else { return nil }
+        let r = rows[row]
+        menuSection = section(staged: r.staged)
         let m = NSMenu()
-        let deleted = files[row].status == .deleted
-        for (title, sel, enabled) in [("Open", #selector(menuOpen), !deleted), ("Compare with Last Commit", #selector(menuCompare), !deleted),
-                                      ("File History…", #selector(menuHistory), !deleted && files[row].status != .untracked),
-                                      ("Reveal in Finder", #selector(menuReveal), !deleted)] {
-            let item = m.addItem(withTitle: title, action: enabled ? sel : nil, keyEquivalent: "")
+        func add(_ title: String, _ sel: Selector, enabled: Bool = true, key: String = "") {
+            let item = m.addItem(withTitle: title, action: enabled ? sel : nil, keyEquivalent: key)
             item.target = self
         }
+        guard r.file != nil else {
+            add(r.staged ? "Unstage All" : "Stage All", r.staged ? #selector(menuUnstageAll) : #selector(menuStageAll))
+            return m
+        }
+        // Like Finder: right-clicking outside the selection acts on that row alone.
+        if !list.selectedRowIndexes.contains(row) { list.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+        menuFiles = selectedFiles
+        let n = menuFiles.count
+        let suffix = n == 1 ? "" : " \(n) Files"
+        if n == 1, let f = menuFiles.first {
+            let deleted = f.status == .deleted
+            add("Open", #selector(menuOpen), enabled: !deleted)
+            add("Compare with Last Commit", #selector(menuCompare), enabled: !deleted)
+            add("File History…", #selector(menuHistory), enabled: !deleted && f.status != .untracked && !(f.staged && f.status == .added))
+        }
+        add("Open Changes as Patch", #selector(menuPatch))
+        m.addItem(.separator())
+        let unstaged = menuFiles.filter { !$0.staged }
+        if !unstaged.isEmpty { add("Stage" + (unstaged.count == n ? suffix : ""), #selector(menuStage)) }
+        if unstaged.count < n { add("Unstage" + (unstaged.isEmpty ? suffix : ""), #selector(menuUnstage)) }
+        if !unstaged.isEmpty {
+            add("Discard Changes…", #selector(menuDiscard), enabled: unstaged.contains { $0.status != .conflicted }, key: "\u{8}")
+        }
+        m.addItem(.separator())
+        add(r.staged ? "Unstage All" : "Stage All", r.staged ? #selector(menuUnstageAll) : #selector(menuStageAll))
+        m.addItem(.separator())
+        add("Reveal in Finder", #selector(menuReveal), enabled: menuFiles.contains { $0.status != .deleted })
         return m
     }
 
-    @objc private func menuOpen() { menuFile.map { onAction?($0, .open) } }
-    @objc private func menuCompare() { menuFile.map { onAction?($0, .compare) } }
-    @objc private func menuHistory() { menuFile.map { onAction?($0, .history) } }
-    @objc private func menuReveal() { menuFile.map { onAction?($0, .reveal) } }
+    @objc private func menuOpen() { menuFiles.first.map { onAction?($0, .open) } }
+    @objc private func menuCompare() { menuFiles.first.map { onAction?($0, .compare) } }
+    @objc private func menuHistory() { menuFiles.first.map { onAction?($0, .history) } }
+    @objc private func menuPatch() { onListAction?(menuFiles, .patch) }
+    @objc private func menuStage() { onListAction?(menuFiles.filter { !$0.staged }, .stage) }
+    @objc private func menuUnstage() { onListAction?(menuFiles.filter(\.staged), .unstage) }
+    @objc private func menuDiscard() { onListAction?(menuFiles.filter { !$0.staged && $0.status != .conflicted }, .discard) }
+    @objc private func menuStageAll() { onListAction?(menuSection, .stage) }
+    @objc private func menuUnstageAll() { onListAction?(menuSection, .unstage) }
+    @objc private func menuReveal() { onListAction?(menuFiles.filter { $0.status != .deleted }, .reveal) }
 
-    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int { item == nil ? files.count : 0 }
-    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any { index as NSNumber }
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int { item == nil ? rows.count : 0 }
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any { rows[index] }
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool { false }
-    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? { HoverRowView() }
+    func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
+        (item as? Row)?.file == nil ? 28 : 24
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        (item as? Row)?.file == nil ? ThemedRowView() : HoverRowView()
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
+        proposed.filteredIndexSet { $0 < rows.count && rows[$0].file != nil }
+    }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
-        guard let i = (item as? NSNumber)?.intValue, i < files.count else { return nil }
+        guard let row = item as? Row else { return nil }
+        guard let file = row.file else {
+            let id = NSUserInterfaceItemIdentifier("changeSection")
+            let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? ChangeSectionCell) ?? ChangeSectionCell()
+            cell.identifier = id
+            let staged = row.staged
+            cell.configure(staged: staged, count: section(staged: staged).count) { [weak self] in
+                guard let self else { return }
+                self.onListAction?(self.section(staged: staged), staged ? .unstage : .stage)
+            }
+            return cell
+        }
         let id = NSUserInterfaceItemIdentifier("change")
         let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? ChangeCell) ?? ChangeCell()
         cell.identifier = id
-        cell.configure(files[i])
+        cell.configure(file)
         return cell
+    }
+}
+
+/// "STAGED CHANGES 2" with an Unstage All button, or "CHANGES 5" with Stage All.
+private final class ChangeSectionCell: NSTableCellView {
+    private let title = NSTextField(labelWithString: "")
+    private let button = ToolButton(symbol: "plus")
+
+    init() {
+        super.init(frame: .zero)
+        title.lineBreakMode = .byTruncatingTail
+        button.symbolSize = 11
+        [title, button].forEach(addSubview)
+        title.setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(staged: Bool, count: Int, action: @escaping () -> Void) {
+        let theme = ThemeManager.shared.active
+        let name = staged ? "Staged Changes" : "Changes"
+        let text = NSMutableAttributedString(string: name.uppercased(), attributes: [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold), .foregroundColor: theme.chromeSecondary,
+        ])
+        text.append(NSAttributedString(string: "  \(count)", attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium), .foregroundColor: theme.chromeSecondary.withAlphaComponent(0.8),
+        ]))
+        title.attributedStringValue = text
+        button.symbol = staged ? "minus" : "plus"
+        button.toolTip = staged ? "Unstage All" : "Stage All"
+        button.onClick = action
+        setAccessibilityLabel("\(name), \(count == 1 ? "1 file" : "\(count) files")")
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        button.frame = NSRect(x: bounds.width - 32, y: (h - 22) / 2 + 1, width: 22, height: 22)
+        title.frame = NSRect(x: 14, y: (h - 14) / 2 + 1, width: max(0, button.frame.minX - 18), height: 14)
     }
 }
 
@@ -240,11 +383,11 @@ private final class ChangeCell: NSTableCellView {
         dir.textColor = theme.chromeSecondary
         counts.attributedStringValue = MainWindowController.changeSummary(f.added.map { ($0, f.removed ?? 0) }, status: f.status, theme: theme)
         let summary = f.added.map { "\($0) added, \(f.removed ?? 0) removed" }
-        setAccessibilityLabel([file, folder.isEmpty ? nil : "in \(folder)", f.status.label, summary].compactMap { $0 }.joined(separator: ", "))
-        toolTip = f.path
+        setAccessibilityLabel([file, folder.isEmpty ? nil : "in \(folder)", f.status.label, f.staged ? "staged" : nil, summary]
+            .compactMap { $0 }.joined(separator: ", "))
+        toolTip = f.originalPath.map { "\($0) → \(f.path)" } ?? f.path
         needsLayout = true
     }
-
     override func layout() {
         super.layout()
         let h = bounds.height

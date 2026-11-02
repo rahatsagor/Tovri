@@ -749,6 +749,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Git
 
     private var gitStatusPending = false
+    /// Set when a refresh is asked for while `git status` runs, whose answer may predate the change.
+    private var gitStatusRequestedAgain = false
     private(set) var changedFileCount = 0
 
     /// Runs `git status` only for the features that are on: sidebar colors and the changed count.
@@ -764,11 +766,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             }
             return
         }
-        guard !gitStatusPending else { return }
+        guard !gitStatusPending else { gitStatusRequestedAgain = true; return }
         gitStatusPending = true
         repo.status { [weak self] status in
             guard let self else { return }
             self.gitStatusPending = false
+            if self.gitStatusRequestedAgain {
+                self.gitStatusRequestedAgain = false
+                self.refreshGitStatus()
+                return
+            }
             let s = Settings.shared
             guard s.gitNeedsStatus else { return }
             var abs: [String: GitFileStatus] = [:]
@@ -782,7 +789,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 self.sidebar.setChangeCount(changed.count)
                 // Line counts cost a `git diff`, so they're only read while the list is on screen.
                 if self.sidebar.isShowingChanges {
-                    repo.changedFiles(status: changed) { [weak self] files in
+                    repo.changeList { [weak self] files in
                         guard let self, Settings.shared.gitChangesAndHistory else { return }
                         self.sidebar.setChanges(self.withLiveCounts(files, root: repo.root))
                     }
@@ -1802,8 +1809,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             live[path] = d.gitDiff.hunks.reduce((0, 0)) { ($0.0 + $1.newCount, $0.1 + $1.oldLines.count) }
         }
         guard !live.isEmpty else { return files }
+        // The editor counts against HEAD, which is what an unstaged change is counted against only
+        // when nothing of the file is staged.
+        let staged = Set(files.filter(\.staged).map(\.path))
         return files.map { f in
             var f = f
+            guard !staged.contains(f.path) else { return f }
             if let l = live[root.appendingPathComponent(f.path).standardizedFileURL.resolvingSymlinksInPath().path] { (f.added, f.removed) = l }
             return f
         }
@@ -1880,8 +1891,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case .history:
             guard change.status != .deleted, let doc = open(url: url), let e = activeEditor, e.document === doc else { return }
             showHistory(of: url, in: e)
-        case .reveal:
-            NSWorkspace.shared.activateFileViewerSelecting([url])
         }
     }
 

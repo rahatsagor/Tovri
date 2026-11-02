@@ -27,15 +27,16 @@ Only the latest release receives fixes.
   the document was read. Links to local files open in Tovri, in Quick Look or
   as a folder; they never launch an app or a script. Web and email links open
   in your default browser or mail app.
-- **Git.** Tovri only reads from Git: the branch, file status, history and
-  committed copies of files. It never commits, checks out or fetches. A
-  repository's own configuration can name programs for Git to run, so Tovri
-  runs Git with hooks, `core.fsmonitor`, signature checking and every network
-  transport turned off, every configured filter neutralized, and the work tree
-  pinned to the repository's folder. These settings are passed in a way the
-  repository can't override, and Tovri doesn't use Git versions older
-  than 2.31, which ignore them. Browsing a cloned folder doesn't run
-  anything from its
+- **Git.** Tovri reads the branch, file status, history and committed copies
+  of files, and from the Changes list it can stage, unstage and discard
+  changes when you ask. It never commits, pushes or fetches. A repository's
+  own configuration can name programs for Git to run, so Tovri runs Git with
+  hooks, `core.fsmonitor`, signature checking and every network transport
+  turned off, every configured filter neutralized, and the work tree pinned to
+  the repository's folder. These settings are passed in a way the repository
+  can't override, and Tovri doesn't use Git versions older than 2.31, which
+  ignore them. Files that use a filter, such as Git LFS, can't be staged or
+  discarded in Tovri. Browsing a cloned folder doesn't run anything from its
   `.git` folder.
 - **EditorConfig.** `.editorconfig` files only set indentation, whitespace
   and line endings. Their patterns are matched in linear time, so a hostile
@@ -70,7 +71,8 @@ a `sudo` command for you to run yourself instead of asking for your password.
   original paths, only on your Mac, in
   `~/Library/Application Support/Tovri/History`, readable only by your user
   account. It is never uploaded or shared, and **File → Clear Local
-  History…** deletes it.
+  History…** deletes it. Discard Changes in the Changes list moves new files
+  and a copy of changed files to the Trash before Git restores them.
 
 ## Network
 
