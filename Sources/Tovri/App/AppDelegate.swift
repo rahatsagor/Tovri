@@ -47,6 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return AppDelegate.sessionWindows(open: self.controllers.map { $0.sessionState() }, closed: self.closedWindows)
         }
         NotificationCenter.default.addObserver(self, selector: #selector(documentChangedOnDisk(_:)), name: .documentFileDidChangeOnDisk, object: nil)
+        AutoSave.shared.save = { [weak self] doc in
+            guard let self, !self.isTerminating else { return }
+            let owner = self.controllers.first { $0.window?.isKeyWindow == true && $0.allOpenDocuments().contains { $0 === doc } }
+                ?? self.controllers.first { $0.allOpenDocuments().contains { $0 === doc } }
+            owner?.save(doc, interactive: false)
+        }
 
         if Settings.shared.restoreSession || Settings.shared.hotExit, let session = SessionStore.shared.load(), !session.windows.isEmpty {
             for w in session.windows {

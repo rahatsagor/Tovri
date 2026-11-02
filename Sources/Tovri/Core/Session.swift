@@ -21,6 +21,8 @@ struct TabSession: Codable {
     var editVersion: Int? = nil
     /// The encoding was detected rather than chosen, so the file is detected again on restore.
     var encodingDetected: Bool? = nil
+    /// Bookmarked lines, counted from 0.
+    var bookmarks: [Int]? = nil
 
     var backupSource: Document.BackupSource? {
         if let id = documentID.flatMap(UUID.init(uuidString:)), let editVersion {

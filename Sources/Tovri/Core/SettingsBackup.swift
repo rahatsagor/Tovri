@@ -98,7 +98,8 @@ struct SettingsBackup: Codable, Equatable {
         Settings.Key.fontSize: 6...72,
         Settings.Key.lineHeight: 1...2.5,
         Settings.Key.tabWidth: 1...16,
-        Settings.Key.rulerColumn: 0...500,
+        Settings.Key.rulerColumn: 0...Double(Settings.maxRulerColumn),
+        Settings.Key.autoSaveDelay: 0...3600,
         Settings.Key.sidebarWidth: 140...600,
     ]
 

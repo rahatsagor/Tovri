@@ -72,6 +72,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         nc.addObserver(self, selector: #selector(settingsChanged), name: .settingsDidChange, object: nil)
         nc.addObserver(self, selector: #selector(windowKeyChanged), name: NSWindow.didBecomeKeyNotification, object: nil)
         nc.addObserver(self, selector: #selector(windowKeyChanged), name: NSWindow.didResignKeyNotification, object: nil)
+        nc.addObserver(self, selector: #selector(bookmarksChanged), name: .bookmarksDidChange, object: document)
 
         if document.length > 0 && hasVeryLongLines() { wordWrapOverride = true }
         applySettings()
@@ -309,6 +310,11 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         wordWrapOverride = !wordWrap
         setWordWrap(!wordWrap)
         needsLayout = true
+    }
+
+    @objc private func bookmarksChanged() {
+        gutter.needsDisplay = true
+        minimap.needsDisplay = true
     }
 
     @objc private func windowKeyChanged(_ n: Notification) {

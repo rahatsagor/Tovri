@@ -38,6 +38,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     private(set) var untitledName: String
     let textStorage = NSTextStorage()
     let lines = LineIndex()
+    let bookmarks = Bookmarks()
     private(set) var language: Language
     private(set) var syntax: SyntaxEngine
     let undoManager = UndoManager()
@@ -94,6 +95,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         indentWidth = Settings.shared.tabWidth
         super.init()
         commonInit()
+        applyLanguageIndentation()
         markClean()
     }
 
@@ -120,6 +122,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         isNewFile = true
         super.init()
         commonInit()
+        applyLanguageIndentation()
         applyEditorConfig()
         markClean()
     }
@@ -131,6 +134,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         indentUsesTabs = false
         indentWidth = 4
         super.init()
+        indentationFollowsSettings = false
         commonInit()
         let (normalized, ending) = LineEnding.normalize(text, rawData: nil)
         lineEnding = ending
@@ -174,7 +178,7 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     var baseAttributes: [NSAttributedString.Key: Any] {
         [.font: font, .foregroundColor: ThemeManager.shared.active.foreground, .paragraphStyle: paragraphStyle,
-         .ligature: 0]
+         .ligature: Settings.shared.ligatureAttribute]
     }
 
     func applyBaseAttributes() {
@@ -189,10 +193,20 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     private var appliedAttributesKey = ""
 
-    private var attributesKey: String { "\(font.fontName)|\(font.pointSize)|\(indentWidth)" }
+    private var attributesKey: String { "\(font.fontName)|\(font.pointSize)|\(indentWidth)|\(Settings.shared.ligatureAttribute)" }
 
     @objc private func settingsChanged() {
+        var indentationChanged = false
+        if indentationFollowsSettings, !indentationWasSetManually,
+           Settings.shared.indentation(forLanguage: language.id) != appliedLanguageIndentation {
+            indentUsesTabs = !Settings.shared.insertSpaces
+            indentWidth = Settings.shared.tabWidth
+            applyDetectedOrLanguageIndentation()
+            applyEditorConfigIndentation(editorConfig)
+            indentationChanged = true
+        }
         if attributesKey != appliedAttributesKey { applyBaseAttributes() }
+        if indentationChanged { postStateChange(force: true) }
     }
 
     func setIndentation(tabs: Bool, width: Int) {
@@ -233,7 +247,7 @@ final class Document: NSObject, NSTextStorageDelegate {
             language = LanguageRegistry.shared.language(forFileName: url.lastPathComponent, firstLine: firstLine)
         }
         Perf.measure("  setContent") { setContent(text) }
-        if !indentationWasSetManually { Perf.measure("  indentation") { detectIndentation() } }
+        if !indentationWasSetManually { Perf.measure("  indentation") { applyDetectedOrLanguageIndentation() } }
         applyEditorConfig()
         if attributesKey != appliedAttributesKey { applyBaseAttributes() }
         Perf.measure("  hash") { markClean() }
@@ -249,6 +263,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         textStorage.endEditing()
         isBulkLoading = false
         Perf.measure("  line index") { lines.rebuild(from: textStorage.mutableString) }
+        bookmarks.clamp(lineCount: lines.count)
         syntax.reset(language: language, lineCount: lines.count)
         editVersion += 1
     }
@@ -363,7 +378,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         guard !indentationWasSetManually else { return }
         indentUsesTabs = !Settings.shared.insertSpaces
         indentWidth = Settings.shared.tabWidth
-        detectIndentation()
+        applyDetectedOrLanguageIndentation()
         applyEditorConfigIndentation(ec)
         if attributesKey != appliedAttributesKey { applyBaseAttributes() }
     }
@@ -393,8 +408,33 @@ final class Document: NSObject, NSTextStorageDelegate {
         textStorage.replaceCharacters(in: range, with: replacement)
     }
 
-    private func detectIndentation() {
-        guard Settings.shared.detectIndentation else { return }
+    /// The indentation Settings → Editor sets for the language, as last applied.
+    private var appliedLanguageIndentation: Settings.Indentation?
+    private var indentationFollowsSettings = true
+
+    /// Indentation detected from the text comes first, so editing a file keeps its style; the
+    /// language's setting covers new files and text without clear indentation. `.editorconfig`
+    /// is applied after both and wins over them.
+    private func applyDetectedOrLanguageIndentation() {
+        appliedLanguageIndentation = Settings.shared.indentation(forLanguage: language.id)
+        if !detectIndentation() { applyLanguageIndentation() }
+    }
+
+    /// Uses the indentation Settings → Editor sets for the document's language, if any.
+    @discardableResult
+    private func applyLanguageIndentation() -> Bool {
+        let setting = Settings.shared.indentation(forLanguage: language.id)
+        appliedLanguageIndentation = setting
+        guard indentationFollowsSettings, !indentationWasSetManually, let setting else { return false }
+        indentUsesTabs = setting.tabs
+        indentWidth = setting.width
+        return true
+    }
+
+    /// Whether the text showed its indentation style.
+    @discardableResult
+    private func detectIndentation() -> Bool {
+        guard Settings.shared.detectIndentation else { return false }
         let s = textStorage.mutableString
         var tabs = 0, spaces = 0
         var widths: [Int: Int] = [:]
@@ -417,10 +457,14 @@ final class Document: NSObject, NSTextStorageDelegate {
         }
         if tabs > spaces && tabs > 0 {
             indentUsesTabs = true
+            if let setting = Settings.shared.indentation(forLanguage: language.id) { indentWidth = setting.width }
+            return true
         } else if spaces > 0 {
             indentUsesTabs = false
             if let best = widths.max(by: { $0.value < $1.value })?.key { indentWidth = best }
+            return true
         }
+        return false
     }
 
     // MARK: Language
@@ -430,6 +474,14 @@ final class Document: NSObject, NSTextStorageDelegate {
         language = lang
         if manual { languageWasSetManually = true }
         syntax.reset(language: lang, lineCount: lines.count)
+        if indentationFollowsSettings, !indentationWasSetManually,
+           Settings.shared.indentation(forLanguage: lang.id) != appliedLanguageIndentation {
+            indentUsesTabs = !Settings.shared.insertSpaces
+            indentWidth = Settings.shared.tabWidth
+            applyDetectedOrLanguageIndentation()
+            applyEditorConfigIndentation(editorConfig)
+            if attributesKey != appliedAttributesKey { applyBaseAttributes() }
+        }
         allEditors.forEach { $0.documentLanguageDidChange() }
         postStateChange(force: true)
     }
@@ -443,6 +495,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         guard editedMask.contains(.editedCharacters), !isBulkLoading else { return }
         let r = lines.update(editedRange: editedRange, delta: delta, text: textStorage.mutableString)
         lastEditLines = r
+        bookmarks.adjust(editedRange: editedRange, delta: delta, change: r, lines: lines, textLength: textStorage.length)
         syntax.linesChanged(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted)
         editVersion += 1
         dirtyFlag = true
@@ -451,6 +504,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         for e in allEditors { e.documentDidEdit(range: editedRange, delta: delta) }
         postStateChange()
         SessionStore.shared.setNeedsSave()
+        AutoSave.shared.documentDidEdit(self)
         if gitBaseline != nil { scheduleGitDiff(delay: 0.35) }
     }
 

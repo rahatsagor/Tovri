@@ -334,7 +334,23 @@ extension EditorTextView {
             }
             return r
         }
+        // The edit keeps the number of lines, so bookmarks stay put unless moved along here.
+        var lineMoves: [(lines: ClosedRange<Int>, by: Int)] = []
+        if !document.bookmarks.isEmpty {
+            for b in blocks {
+                let moved = lineNumbers(in: b)
+                let other = lineNumbers(in: up ? visualLineBlock(NSRange(location: b.location - 1, length: 0))
+                                               : visualLineBlock(NSRange(location: NSMaxRange(b), length: 0)))
+                lineMoves.append((moved, up ? -other.count : other.count))
+                lineMoves.append((other, up ? moved.count : -moved.count))
+            }
+        }
+        let version = document.editVersion
         performEdits(edits, selection: .custom(sels), actionName: up ? "Move Line Up" : "Move Line Down", keepFolds: true, addedFolds: movedFolds)
+        if !lineMoves.isEmpty && document.editVersion != version {
+            document.bookmarks.remap { l in lineMoves.first { $0.lines.contains(l) }.map { l + $0.by } ?? l }
+            bookmarksChanged()
+        }
     }
 
     @objc func joinLines(_ sender: Any?) {
@@ -752,6 +768,39 @@ extension EditorTextView {
         }
     }
 
+    // MARK: Bookmarks
+
+    /// Bookmarks the lines of every selection, or removes their bookmarks when they all have one.
+    @objc func toggleBookmark(_ sender: Any?) {
+        var toggled: [Int] = []
+        for r in allSelections { toggled.append(contentsOf: lineNumbers(in: r)) }
+        // Selecting all of a huge file and toggling would mark every line; one per selection is enough then.
+        if toggled.count > 10_000 { toggled = allSelections.map { lines.line(containing: $0.location) } }
+        document.bookmarks.toggle(toggled)
+        bookmarksChanged()
+    }
+
+    @objc func nextBookmark(_ sender: Any?) { goToBookmark(forward: true) }
+    @objc func previousBookmark(_ sender: Any?) { goToBookmark(forward: false) }
+
+    @objc func clearBookmarks(_ sender: Any?) {
+        guard !document.bookmarks.isEmpty else { return }
+        document.bookmarks.clear()
+        bookmarksChanged()
+    }
+
+    private func goToBookmark(forward: Bool) {
+        let current = lines.line(containing: selectedRange().location)
+        let b = document.bookmarks
+        guard let line = forward ? b.next(after: current) : b.previous(before: current) else { NSSound.beep(); return }
+        editor?.goTo(line: line + 1)
+    }
+
+    func bookmarksChanged() {
+        NotificationCenter.default.post(name: .bookmarksDidChange, object: document)
+        SessionStore.shared.setNeedsSave()
+    }
+
     // MARK: Validation
 
     static let editingActions: Set<Selector> = [
@@ -770,6 +819,9 @@ extension EditorTextView {
 
     override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
         if let action = item.action, document.isReadOnly, EditorTextView.editingActions.contains(action) { return false }
+        if let action = item.action, [#selector(nextBookmark(_:)), #selector(previousBookmark(_:)), #selector(clearBookmarks(_:))].contains(action) {
+            return !document.bookmarks.isEmpty
+        }
         return super.validateUserInterfaceItem(item)
     }
 }

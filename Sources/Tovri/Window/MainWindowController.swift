@@ -1558,6 +1558,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     @objc func gotoSymbol(_ sender: Any?) { palette.show(mode: .files, initial: "@") }
     @objc func gotoLine(_ sender: Any?) { palette.show(mode: .files, initial: ":") }
 
+    @objc func gotoBookmark(_ sender: Any?) {
+        guard let e = activeEditor else { return }
+        let doc = e.document
+        guard !doc.bookmarks.isEmpty else { statusBar.flash("No bookmarks in “\(doc.displayName)”. Press ⌘F2 to bookmark a line."); return }
+        let caretLine = doc.lines.line(containing: e.textView.selectedRange().location)
+        let marked = doc.bookmarks.lines
+        let items = marked.map { line -> PaletteItem in
+            let r = doc.lines.range(of: line, textLength: doc.length)
+            let text = doc.string.substring(with: NSRange(location: r.location, length: min(r.length, 200))).trimmingCharacters(in: .whitespaces)
+            let preview = { [weak e] () -> Void in e?.goTo(line: line + 1) }
+            return PaletteItem(title: text.isEmpty ? "Empty line" : text, detail: "line \(line + 1)", icon: "bookmark",
+                               preview: preview) { [weak e] in preview(); e?.focus() }
+        }
+        palette.showList(placeholder: "Go to bookmark", items: items, selectedIndex: marked.firstIndex { $0 >= caretLine } ?? 0, label: "Bookmarks")
+    }
+
     @objc func showSyntaxPicker(_ sender: Any?) {
         guard let doc = activeDocument else { return }
         let all = LanguageRegistry.shared.all
@@ -2248,7 +2264,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             return !activeGroup.tabs.isEmpty
         case #selector(jumpBack(_:)): return historyIndex >= 0 && historyIndex < history.count
         case #selector(jumpForward(_:)): return historyIndex + 2 < history.count
-        case #selector(printActiveDocument(_:)): return activeEditor != nil
+        case #selector(printActiveDocument(_:)), #selector(gotoBookmark(_:)): return activeEditor != nil
         case #selector(moveTabLeft(_:)): return activeGroup.selectedIndex > 0
         case #selector(moveTabRight(_:)): return activeGroup.selectedIndex >= 0 && activeGroup.selectedIndex < activeGroup.tabs.count - 1
         case #selector(moveTabToNextGroup(_:)), #selector(splitTabRight(_:)): return activeTab != nil
@@ -2300,6 +2316,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 ts.documentID = d.backupSource.id.uuidString
                 ts.editVersion = d.backupSource.version
                 ts.encodingDetected = d.url != nil && d.encodingWasDetected ? true : nil
+                ts.bookmarks = d.bookmarks.isEmpty ? nil : d.bookmarks.lines
                 if Settings.shared.hotExit && (d.isDirty || (d.url == nil && d.length > 0)) {
                     ts.buffer = SessionStore.shared.bufferName(for: d)
                     if ts.buffer != nil { ts.diskStamp = d.lastReadDiskStamp }
@@ -2374,6 +2391,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 } else if let source = t.backupSource {
                     d.noteSessionSource(source)
                 }
+                if let marks = t.bookmarks, shown.bookmarks.isEmpty { shown.bookmarks.set(marks, lineCount: shown.lines.count) }
                 if g.index(of: shown) != nil { continue }
                 let tab = g.add(shown, select: false)
                 tab.pendingSelection = NSRange(location: t.selection, length: t.selectionLength)

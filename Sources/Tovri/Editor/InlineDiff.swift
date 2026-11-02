@@ -9,7 +9,7 @@ enum SnippetHighlighter {
                           paragraph: NSParagraphStyle? = nil, alpha: CGFloat = 1) -> [NSMutableAttributedString] {
         let lexer = language.style == .plain ? nil : language.lexer
         let colors = theme.tokenColors
-        var base: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: theme.foreground.withAlphaComponent(alpha), .ligature: 0]
+        var base: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: theme.foreground.withAlphaComponent(alpha), .ligature: Settings.shared.ligatureAttribute]
         if let paragraph { base[.paragraphStyle] = paragraph }
         var state: UInt32 = 0
         return lines.map { line in

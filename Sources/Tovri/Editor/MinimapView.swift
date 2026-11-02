@@ -128,6 +128,12 @@ final class MinimapView: NSView {
             ctx.setFillColor(color.withAlphaComponent(0.72).cgColor)
             ctx.fill(rects)
         }
+
+        let marked = doc.bookmarks.lines.filter { $0 >= g.start && $0 < end }
+        if !marked.isEmpty {
+            ctx.setFillColor(theme.accent.cgColor)
+            ctx.fill(marked.map { CGRect(x: 1, y: CGFloat($0 - g.start) * rowHeight, width: 3, height: rowHeight) })
+        }
     }
 
     // MARK: Interaction

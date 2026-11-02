@@ -40,9 +40,22 @@ and versions follow [Semantic Versioning](https://semver.org/).
   and **Unstage All** in the section headers. Discard Changes asks first and
   puts new files and a copy of changed files in the Trash. Files that use a
   Git filter, such as Git LFS, are left to Terminal.
+- **Bookmarks.** ⌘F2 bookmarks a line, F2 and ⇧F2 go to the next and
+  previous one, ⇧⌘F2 clears them, and **Goto → Bookmarks → Goto Bookmark…**
+  lists them. Bookmarks stay on their lines as you edit and come back with
+  your tabs.
 - **Find in Selection** (⌥⌘L) in the find bar. It turns on by itself when you
   open the bar with several lines selected, and Replace All then changes only
   the selection.
+- Tovri can save changes automatically a moment after you stop typing. Turn it
+  on in **Settings → Files**; it only saves files that are already on disk.
+- Vertical rulers can go at any column, and you can have several, such as
+  "80, 120".
+- Set the tab width and spaces or tabs for each language in **Settings →
+  Editor**. A file's own indentation and a project's `.editorconfig` still
+  come first.
+- A font weight setting, and ligatures for fonts that have them, in
+  **Settings → Appearance**.
 - Regular expression replacements understand `\n` (new line), `\t` (tab)
   and `\\` (backslash).
 

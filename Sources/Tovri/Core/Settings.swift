@@ -50,6 +50,11 @@ final class Settings {
         static let markdownPreviewOnOpen = "markdownPreviewOnOpen"
         static let spellCheckProse = "spellCheckProse"
         static let markdownRemoteContent = "markdownRemoteContent"
+        static let rulers = "rulers"
+        static let autoSaveDelay = "autoSaveDelay"
+        static let languageIndentation = "languageIndentation"
+        static let fontLigatures = "fontLigatures"
+        static let fontWeight = "fontWeight"
     }
 
     static let defaults: [String: Any] = [
@@ -97,6 +102,11 @@ final class Settings {
         Key.markdownPreviewOnOpen: false,
         Key.spellCheckProse: true,
         Key.markdownRemoteContent: false,
+        Key.rulers: "",
+        Key.autoSaveDelay: 0,
+        Key.languageIndentation: "",
+        Key.fontLigatures: false,
+        Key.fontWeight: FontWeight.regular.rawValue,
     ]
 
     private let d = UserDefaults.standard
@@ -159,7 +169,110 @@ final class Settings {
     var showHiddenFiles: Bool { d.bool(forKey: Key.showHiddenFiles) }
     var highlightBrackets: Bool { d.bool(forKey: Key.highlightBrackets) }
     var highlightOccurrences: Bool { d.bool(forKey: Key.highlightOccurrences) }
-    var rulerColumn: Int { max(0, d.integer(forKey: Key.rulerColumn)) }
+    var rulerColumn: Int { min(max(0, d.integer(forKey: Key.rulerColumn)), Settings.maxRulerColumn) }
+
+    static let maxRulerColumn = 500
+
+    /// Columns to draw vertical rulers at, from `rulers` (such as "80, 120"). Settings from before
+    /// several rulers were possible keep their single `rulerColumn`.
+    var rulerColumns: [Int] {
+        let text = d.string(forKey: Key.rulers) ?? ""
+        if let c = rulerCache, c.text == text, c.legacy == d.integer(forKey: Key.rulerColumn) { return c.columns }
+        let columns = text.trimmingCharacters(in: .whitespaces).isEmpty ? (rulerColumn > 0 ? [rulerColumn] : []) : Settings.parseRulers(text)
+        rulerCache = (text, d.integer(forKey: Key.rulerColumn), columns)
+        return columns
+    }
+    private var rulerCache: (text: String, legacy: Int, columns: [Int])?
+
+    /// What the rulers field shows.
+    var rulersText: String {
+        get { Settings.formatRulers(rulerColumns) }
+        set {
+            let columns = Settings.parseRulers(newValue)
+            d.set(Settings.formatRulers(columns), forKey: Key.rulers)
+            d.set(columns.first ?? 0, forKey: Key.rulerColumn)
+        }
+    }
+
+    /// Columns from text such as "80, 120"; anything that isn't a column from 1 to 500 is ignored.
+    static func parseRulers(_ text: String) -> [Int] {
+        let columns = text.split(whereSeparator: { $0 == "," || $0 == " " || $0 == ";" })
+            .compactMap { Int($0) }.filter { (1...maxRulerColumn).contains($0) }
+        return Array(Array(Set(columns)).sorted().prefix(8))
+    }
+
+    static func formatRulers(_ columns: [Int]) -> String { columns.map(String.init).joined(separator: ", ") }
+
+    /// Seconds without edits before a changed file is saved; 0 is off.
+    var autoSaveDelay: Int { min(max(0, d.integer(forKey: Key.autoSaveDelay)), 3600) }
+
+    struct Indentation: Equatable {
+        var tabs: Bool
+        var width: Int
+    }
+
+    /// Tab width and tabs or spaces per language id, stored as "swift:2s,go:4t".
+    var languageIndentation: [(language: String, indentation: Indentation)] {
+        let text = d.string(forKey: Key.languageIndentation) ?? ""
+        if let c = indentationCache, c.text == text { return c.entries }
+        let entries = Settings.parseLanguageIndentation(text)
+        indentationCache = (text, entries, Dictionary(entries.map { ($0.language, $0.indentation) }, uniquingKeysWith: { a, _ in a }))
+        return entries
+    }
+    private var indentationCache: (text: String, entries: [(language: String, indentation: Indentation)], byLanguage: [String: Indentation])?
+
+    func indentation(forLanguage id: String) -> Indentation? {
+        _ = languageIndentation
+        return indentationCache?.byLanguage[id]
+    }
+
+    static func parseLanguageIndentation(_ text: String) -> [(language: String, indentation: Indentation)] {
+        var seen = Set<String>()
+        return text.split(separator: ",").compactMap { item in
+            let parts = item.trimmingCharacters(in: .whitespaces).split(separator: ":")
+            guard parts.count == 2, let kind = parts[1].last, kind == "s" || kind == "t",
+                  let width = Int(parts[1].dropLast()), (1...16).contains(width) else { return nil }
+            let id = parts[0].lowercased()
+            guard !id.isEmpty, seen.insert(id).inserted else { return nil }
+            return (id, Indentation(tabs: kind == "t", width: width))
+        }
+    }
+
+    static func formatLanguageIndentation(_ entries: [(language: String, indentation: Indentation)]) -> String {
+        entries.map { "\($0.language):\($0.indentation.width)\($0.indentation.tabs ? "t" : "s")" }.joined(separator: ",")
+    }
+
+    var fontLigatures: Bool { d.bool(forKey: Key.fontLigatures) }
+    /// The `.ligature` attribute for editor text: 1 lets fonts with ligatures join characters such
+    /// as -> or != into one symbol, 0 keeps every character on its own.
+    var ligatureAttribute: Int { fontLigatures ? 1 : 0 }
+
+    enum FontWeight: String, CaseIterable {
+        case light, regular, medium, semibold
+
+        var title: String { rawValue.capitalized }
+
+        var weight: NSFont.Weight {
+            switch self {
+            case .light: return .light
+            case .regular: return .regular
+            case .medium: return .medium
+            case .semibold: return .semibold
+            }
+        }
+
+        /// NSFontManager's 0–15 weight scale.
+        var managerWeight: Int {
+            switch self {
+            case .light: return 3
+            case .regular: return 5
+            case .medium: return 6
+            case .semibold: return 8
+            }
+        }
+    }
+
+    var fontWeight: FontWeight { FontWeight(rawValue: d.string(forKey: Key.fontWeight) ?? "") ?? .regular }
     var showStatusBar: Bool { get { d.bool(forKey: Key.showStatusBar) } set { d.set(newValue, forKey: Key.showStatusBar) } }
     var sidebarVisible: Bool { get { d.bool(forKey: Key.sidebarVisible) } set { d.set(newValue, forKey: Key.sidebarVisible) } }
     var sidebarWidth: Double { get { min(max(d.double(forKey: Key.sidebarWidth), 140), 600) } set { d.set(newValue, forKey: Key.sidebarWidth) } }
@@ -193,9 +306,19 @@ final class Settings {
     var font: NSFont {
         if let f = _font { return f }
         let size = CGFloat(fontSize)
-        var f: NSFont = .monospacedSystemFont(ofSize: size, weight: .regular)
-        if !fontName.isEmpty, let custom = NSFont(name: fontName, size: size) { f = custom }
+        let weight = fontWeight
+        var f: NSFont = .monospacedSystemFont(ofSize: size, weight: weight.weight)
+        if !fontName.isEmpty, let custom = NSFont(name: fontName, size: size) {
+            f = weight == .regular ? custom : Settings.font(custom, weight: weight)
+        }
         _font = f
+        return f
+    }
+
+    /// The face of `font`'s family closest to `weight`, or `font` when the family has only one.
+    static func font(_ font: NSFont, weight: FontWeight) -> NSFont {
+        guard let family = font.familyName,
+              let f = NSFontManager.shared.font(withFamily: family, traits: [], weight: weight.managerWeight, size: font.pointSize) else { return font }
         return f
     }
 

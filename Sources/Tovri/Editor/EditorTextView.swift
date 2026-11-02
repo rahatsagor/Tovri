@@ -266,10 +266,14 @@ final class EditorTextView: NSTextView {
 
         if let diff = editor?.inlineDiff { drawInlineDiff(diff, in: rect, theme: theme) }
 
-        if settings.rulerColumn > 0, let tc = textContainer {
-            let x = floor(textContainerOrigin.x + tc.lineFragmentPadding + CGFloat(settings.rulerColumn) * charWidth)
+        let rulers = settings.rulerColumns
+        if !rulers.isEmpty, let tc = textContainer {
             theme.guide.setFill()
-            NSRect(x: x, y: rect.minY, width: 1, height: rect.height).fill()
+            let left = textContainerOrigin.x + tc.lineFragmentPadding
+            for column in rulers {
+                let x = floor(left + CGFloat(column) * charWidth)
+                if x >= rect.minX - 1 && x <= rect.maxX { NSRect(x: x, y: rect.minY, width: 1, height: rect.height).fill() }
+            }
         }
 
         if settings.showIndentGuides { drawIndentGuides(in: rect, theme: theme) }

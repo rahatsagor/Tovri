@@ -18,8 +18,8 @@ enum SettingsWindow {
             tabs.addTabViewItem(item)
         }
         add("Appearance", "paintpalette", AppearanceSettings(), height: 700)
-        add("Editor", "text.cursor", EditorSettings(), height: 672)
-        add("Files", "folder", FilesSettings(), height: 712)
+        add("Editor", "text.cursor", EditorSettings(), height: 720)
+        add("Files", "folder", FilesSettings(), height: 740)
         add("Git", "arrow.triangle.branch", GitSettings(), height: 440)
         add("Key Bindings", "keyboard", KeyBindingsSettings(), height: 600)
         add("Updates", "arrow.triangle.2.circlepath", UpdatesSettings(), height: 300)
@@ -41,6 +41,8 @@ struct AppearanceSettings: View {
     @AppStorage(Settings.Key.darkTheme) private var darkTheme = "Tovri Dark"
     @AppStorage(Settings.Key.fontName) private var fontName = ""
     @AppStorage(Settings.Key.fontSize) private var fontSize = 13.0
+    @AppStorage(Settings.Key.fontWeight) private var fontWeight = Settings.FontWeight.regular.rawValue
+    @AppStorage(Settings.Key.fontLigatures) private var ligatures = false
     @AppStorage(Settings.Key.lineHeight) private var lineHeight = 1.4
     @AppStorage(Settings.Key.showMinimap) private var minimap = true
     @AppStorage(Settings.Key.showStatusBar) private var statusBar = true
@@ -72,6 +74,9 @@ struct AppearanceSettings: View {
                     Text("SF Mono (System)").tag("")
                     ForEach(fonts, id: \.self) { Text($0).tag($0) }
                 }
+                Picker("Weight", selection: $fontWeight) {
+                    ForEach(Settings.FontWeight.allCases, id: \.self) { Text($0.title).tag($0.rawValue) }
+                }
                 Stepper(value: $fontSize, in: 8...36, step: 1) {
                     HStack { Text("Size"); Spacer(); Text("\(Int(fontSize)) pt").foregroundStyle(.secondary) }
                 }
@@ -79,6 +84,10 @@ struct AppearanceSettings: View {
                     Text("Line height")
                     Slider(value: $lineHeight, in: 1.0...2.2, step: 0.05)
                     Text(String(format: "%.2f", lineHeight)).monospacedDigit().foregroundStyle(.secondary).frame(width: 38)
+                }
+                Toggle(isOn: $ligatures) {
+                    Text("Use ligatures")
+                    Text("In fonts that have them, character pairs such as -> and != are drawn as one symbol.")
                 }
             }
             Section("Window") {
@@ -155,8 +164,24 @@ struct EditorSettings: View {
     @AppStorage(Settings.Key.scrollPastEnd) private var scrollPastEnd = true
     @AppStorage(Settings.Key.highlightBrackets) private var brackets = true
     @AppStorage(Settings.Key.highlightOccurrences) private var occurrences = true
-    @AppStorage(Settings.Key.rulerColumn) private var ruler = 0
     @AppStorage(Settings.Key.spellCheckProse) private var spellCheck = true
+    @AppStorage(Settings.Key.languageIndentation) private var languageIndentation = ""
+    @State private var rulers = Settings.shared.rulersText
+
+    private var languageEntries: [(language: String, indentation: Settings.Indentation)] {
+        Settings.parseLanguageIndentation(languageIndentation)
+    }
+
+    private func updateLanguages(_ change: (inout [(language: String, indentation: Settings.Indentation)]) -> Void) {
+        var entries = languageEntries
+        change(&entries)
+        languageIndentation = Settings.formatLanguageIndentation(entries)
+    }
+
+    private func indentation(_ id: String) -> Binding<Settings.Indentation> {
+        Binding(get: { languageEntries.first { $0.language == id }?.indentation ?? Settings.Indentation(tabs: false, width: 4) },
+                set: { value in updateLanguages { e in if let i = e.firstIndex(where: { $0.language == id }) { e[i].indentation = value } } })
+    }
 
     var body: some View {
         Form {
@@ -166,6 +191,7 @@ struct EditorSettings: View {
                 Toggle("Detect indentation from file contents", isOn: $detect)
                 Toggle("Auto indent", isOn: $autoIndent)
             }
+            languagesSection
             Section("Display") {
                 Toggle("Word wrap", isOn: $wordWrap)
                 Toggle("Line numbers", isOn: $lineNumbers)
@@ -176,9 +202,15 @@ struct EditorSettings: View {
                 Toggle("Highlight occurrences of selection", isOn: $occurrences)
                 Toggle("Scroll past end", isOn: $scrollPastEnd)
                     .help("Adds space below the last line only when the file is taller than the editor.")
-                Picker("Vertical ruler", selection: $ruler) {
-                    Text("None").tag(0)
-                    ForEach([72, 80, 100, 120], id: \.self) { Text("Column \($0)").tag($0) }
+                LabeledContent {
+                    TextField("Vertical rulers", text: $rulers, prompt: Text("None"))
+                        .labelsHidden()
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 120)
+                        .onChange(of: rulers) { _, new in Settings.shared.rulersText = new }
+                } label: {
+                    Text("Vertical rulers")
+                    Text("Columns to draw a line at, such as 80, or 80, 120 for two. Leave empty for none.")
                 }
             }
             Section("Typing") {
@@ -188,6 +220,55 @@ struct EditorSettings: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { rulers = Settings.shared.rulersText }
+    }
+
+    private var languagesSection: some View {
+        Section {
+            ForEach(languageEntries.map { $0.language }, id: \.self) { id in
+                let value = indentation(id)
+                HStack {
+                    Text(LanguageRegistry.shared.language(id: id)?.name ?? id)
+                    Spacer()
+                    Picker("Indent using", selection: value.tabs) {
+                        Text("Spaces").tag(false)
+                        Text("Tabs").tag(true)
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    Stepper(value: value.width, in: 1...16) {
+                        Text("Width \(value.wrappedValue.width)").monospacedDigit()
+                    }
+                    .fixedSize()
+                    Button {
+                        updateLanguages { e in e.removeAll { $0.language == id } }
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Use the usual indentation for this language")
+                    .accessibilityLabel("Remove \(LanguageRegistry.shared.language(id: id)?.name ?? id)")
+                }
+            }
+            LabeledContent {
+                Menu("Add Language…") {
+                    let used = Set(languageEntries.map { $0.language })
+                    ForEach(LanguageRegistry.shared.all.filter { !used.contains($0.id) }, id: \.id) { lang in
+                        Button(lang.name) {
+                            updateLanguages { e in
+                                e.append((lang.id, Settings.Indentation(tabs: !insertSpaces, width: tabWidth)))
+                            }
+                        }
+                    }
+                }
+                .fixedSize()
+            } label: {
+                Text("Indentation for a language")
+                Text("Used instead of the indentation found in the file. A project's .editorconfig still comes first.")
+            }
+        } header: {
+            Text("Languages")
+        }
     }
 }
 
@@ -239,6 +320,7 @@ struct FilesSettings: View {
     @AppStorage(Settings.Key.trimTrailingWhitespace) private var trim = false
     @AppStorage(Settings.Key.ensureNewlineAtEOF) private var newline = false
     @AppStorage(Settings.Key.saveOnFocusLost) private var saveOnFocusLost = false
+    @AppStorage(Settings.Key.autoSaveDelay) private var autoSaveDelay = 0
     @AppStorage(Settings.Key.showHiddenFiles) private var hidden = true
     @AppStorage(Settings.Key.hiddenPatterns) private var hiddenPatterns = ".git .svn .hg .DS_Store"
     @AppStorage(Settings.Key.searchExcludes) private var excludes = ""
@@ -290,6 +372,15 @@ struct FilesSettings: View {
                 Toggle("Trim trailing whitespace on save", isOn: $trim)
                 Toggle("Ensure newline at end of file", isOn: $newline)
                 Toggle("Save files when Tovri loses focus", isOn: $saveOnFocusLost)
+                Picker(selection: $autoSaveDelay) {
+                    Text("Off").tag(0)
+                    ForEach(([1, 5, 30] + ([0, 1, 5, 30].contains(autoSaveDelay) ? [] : [autoSaveDelay])).sorted(), id: \.self) { s in
+                        Text(s == 1 ? "After 1 second" : "After \(s) seconds").tag(s)
+                    }
+                } label: {
+                    Text("Save changes automatically")
+                    Text("Saves files that are already on disk once you stop typing. New files still need Save.")
+                }
             }
             Section("Sidebar & Search") {
                 Toggle("Reveal the active file in the sidebar", isOn: $revealActive)
