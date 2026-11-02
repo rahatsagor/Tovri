@@ -83,9 +83,11 @@ removed and added lines or revert them. **Compare with Last Commit** (⇧⌥⌘D
 shows removed lines right in the editor, and the status bar counts changed
 files: click it to list them with the lines each one adds and removes.
 Ideal for checking what a coding agent touched. Turn on **Changes and file
-history** in **Settings → Git** for a Changes list in the sidebar and **File
-History** (⇧⌥⌘H), which compares a file with any earlier commit. Every Git
-feature can be turned off there too.
+history** in **Settings → Git** for a Changes list in the sidebar, where you
+can stage, unstage and discard changes, and **File History** (⇧⌥⌘H), which
+compares a file with any earlier commit. Every Git feature can be turned off
+there too. You can also compare a file with its saved version, the clipboard
+or another file.
 
 </td>
 </tr>
@@ -96,7 +98,9 @@ feature can be turned off there too.
 **Goto Anything** (⌘P) opens files by a few letters of their name, the
 command palette (⇧⌘P) runs any command, and Goto Symbol (⌘R), Goto Symbol in
 Project (⇧⌘R) and Goto Definition (F12) jump straight to the code you need.
-Find in Files (⇧⌘F) searches a whole folder on every core.
+Find in Files (⇧⌘F) searches a whole folder on every core, Replace in Files
+(⌥⇧⌘F) shows every match before it changes anything, and bookmarks (⌘F2)
+mark lines to come back to.
 
 </td>
 <td valign="top">
@@ -120,8 +124,8 @@ remote images load only when you ask.
 <td valign="top">
 
 #### Made for the Mac
-15 themes that can follow light and dark mode, tabs and split layouts, a
-minimap, Quick Look for images, PDFs and documents, printing, `.editorconfig`
+15 themes that can follow light and dark mode, plus your own made in
+Settings, tabs and split layouts, a minimap, Quick Look for images, PDFs and documents, printing, `.editorconfig`
 support, and spell checking for prose.
 
 </td>
@@ -132,7 +136,8 @@ support, and spell checking for prose.
 #### Never lose your work
 Windows, tabs and unsaved changes are still there after you quit. Files
 changed by other apps reload on their own, and Tovri asks before it replaces
-your edits. A growing log follows its new lines.
+your edits. Local History keeps earlier versions of every file you save
+over, and a growing log follows its new lines.
 
 </td>
 <td valign="top">
