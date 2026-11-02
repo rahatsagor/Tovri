@@ -38,6 +38,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { _, _ in
             DispatchQueue.main.async { ThemeManager.shared.refresh() }
         }
+        NotificationCenter.default.addObserver(forName: .themeListDidChange, object: nil, queue: .main) { _ in
+            MainMenu.rebuildThemeItems()
+        }
 
         SessionStore.shared.stateProvider = { [weak self] in
             guard let self else { return [] }

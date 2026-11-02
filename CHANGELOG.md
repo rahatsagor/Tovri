@@ -9,6 +9,19 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Custom themes.** In **Settings → Appearance**, choose **New Theme…** to
+  start from any theme and change its colors: the background, text, accent,
+  selection and cursor, every kind of syntax color and, under **Interface
+  colors**, the sidebar, tabs, gutter, find highlights and window blur. A
+  preview shows your changes, and open windows follow along as you edit.
+  Colors you don't set are worked out from the others. Your themes appear in
+  **View → Theme**, the theme picker and the light and dark mode choices.
+- A **Backup** settings pane. **Export…** saves your preferences, key
+  bindings and custom themes to a file, and **Import…** brings them back,
+  on the same Mac or another one.
+
 ## [0.3.0] - 2026-11-01
 
 ### Added

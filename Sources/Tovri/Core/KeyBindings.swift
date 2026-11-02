@@ -89,11 +89,18 @@ final class KeyBindings: ObservableObject {
     @Published private(set) var commands: [CommandBinding] = []
     private var defaults: [String: KeyShortcut?] = [:]
     private var overrides: [String: String]
-    private let storeKey = "keyBindings"
+    static let storeKey = "keyBindings"
+    private var storeKey: String { KeyBindings.storeKey }
     private weak var menu: NSMenu?
 
     private init() {
+        overrides = UserDefaults.standard.dictionary(forKey: KeyBindings.storeKey) as? [String: String] ?? [:]
+    }
+
+    /// Picks up overrides written to UserDefaults directly, such as by a settings import.
+    func reloadFromDefaults() {
         overrides = UserDefaults.standard.dictionary(forKey: storeKey) as? [String: String] ?? [:]
+        apply()
     }
 
     private static let skippedSubmenus: Set<String> = ["Services", "Open Recent"]

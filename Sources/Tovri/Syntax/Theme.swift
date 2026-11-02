@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 extension NSColor {
     convenience init(hex: String, alpha: CGFloat = 1) {
@@ -17,10 +18,25 @@ extension NSColor {
     func mix(_ other: NSColor, _ fraction: CGFloat) -> NSColor {
         blended(withFraction: fraction, of: other) ?? self
     }
+
+    /// `#RRGGBB`, or `#RRGGBBAA` when the color isn't opaque.
+    var hexString: String {
+        let c = usingColorSpace(.sRGB) ?? self
+        func byte(_ v: CGFloat) -> Int { Int((min(max(v, 0), 1) * 255).rounded()) }
+        let rgb = String(format: "#%02X%02X%02X", byte(c.redComponent), byte(c.greenComponent), byte(c.blueComponent))
+        let a = byte(c.alphaComponent)
+        return a == 255 ? rgb : rgb + String(format: "%02X", a)
+    }
+}
+
+extension TokenKind {
+    /// Stable name used in theme files.
+    var key: String { String(describing: self) }
+    static let byKey: [String: TokenKind] = Dictionary(uniqueKeysWithValues: allCases.map { ($0.key, $0) })
 }
 
 /// Optional per-theme UI colors; anything left nil is derived from the base palette.
-struct ThemeUI {
+struct ThemeUI: Codable, Equatable {
     var gutter: String?
     var gutterActive: String?
     var guide: String?
@@ -42,11 +58,98 @@ struct ThemeUI {
     var dirty: String?
     /// Window blur: the window background is a blurred view tinted with this color.
     var windowTint: String?
+
+    static let keyPaths: [WritableKeyPath<ThemeUI, String?>] = [
+        \.gutter, \.gutterActive, \.guide, \.activeGuide, \.invisibles, \.border, \.chromeForeground,
+        \.chromeSecondary, \.tabActive, \.hover, \.sidebarSelection, \.panel, \.field, \.findMatch,
+        \.findCurrent, \.bracket, \.wordHighlight, \.minimapViewport, \.dirty, \.windowTint,
+    ]
+}
+
+/// The colors a theme is made from, as stored in a custom theme file. Colors left out are
+/// derived from the base palette when the theme is built.
+struct ThemeDefinition: Codable, Equatable {
+    var name: String
+    var dark: Bool
+    var background: String
+    var foreground: String
+    var accent: String
+    var selection: String?
+    var lineHighlight: String?
+    var caret: String?
+    var chrome: String?
+    var ui: ThemeUI
+    /// Token color by `TokenKind.key`.
+    var tokens: [String: String]
+
+    init(name: String, dark: Bool, background: String, foreground: String, accent: String,
+         selection: String? = nil, lineHighlight: String? = nil, caret: String? = nil, chrome: String? = nil,
+         ui: ThemeUI = ThemeUI(), tokens: [String: String] = [:]) {
+        self.name = name
+        self.dark = dark
+        self.background = background
+        self.foreground = foreground
+        self.accent = accent
+        self.selection = selection
+        self.lineHighlight = lineHighlight
+        self.caret = caret
+        self.chrome = chrome
+        self.ui = ui
+        self.tokens = tokens
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, dark, background, foreground, accent, selection, lineHighlight, caret, chrome, ui, tokens
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        dark = try c.decode(Bool.self, forKey: .dark)
+        background = try c.decode(String.self, forKey: .background)
+        foreground = try c.decode(String.self, forKey: .foreground)
+        accent = try c.decode(String.self, forKey: .accent)
+        selection = try c.decodeIfPresent(String.self, forKey: .selection)
+        lineHighlight = try c.decodeIfPresent(String.self, forKey: .lineHighlight)
+        caret = try c.decodeIfPresent(String.self, forKey: .caret)
+        chrome = try c.decodeIfPresent(String.self, forKey: .chrome)
+        ui = try c.decodeIfPresent(ThemeUI.self, forKey: .ui) ?? ThemeUI()
+        tokens = try c.decodeIfPresent([String: String].self, forKey: .tokens) ?? [:]
+    }
+
+    static let maxNameLength = 60
+
+    static func isValidHex(_ s: String) -> Bool {
+        let h = s.hasPrefix("#") ? s.dropFirst() : Substring(s)
+        return [3, 6, 8].contains(h.count) && h.allSatisfy(\.isHexDigit)
+    }
+
+    static func cleanName(_ s: String) -> String {
+        s.filter { !$0.isNewline && !($0.unicodeScalars.first.map { CharacterSet.controlCharacters.contains($0) } ?? false) }
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Theme files come from outside Tovri, so this rejects anything `Theme` can't use as is:
+    /// a missing name, a malformed color, or unknown token names (which are dropped).
+    func validated() -> ThemeDefinition? {
+        var d = self
+        d.name = ThemeDefinition.cleanName(name)
+        guard !d.name.isEmpty, d.name.count <= ThemeDefinition.maxNameLength else { return nil }
+        let required = [background, foreground, accent]
+        let optional = [selection, lineHighlight, caret, chrome] + ThemeUI.keyPaths.map { ui[keyPath: $0] }
+        guard required.allSatisfy(ThemeDefinition.isValidHex),
+              optional.allSatisfy({ $0.map(ThemeDefinition.isValidHex) ?? true }) else { return nil }
+        d.tokens = tokens.filter { TokenKind.byKey[$0.key] != nil && $0.key != TokenKind.plain.key && ThemeDefinition.isValidHex($0.value) }
+        return d
+    }
 }
 
 final class Theme {
     let name: String
     let isDark: Bool
+    /// Made in Tovri's theme editor or imported, rather than built in.
+    let isCustom: Bool
+    let definition: ThemeDefinition
     /// Translucent themes draw editor surfaces clear over a blurred, tinted window.
     let translucent: Bool
     let windowTint: NSColor
@@ -89,10 +192,14 @@ final class Theme {
 
     init(name: String, dark: Bool, background: String, foreground: String, accent: String,
          selection: String? = nil, lineHighlight: String? = nil, caret: String? = nil,
-         chrome: String? = nil, ui: ThemeUI = ThemeUI(), tokens: [TokenKind: String]) {
+         chrome: String? = nil, ui: ThemeUI = ThemeUI(), tokens: [TokenKind: String], custom: Bool = false) {
         func c(_ hex: String?) -> NSColor? { hex.map { NSColor(hex: $0) } }
         self.name = name
         self.isDark = dark
+        self.isCustom = custom
+        self.definition = ThemeDefinition(name: name, dark: dark, background: background, foreground: foreground, accent: accent,
+                                          selection: selection, lineHighlight: lineHighlight, caret: caret, chrome: chrome, ui: ui,
+                                          tokens: Dictionary(uniqueKeysWithValues: tokens.map { ($0.key.key, $0.value) }))
         let bg = NSColor(hex: background)
         let fg = NSColor(hex: foreground)
         let ac = NSColor(hex: accent)
@@ -159,36 +266,171 @@ final class Theme {
         self.tokenColors = colors
     }
 
+    convenience init(definition d: ThemeDefinition, custom: Bool = true) {
+        var tokens: [TokenKind: String] = [:]
+        for (k, v) in d.tokens { if let kind = TokenKind.byKey[k] { tokens[kind] = v } }
+        self.init(name: d.name, dark: d.dark, background: d.background, foreground: d.foreground, accent: d.accent,
+                  selection: d.selection, lineHighlight: d.lineHighlight, caret: d.caret, chrome: d.chrome,
+                  ui: d.ui, tokens: tokens, custom: custom)
+    }
+
     @inline(__always) func color(_ kind: TokenKind) -> NSColor? { tokenColors[Int(kind.rawValue)] }
 }
 
 extension Notification.Name {
     static let themeDidChange = Notification.Name("TovriThemeDidChange")
     static let settingsDidChange = Notification.Name("TovriSettingsDidChange")
+    /// Custom themes were added, changed or removed.
+    static let themeListDidChange = Notification.Name("TovriThemeListDidChange")
 }
 
-final class ThemeManager {
+/// Custom theme files in a folder, one JSON `ThemeDefinition` per file.
+struct CustomThemeStore {
+    let directory: URL
+
+    static let shared = CustomThemeStore(directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Tovri", isDirectory: true).appendingPathComponent("Themes", isDirectory: true))
+
+    static let maxFileSize = 256 * 1024
+
+    private func files() -> [URL] {
+        let urls = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])) ?? []
+        return urls.filter { $0.pathExtension.lowercased() == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func read(_ url: URL) -> ThemeDefinition? {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), values.isRegularFile == true,
+              (values.fileSize ?? 0) <= CustomThemeStore.maxFileSize,
+              let data = try? Data(contentsOf: url) else { return nil }
+        return (try? JSONDecoder().decode(ThemeDefinition.self, from: data))?.validated()
+    }
+
+    /// Valid themes, sorted by name; when two files use the same name, the first one wins.
+    func load() -> [ThemeDefinition] {
+        var seen = Set<String>()
+        return files().compactMap(read).filter { seen.insert($0.name).inserted }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    static func fileName(for name: String) -> String {
+        var s = String(name.map { "/:\\".contains($0) ? "-" : $0 })
+        while s.hasPrefix(".") { s.removeFirst() }
+        return (s.isEmpty ? "Theme" : s) + ".json"
+    }
+
+    /// Saves `definition`, replacing any theme file with the same name.
+    func save(_ definition: ThemeDefinition) throws {
+        guard let d = definition.validated() else { throw CocoaError(.fileWriteInvalidFileName) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Overwrite the theme's existing file in place, so a failed write leaves the old theme intact.
+        let existing = files().filter { read($0)?.name == d.name }
+        var url = existing.first ?? directory.appendingPathComponent(CustomThemeStore.fileName(for: d.name))
+        var n = 2
+        while existing.isEmpty && FileManager.default.fileExists(atPath: url.path) {
+            url = directory.appendingPathComponent((CustomThemeStore.fileName(for: d.name) as NSString).deletingPathExtension + " \(n).json")
+            n += 1
+        }
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(d).write(to: url, options: .atomic)
+        for other in existing.dropFirst() { try? FileManager.default.removeItem(at: other) }
+    }
+
+    func delete(named name: String) throws {
+        for url in files() where read(url)?.name == name { try FileManager.default.removeItem(at: url) }
+    }
+}
+
+final class ThemeManager: ObservableObject {
     static let shared = ThemeManager()
 
-    let themes: [Theme] = Themes.all
+    let builtIn: [Theme] = Themes.all
+    private(set) var themes: [Theme]
     private(set) var current: Theme
-    /// Temporarily shown theme (palette preview); nil when not previewing.
-    private var previewing: Theme?
+    enum PreviewSource { case picker, editor }
+    /// Temporarily shown themes; nil when not previewing. The theme picker can open while the
+    /// theme editor is previewing, so each keeps its own slot and the picker's wins.
+    private var pickerPreview: Theme?
+    private var editorPreview: Theme?
+    var store: CustomThemeStore
 
-    var active: Theme { previewing ?? current }
+    var active: Theme { pickerPreview ?? editorPreview ?? current }
+    var customThemes: [Theme] { themes.filter(\.isCustom) }
 
     private init() {
+        store = .shared
+        themes = Themes.all
         current = Themes.all[0]
+        themes = builtIn + loadCustom()
         current = resolvedTheme()
     }
 
+    private func loadCustom() -> [Theme] {
+        let reserved = Set(builtIn.map(\.name))
+        return store.load().filter { !reserved.contains($0.name) }.map { Theme(definition: $0) }
+    }
+
     func theme(named name: String) -> Theme? { themes.first { $0.name == name } }
+
+    func isBuiltIn(_ name: String) -> Bool { builtIn.contains { $0.name == name } }
+
+    func reloadCustomThemes() {
+        objectWillChange.send()
+        themes = builtIn + loadCustom()
+        repairSelection()
+        NotificationCenter.default.post(name: .themeListDidChange, object: nil)
+        refresh()
+    }
+
+    /// Theme settings that name a missing theme, or a light or dark slot holding the other kind
+    /// (after a theme was switched between light and dark), go back to Tovri's own themes.
+    private func repairSelection() {
+        let d = UserDefaults.standard
+        func fix(_ key: String, fallback: String, valid: (Theme) -> Bool) {
+            guard let name = d.string(forKey: key) else { return }
+            if let t = theme(named: name), valid(t) { return }
+            d.set(fallback, forKey: key)
+        }
+        fix(Settings.Key.theme, fallback: "Tovri Dark") { _ in true }
+        fix(Settings.Key.lightTheme, fallback: "Tovri Day") { !$0.isDark }
+        fix(Settings.Key.darkTheme, fallback: "Tovri Dark") { $0.isDark }
+    }
+
+    /// Saves a custom theme. When it was renamed, the old file goes and any setting that chose the
+    /// old name follows the new one.
+    func saveCustomTheme(_ definition: ThemeDefinition, replacing oldName: String?) throws {
+        guard let d = definition.validated(), !isBuiltIn(d.name) else { throw CocoaError(.fileWriteInvalidFileName) }
+        try store.save(d)
+        if let oldName, oldName != d.name {
+            try store.delete(named: oldName)
+            renameSelection(from: oldName, to: d.name)
+        }
+        reloadCustomThemes()
+    }
+
+    /// A setting that chose the deleted theme falls back to Tovri's own light or dark theme.
+    func deleteCustomTheme(named name: String) throws {
+        let dark = theme(named: name)?.isDark ?? true
+        try store.delete(named: name)
+        let d = UserDefaults.standard
+        if d.string(forKey: Settings.Key.theme) == name { d.set(dark ? "Tovri Dark" : "Tovri Day", forKey: Settings.Key.theme) }
+        if d.string(forKey: Settings.Key.lightTheme) == name { d.set("Tovri Day", forKey: Settings.Key.lightTheme) }
+        if d.string(forKey: Settings.Key.darkTheme) == name { d.set("Tovri Dark", forKey: Settings.Key.darkTheme) }
+        reloadCustomThemes()
+    }
+
+    private func renameSelection(from old: String, to new: String) {
+        let d = UserDefaults.standard
+        for key in [Settings.Key.theme, Settings.Key.lightTheme, Settings.Key.darkTheme] where d.string(forKey: key) == old {
+            d.set(new, forKey: key)
+        }
+    }
 
     func resolvedTheme() -> Theme {
         let s = Settings.shared
         if s.followSystemAppearance {
             let dark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            return theme(named: dark ? s.darkTheme : s.lightTheme) ?? themes[0]
+            return theme(named: dark ? s.darkTheme : s.lightTheme) ?? theme(named: dark ? "Tovri Dark" : "Tovri Day") ?? themes[0]
         }
         return theme(named: s.theme) ?? themes[0]
     }
@@ -197,12 +439,15 @@ final class ThemeManager {
         let t = resolvedTheme()
         if t !== current {
             current = t
-            if previewing == nil { NotificationCenter.default.post(name: .themeDidChange, object: nil) }
+            if pickerPreview == nil && editorPreview == nil { NotificationCenter.default.post(name: .themeDidChange, object: nil) }
         }
     }
 
-    func preview(_ theme: Theme?) {
-        previewing = theme
+    func preview(_ theme: Theme?, from source: PreviewSource = .picker) {
+        switch source {
+        case .picker: pickerPreview = theme
+        case .editor: editorPreview = theme
+        }
         NotificationCenter.default.post(name: .themeDidChange, object: nil)
     }
 }

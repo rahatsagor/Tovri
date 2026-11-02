@@ -17,12 +17,13 @@ enum SettingsWindow {
             item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
             tabs.addTabViewItem(item)
         }
-        add("Appearance", "paintpalette", AppearanceSettings(), height: 500)
+        add("Appearance", "paintpalette", AppearanceSettings(), height: 700)
         add("Editor", "text.cursor", EditorSettings(), height: 672)
         add("Files", "folder", FilesSettings(), height: 712)
         add("Git", "arrow.triangle.branch", GitSettings(), height: 440)
         add("Key Bindings", "keyboard", KeyBindingsSettings(), height: 600)
         add("Updates", "arrow.triangle.2.circlepath", UpdatesSettings(), height: 300)
+        add("Backup", "externaldrive", BackupSettings(), height: 340)
         let w = NSWindow(contentViewController: tabs)
         w.styleMask = [.titled, .closable]
         w.toolbarStyle = .preference
@@ -44,7 +45,12 @@ struct AppearanceSettings: View {
     @AppStorage(Settings.Key.showMinimap) private var minimap = true
     @AppStorage(Settings.Key.showStatusBar) private var statusBar = true
 
-    private let themes = ThemeManager.shared.themes
+    @ObservedObject private var manager = ThemeManager.shared
+    @State private var editing: ThemeEditorSession?
+    @State private var deleting: String?
+    @State private var deleteError: String?
+
+    private var themes: [Theme] { manager.themes }
     private let fonts = Settings.monospacedFontFamilies()
 
     var body: some View {
@@ -60,6 +66,7 @@ struct AppearanceSettings: View {
                     }
                 }
             }
+            customThemesSection
             Section("Font") {
                 Picker("Family", selection: $fontName) {
                     Text("SF Mono (System)").tag("")
@@ -80,6 +87,56 @@ struct AppearanceSettings: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(item: $editing) { ThemeEditor(session: $0) }
+    }
+
+    private var customThemesSection: some View {
+        Section {
+            ForEach(manager.customThemes, id: \.name) { t in
+                HStack(spacing: 10) {
+                    ThemeSwatch(theme: t)
+                    Text(t.name)
+                    Text(t.isDark ? "Dark" : "Light").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Edit…") { editing = ThemeEditorSession(definition: t.definition, originalName: t.name) }
+                    Button {
+                        deleting = t.name
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Delete this theme")
+                    .accessibilityLabel("Delete \(t.name)")
+                }
+            }
+            LabeledContent {
+                Menu("New Theme…") {
+                    Button("Copy of \(manager.current.name)") { editing = .copy(of: manager.current, among: themes) }
+                    Divider()
+                    ForEach(themes, id: \.name) { t in
+                        Button(t.name) { editing = .copy(of: t, among: themes) }
+                    }
+                }
+                .fixedSize()
+            } label: {
+                Text("Make your own theme")
+                Text("Start from any theme and change its colors. Open windows show your changes as you make them.")
+            }
+            if let deleteError {
+                Text(deleteError).font(.callout).foregroundStyle(.red)
+            }
+        } header: {
+            Text("Custom Themes")
+        }
+        .confirmationDialog("Delete the theme “\(deleting ?? "")”?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            presenting: deleting) { name in
+            Button("Delete", role: .destructive) {
+                do { try manager.deleteCustomTheme(named: name); deleteError = nil }
+                catch { deleteError = "Tovri couldn't delete the theme. \(error.localizedDescription)" }
+            }
+        } message: { _ in
+            Text("Windows using it switch to a built-in theme. This can't be undone.")
+        }
     }
 }
 

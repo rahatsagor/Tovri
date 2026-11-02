@@ -25,6 +25,20 @@ enum MainMenu {
         return item
     }
 
+    private static weak var themeMenu: NSMenu?
+
+    /// The theme list after the menu's separator, rebuilt when custom themes change.
+    static func rebuildThemeItems() {
+        guard let menu = themeMenu, let sep = menu.items.firstIndex(where: \.isSeparatorItem) else { return }
+        while menu.items.count > sep + 1 { menu.removeItem(at: sep + 1) }
+        let all = ThemeManager.shared.themes
+        for (i, t) in all.enumerated() {
+            if t.isCustom, i > 0, !all[i - 1].isCustom { menu.addItem(.separator()) }
+            let item = add(menu, t.name, #selector(MainWindowController.setThemeFromMenu(_:)), "", [])
+            item.representedObject = t.name
+        }
+    }
+
     private static func submenu(_ parent: NSMenu, _ title: String) -> NSMenu {
         let m = NSMenu(title: title)
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
@@ -211,10 +225,8 @@ enum MainMenu {
         add(theme, "Select Theme…", #selector(MainWindowController.showThemePicker(_:)), "k", [.command, .control])
         add(theme, "Follow System Appearance", #selector(MainWindowController.toggleFollowSystemAppearance(_:)))
         theme.addItem(.separator())
-        for t in ThemeManager.shared.themes {
-            let item = add(theme, t.name, #selector(MainWindowController.setThemeFromMenu(_:)), "", [])
-            item.representedObject = t.name
-        }
+        themeMenu = theme
+        rebuildThemeItems()
         view.addItem(.separator())
         add(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
 
