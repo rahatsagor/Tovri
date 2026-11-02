@@ -22,8 +22,35 @@ and versions follow [Semantic Versioning](https://semver.org/).
   bindings and custom themes to a file, and **Import…** brings them back,
   on the same Mac or another one.
 
+### Changed
+
+- Changing the line ending in the status bar is now an unsaved change you can
+  undo, instead of saving the file right away.
+- Saving keeps a file's hidden flag and updates every hard link to it, and
+  Save All and saving when you quit trim whitespace and add the final newline
+  the same way ⌘S does.
+- Very large unsaved documents are backed up regularly while you work, not
+  only when you quit.
+
 ### Fixed
 
+- Choosing **Don't Save** really discards your changes. Reopening the file
+  could bring the discarded edits back.
+- Reopening Tovri could replace unsaved edits in one window with an older
+  backup from a window you had closed. Both are now kept, and the older one
+  opens as "(unsaved copy)".
+- **Reopen with Encoding** threw away unsaved changes without asking.
+- If a file changed on disk while Tovri was closed, saving your restored edits
+  replaced the newer file without warning. Now Tovri asks.
+- A file that disappeared and came back, such as when switching Git
+  branches, showed as having unsaved changes.
+- If another app removed a file's byte order mark or converted it to UTF-8,
+  Tovri added the mark back or kept reading it in the old encoding.
+- Save As and moving a file in the sidebar kept the old folder's
+  `.editorconfig` settings, and an `.editorconfig` at the root of the disk
+  never applied.
+- Tovri could crash when a file it was reading was cut short by another
+  program, as log rotation does.
 - Files ignored only by your global Git ignore file, such as `.DS_Store`,
   showed as new in the sidebar and the Changes list.
 - `tovri -w` waited forever over SSH or with a custom `TMPDIR`.

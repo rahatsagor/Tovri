@@ -41,13 +41,20 @@ enum TextEncoding: String, CaseIterable {
         var text: String
         var encoding: TextEncoding
         var isBinary: Bool
+        /// False when the preferred encoding was used.
+        var detected = true
     }
 
     static func decode(_ data: Data, preferred: TextEncoding? = nil) -> Decoded {
         if var p = preferred {
             if p == .utf8 && data.starts(with: TextEncoding.utf8BOM.bom) { p = .utf8BOM }
-            let body = data.starts(with: p.bom) && !p.bom.isEmpty ? data.dropFirst(p.bom.count) : data
-            if let s = p.string(from: body) { return Decoded(text: s, encoding: p, isBinary: false) }
+            // Another program removed the BOM; saving must not put it back.
+            if p == .utf8BOM && !data.starts(with: p.bom) { p = .utf8 }
+            let hasBOM = !p.bom.isEmpty && data.starts(with: p.bom)
+            if !(p.isUTF16 && !hasBOM && TextEncoding.lostUTF16Marker(data)) {
+                let body = hasBOM ? data.dropFirst(p.bom.count) : data
+                if let s = p.string(from: body) { return Decoded(text: s, encoding: p, isBinary: false, detected: false) }
+            }
         }
         if data.starts(with: [0xEF, 0xBB, 0xBF]), let s = TextEncoding.utf8BOM.string(from: data.dropFirst(3)) {
             return Decoded(text: s, encoding: .utf8BOM, isBinary: false)
@@ -70,6 +77,22 @@ enum TextEncoding: String, CaseIterable {
         }
         let s = String(data: data, encoding: .isoLatin1) ?? ""
         return Decoded(text: s, encoding: .latin1, isBinary: binary)
+    }
+
+    private var isUTF16: Bool { self == .utf16LE || self == .utf16BE }
+
+    /// Whether data expected as UTF-16 without its BOM was rewritten in another encoding. UTF-16
+    /// text has NUL bytes in nearly every line, so valid UTF-8 without any, or another BOM, means
+    /// the file was converted.
+    private static func lostUTF16Marker(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return false }
+        if data.starts(with: TextEncoding.utf8BOM.bom) || data.starts(with: TextEncoding.utf16LE.bom)
+            || data.starts(with: TextEncoding.utf16BE.bom) { return true }
+        let hasNUL = data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return false }
+            return memchr(base, 0, raw.count) != nil
+        }
+        return !hasNUL && String(data: data, encoding: .utf8) != nil
     }
 
     /// Decodes the bytes after any BOM. Foundation silently drops a leading UTF-8 BOM, so one that is

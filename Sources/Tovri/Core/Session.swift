@@ -12,6 +12,22 @@ struct TabSession: Codable {
     var encoding: String?
     var lineEnding: String?
     var isNewFile: Bool? = nil
+    /// The file as it was when the backup was taken, so a file changed since then is noticed
+    /// before the backup is saved over it.
+    var diskStamp: DiskStamp? = nil
+    /// The document and edit version the tab showed, so an older backup of the same buffer from
+    /// another window never replaces newer text.
+    var documentID: String? = nil
+    var editVersion: Int? = nil
+    /// The encoding was detected rather than chosen, so the file is detected again on restore.
+    var encodingDetected: Bool? = nil
+
+    var backupSource: Document.BackupSource? {
+        if let id = documentID.flatMap(UUID.init(uuidString:)), let editVersion {
+            return Document.BackupSource(id: id, version: editVersion)
+        }
+        return buffer.flatMap(SessionStore.backupSource(ofBufferNamed:))
+    }
 }
 
 struct GroupSession: Codable {
@@ -70,6 +86,7 @@ final class SessionStore {
     private var pendingWrites: [String: BufferWrite] = [:]
     private var allowLarge = false
     private static let largeBuffer = 4_000_000
+    private var lastLargeWrite: [UUID: TimeInterval] = [:]
 
     lazy var directory: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -101,14 +118,29 @@ final class SessionStore {
             FileManager.default.fileExists(atPath: bufferDirectory.appendingPathComponent(buffer.name).path) ? buffer : nil
         }
         if let available, available.version == doc.editVersion { return available.name }
-        if doc.length > SessionStore.largeBuffer && !allowLarge { return available?.name }
         // A new version must not overwrite a buffer referenced by the last committed session.
         let name = "\(doc.id.uuidString)-\(doc.editVersion).txt"
-        if pendingWrites[name] == nil {
-            pendingWrites[name] = BufferWrite(documentID: doc.id, version: doc.editVersion, name: name,
-                                              text: doc.string.copy() as! NSString)
+        if pendingWrites[name] != nil { return name }
+        if doc.length > SessionStore.largeBuffer && !allowLarge {
+            // Copying a huge buffer stalls typing, so between quits it is backed up less often.
+            let now = Date.timeIntervalSinceReferenceDate
+            let interval = max(60, Double(doc.length) / 1_000_000 * 3)
+            if let last = lastLargeWrite[doc.id], now - last < interval { return available?.name }
+            lastLargeWrite[doc.id] = now
         }
+        pendingWrites[name] = BufferWrite(documentID: doc.id, version: doc.editVersion, name: name,
+                                          text: doc.string.copy() as! NSString)
         return name
+    }
+
+    /// Reads the document and version back out of a buffer name, for sessions saved before tabs
+    /// recorded them.
+    static func backupSource(ofBufferNamed name: String) -> Document.BackupSource? {
+        guard name.hasSuffix(".txt"), name.count > 41 else { return nil }
+        let base = name.dropLast(4)
+        guard let id = UUID(uuidString: String(base.prefix(36))), base.dropFirst(36).first == "-",
+              let version = Int(base.dropFirst(37)) else { return nil }
+        return Document.BackupSource(id: id, version: version)
     }
 
     /// Synchronous callers must check the result before discarding any open documents.

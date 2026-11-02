@@ -848,9 +848,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         alert.beginSheetModal(for: window) { [weak self] resp in
             switch resp {
             case .alertFirstButtonReturn: self?.save(doc, completion: completion)
-            case .alertThirdButtonReturn: completion(true)
+            case .alertThirdButtonReturn:
+                completion(true)
+                MainWindowController.discardChangesLater(doc)
             default: completion(false)
             }
+        }
+    }
+
+    /// After "Don’t Save", a document that is no longer open anywhere but is still alive (held by
+    /// a list, an undo stack, a background task) goes back to the file on disk. Otherwise opening
+    /// the file again would find it and show the edits that were just thrown away.
+    private static func discardChangesLater(_ doc: Document) {
+        // Once the tab or window has gone.
+        DispatchQueue.main.async { [weak doc] in discardChanges(of: doc) }
+    }
+
+    static func discardChanges(of doc: Document?) {
+        guard let doc, doc.isDirty, (NSApp.delegate as? AppDelegate)?.isTerminating != true else { return }
+        let controllers = (NSApp.delegate as? AppDelegate)?.controllers ?? []
+        guard !controllers.contains(where: { $0.allOpenDocuments().contains { $0 === doc } }) else { return }
+        if let url = doc.url, !doc.isNewFile, FileManager.default.fileExists(atPath: url.path) {
+            // If the file can't be read, the edits stay rather than an empty copy that could be saved over it.
+            try? doc.reload()
+        } else {
+            doc.replaceAllContent("")
         }
     }
 
@@ -863,7 +885,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// The app supplies globally deduplicated documents when every window is quitting.
     func confirmClose(_ dirty: [Document], completion: @escaping (Bool) -> Void) {
         func next(_ i: Int) {
-            guard i < dirty.count else { completion(true); return }
+            guard i < dirty.count else {
+                completion(true)
+                // Those still unsaved were answered "Don’t Save"; the window closes in `completion`.
+                for d in dirty where d.isDirty { MainWindowController.discardChangesLater(d) }
+                return
+            }
             guard dirty[i].isDirty else { next(i + 1); return }
             if let (g, idx) = locate(dirty[i]) {
                 activate(group: g)
@@ -1013,10 +1040,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     func write(_ doc: Document, to target: URL?, replacingExternalChanges: Bool = false, interactive: Bool = true,
                completion: ((Bool) -> Void)? = nil) {
         let editor = allGroupsTabs().first { $0.document === doc && $0.editor != nil }?.editor
+        let cleanups = doc.saveCleanups(to: target)
         if let tv = editor?.textView {
-            let cleanups = doc.saveCleanups(to: target)
             if cleanups.trimTrailingWhitespace { tv.trimTrailingWhitespace(nil) }
             if cleanups.insertFinalNewline { tv.ensureTrailingNewline() }
+        } else {
+            doc.applySaveCleanups(trimTrailingWhitespace: cleanups.trimTrailingWhitespace, insertFinalNewline: cleanups.insertFinalNewline)
         }
         do {
             try doc.save(to: target, replacingExternalChanges: replacingExternalChanges)
@@ -2028,16 +2057,32 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         updateStatusBar()
     }
 
-    @objc private func reopenWithEncoding(_ sender: NSMenuItem) {
+    @objc func reopenWithEncoding(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let e = TextEncoding(rawValue: raw), let doc = activeDocument else { return }
+        guard doc.isDirty, let window else { reopen(doc, encoding: e); return }
+        // Reading the file again replaces the buffer and clears the undo history.
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Reopen “\(doc.displayName)” using \(e.rawValue)?"
+        alert.informativeText = "Tovri reads the file from disk again, so your unsaved changes will be lost. This can’t be undone."
+        alert.addButton(withTitle: "Discard Changes and Reopen")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .alertFirstButtonReturn else { return }
+            self?.reopen(doc, encoding: e)
+        }
+    }
+
+    private func reopen(_ doc: Document, encoding e: TextEncoding) {
         do { try doc.reload(encoding: e) } catch { showError(error) }
         updateStatusBar()
     }
 
-    @objc private func setLineEnding(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let le = LineEnding(rawValue: raw), let doc = activeDocument else { return }
-        doc.lineEnding = le
-        if doc.url != nil { save(doc) }
+    /// Changes the line endings as an unsaved edit; the file is written on the next save.
+    @objc func setLineEnding(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let le = LineEnding(rawValue: raw), let doc = activeDocument,
+              !doc.isReadOnly else { return }
+        doc.setLineEnding(le)
         updateStatusBar()
     }
 
@@ -2158,8 +2203,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                                     language: d.languageWasSetManually ? d.language.id : nil,
                                     encoding: d.encoding.rawValue, lineEnding: d.lineEnding.rawValue)
                 ts.isNewFile = d.isNewFile ? true : nil
+                ts.documentID = d.backupSource.id.uuidString
+                ts.editVersion = d.backupSource.version
+                ts.encodingDetected = d.url != nil && d.encodingWasDetected ? true : nil
                 if Settings.shared.hotExit && (d.isDirty || (d.url == nil && d.length > 0)) {
                     ts.buffer = SessionStore.shared.bufferName(for: d)
+                    if ts.buffer != nil { ts.diskStamp = d.lastReadDiskStamp }
                 } else if d.url == nil && d.length == 0 {
                     continue
                 }
@@ -2189,7 +2238,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 if let p = t.path {
                     let url = URL(fileURLWithPath: p)
                     if FileManager.default.fileExists(atPath: p) {
-                        doc = try? DocumentRegistry.shared.open(url, encoding: encoding)
+                        doc = try? DocumentRegistry.shared.open(url, encoding: t.encodingDetected == true ? nil : encoding)
                     } else if t.isNewFile == true || t.buffer != nil {
                         doc = Document(newFileAt: url)
                     }
@@ -2207,12 +2256,32 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                     if let encoding { d.encoding = encoding }
                     if let le = t.lineEnding.flatMap(LineEnding.init(rawValue:)) { d.lineEnding = le }
                 }
+                var shown = d
                 if let b = t.buffer, let text = try? String(contentsOf: bufferDirectory.appendingPathComponent(b), encoding: .utf8) {
-                    d.restoreBuffer(text)
-                    if t.path != nil && !FileManager.default.fileExists(atPath: t.path!) { d.markDirtyForRestoredBuffer() }
+                    // Another restored window, or a window still open, may already hold this file.
+                    switch d.restoreDecision(forBackup: text, from: t.backupSource) {
+                    case .apply:
+                        // A line ending changed without saving, recognizable while the file is the one the backup was taken from.
+                        if d.url != nil, !d.isNewFile, let le = t.lineEnding.flatMap(LineEnding.init(rawValue:)),
+                           let stamp = t.diskStamp, stamp == d.lastReadDiskStamp { d.lineEnding = le }
+                        d.restoreBuffer(text, from: t.backupSource, diskStamp: t.diskStamp)
+                        if t.path != nil && !FileManager.default.fileExists(atPath: t.path!) { d.markDirtyForRestoredBuffer() }
+                    case .skip:
+                        break
+                    case .keepSeparately:
+                        let copy = Document()
+                        copy.restoreUntitledName("\(d.displayName) (unsaved copy)")
+                        copy.setLanguage(d.language, manual: false)
+                        copy.encoding = d.encoding
+                        copy.lineEnding = t.lineEnding.flatMap(LineEnding.init(rawValue:)) ?? d.lineEnding
+                        copy.restoreBuffer(text)
+                        shown = copy
+                    }
+                } else if let source = t.backupSource {
+                    d.noteSessionSource(source)
                 }
-                if g.index(of: d) != nil { continue }
-                let tab = g.add(d, select: false)
+                if g.index(of: shown) != nil { continue }
+                let tab = g.add(shown, select: false)
                 tab.pendingSelection = NSRange(location: t.selection, length: t.selectionLength)
                 tab.pendingScroll = CGPoint(x: t.scrollX, y: t.scrollY)
             }

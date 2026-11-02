@@ -42,18 +42,24 @@ final class Document: NSObject, NSTextStorageDelegate {
     private(set) var syntax: SyntaxEngine
     let undoManager = UndoManager()
 
-    var encoding: TextEncoding = .utf8
+    var encoding: TextEncoding = .utf8 { didSet { encodingWasDetected = false } }
+    /// The encoding came from looking at the bytes rather than from a choice, so reading the file
+    /// again detects it afresh: a file another program converted must not be decoded the old way.
+    private(set) var encodingWasDetected = false
     var lineEnding: LineEnding = .lf
     var indentUsesTabs: Bool
     var indentWidth: Int
+    /// Chosen in the status bar or by converting indentation; detection and `.editorconfig` then leave it alone.
+    private(set) var indentationWasSetManually = false
     var isReadOnly = false
     /// Transient documents (find results, generated help) never prompt to save.
     var isTransient = false
     /// For a Changes tab, the document it compares with the last commit.
     weak var changesSource: Document?
     var isFindResults: Bool { language === LanguageRegistry.shared.findResults }
-    /// The file's modification time and size when Tovri last read or wrote it.
+    /// The file's identity, modification time and size when Tovri last read or wrote it.
     private var diskStamp: DiskStamp?
+    var lastReadDiskStamp: DiskStamp? { diskStamp }
     private(set) var fileMissing = false
     private(set) var editVersion = 0
     var languageWasSetManually = false
@@ -63,8 +69,11 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// Dirty state is content-based: any user edit marks the document dirty, and after undo/redo a
     /// content hash is compared with the last saved version so undoing back to it clears the flag.
     private var dirtyFlag = false
+    /// Set when the only reason for `dirtyFlag` is that the file vanished from disk.
+    private var dirtyOnlyFromDeletion = false
     private var savedLength = 0
     private var savedHash: UInt64?
+    private var savedLineEnding: LineEnding = .lf
     private var cleanCheckScheduled = false
     private var isBulkLoading = false
     private var wasDirty = false
@@ -187,6 +196,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     }
 
     func setIndentation(tabs: Bool, width: Int) {
+        indentationWasSetManually = true
         indentUsesTabs = tabs
         indentWidth = width
         applyBaseAttributes()
@@ -209,11 +219,12 @@ final class Document: NSObject, NSTextStorageDelegate {
         let values = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey])
         if values.isRegularFile == false { throw DocumentError.notAFile }
         let stamp = DiskStamp(url)
-        let data = try Perf.measure("  read") { try Data(contentsOf: url, options: .mappedIfSafe) }
+        let data = try Perf.measure("  read") { try Document.readFile(url) }
         let decoded = Perf.measure("  decode") { TextEncoding.decode(data, preferred: preferred) }
         guard !decoded.isBinary else { throw DocumentError.binaryFile }
         let (text, ending) = Perf.measure("  line endings") { LineEnding.normalize(decoded.text, rawData: decoded.encoding == .utf8 ? data : nil) }
         encoding = decoded.encoding
+        encodingWasDetected = decoded.detected
         lineEnding = ending
         diskStamp = stamp
         fileMissing = false
@@ -222,7 +233,7 @@ final class Document: NSObject, NSTextStorageDelegate {
             language = LanguageRegistry.shared.language(forFileName: url.lastPathComponent, firstLine: firstLine)
         }
         Perf.measure("  setContent") { setContent(text) }
-        Perf.measure("  indentation") { detectIndentation() }
+        if !indentationWasSetManually { Perf.measure("  indentation") { detectIndentation() } }
         applyEditorConfig()
         if attributesKey != appliedAttributesKey { applyBaseAttributes() }
         Perf.measure("  hash") { markClean() }
@@ -253,17 +264,55 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     /// Restores an unsaved buffer (hot exit) on top of the file's saved state, keeping the saved
     /// hash so the document reads as dirty only if the buffer actually differs from disk.
-    func restoreBuffer(_ text: String) {
+    /// `backupStamp` is the file's state when the backup was taken.
+    func restoreBuffer(_ text: String, from source: BackupSource? = nil, diskStamp backupStamp: DiskStamp? = nil) {
         setContent(text)
         undoManager.removeAllActions()
-        dirtyFlag = !(length == savedLength && savedHash == Document.contentHash(string))
+        if let source { restoredFrom = (source, editVersion) }
+        dirtyFlag = !matchesSavedVersion()
+        dirtyOnlyFromDeletion = false
+        // The buffer was edited against an older version of the file. Keeping that version's stamp
+        // makes saving ask before it replaces what another program wrote meanwhile.
+        if dirtyFlag, let backupStamp, let current = diskStamp, backupStamp != current { diskStamp = backupStamp }
         allEditors.forEach { $0.documentDidReload() }
         postStateChange(force: true)
     }
 
+    /// Identifies the buffer a hot-exit backup was written from: the document and its edit version.
+    struct BackupSource: Equatable {
+        let id: UUID
+        let version: Int
+    }
+
+    var backupSource: BackupSource { BackupSource(id: id, version: editVersion) }
+
+    /// The backup this buffer was restored from, and the edit version right after restoring it.
+    private var restoredFrom: (source: BackupSource, editVersion: Int)?
+
+    /// Remembers which buffer a restored tab showed, so an older backup of it isn't applied on top.
+    func noteSessionSource(_ source: BackupSource) {
+        if restoredFrom == nil && !dirtyFlag { restoredFrom = (source, editVersion) }
+    }
+
+    enum BackupRestore { case apply, skip, keepSeparately }
+
+    /// Decides how to restore a backup into this document when another tab may already have
+    /// restored or edited it: an older backup of the same buffer is skipped, and a backup of
+    /// independent edits never replaces unsaved text.
+    func restoreDecision(forBackup text: String, from source: BackupSource?) -> BackupRestore {
+        if let source {
+            if source.id == id && source.version <= editVersion { return .skip }
+            if let r = restoredFrom, r.source.id == source.id, source.version <= r.source.version { return .skip }
+        }
+        guard dirtyFlag else { return .apply }
+        if string.isEqual(to: text) { return .skip }
+        if let source, let r = restoredFrom, r.source.id == source.id, r.editVersion == editVersion { return .apply }
+        return .keepSeparately
+    }
+
     func reload(encoding preferred: TextEncoding? = nil) throws {
         guard let url else { return }
-        try load(from: url, encoding: preferred ?? encoding)
+        try load(from: url, encoding: preferred ?? (encodingWasDetected ? nil : encoding))
         undoManager.removeAllActions()
         allEditors.forEach { $0.documentDidReload() }
         postStateChange(force: true)
@@ -281,22 +330,67 @@ final class Document: NSObject, NSTextStorageDelegate {
                 ec.insertFinalNewline ?? Settings.shared.ensureNewlineAtEOF)
     }
 
-    /// Indentation always follows the project; line endings and charset only apply to files that
-    /// have no content yet, so opening a file never rewrites it.
+    /// Indentation follows the project unless the user chose it; line endings and charset only
+    /// apply to files that have no content yet, so opening a file never rewrites it.
     private func applyEditorConfig() {
         guard let url else { return }
         let ec = EditorConfig.properties(for: url)
         editorConfig = ec
         guard !ec.values.isEmpty else { return }
-        if let tabs = ec.indentsWithTabs { indentUsesTabs = tabs }
-        if let width = indentUsesTabs ? (ec.tabWidth ?? ec.indentSize) : (ec.indentSize ?? ec.tabWidth) {
-            indentWidth = min(max(width, 1), 16)
-        }
+        applyEditorConfigIndentation(ec)
         if isNewFile || length == 0 {
             if let le = ec.lineEnding { lineEnding = le }
             if let enc = ec.encoding { encoding = enc }
         }
         if attributesKey != appliedAttributesKey { applyBaseAttributes() }
+    }
+
+    private func applyEditorConfigIndentation(_ ec: EditorConfig.Properties) {
+        guard !indentationWasSetManually else { return }
+        if let tabs = ec.indentsWithTabs { indentUsesTabs = tabs }
+        if let width = indentUsesTabs ? (ec.tabWidth ?? ec.indentSize) : (ec.indentSize ?? ec.tabWidth) {
+            indentWidth = min(max(width, 1), 16)
+        }
+    }
+
+    /// After Save As or a move, the file follows the `.editorconfig` of its new folder instead of
+    /// the old one; indentation is worked out again as if the file had been opened there.
+    private func followEditorConfig() {
+        guard let url else { return }
+        let ec = EditorConfig.properties(for: url)
+        guard ec != editorConfig else { return }
+        editorConfig = ec
+        guard !indentationWasSetManually else { return }
+        indentUsesTabs = !Settings.shared.insertSpaces
+        indentWidth = Settings.shared.tabWidth
+        detectIndentation()
+        applyEditorConfigIndentation(ec)
+        if attributesKey != appliedAttributesKey { applyBaseAttributes() }
+    }
+
+    /// Trims trailing whitespace and adds the final newline for a document without an editor
+    /// (Save All, saving on quit), as one undoable change, so it saves the same bytes as ⌘S.
+    func applySaveCleanups(trimTrailingWhitespace trim: Bool, insertFinalNewline: Bool) {
+        guard !isReadOnly else { return }
+        var edits: [(NSRange, String)] = []
+        if trim, let re = try? NSRegularExpression(pattern: "[ \\t]+$", options: [.anchorsMatchLines]) {
+            edits = re.matches(in: string as String, range: NSRange(location: 0, length: length)).map { ($0.range, "") }
+        }
+        if insertFinalNewline && length > 0 && string.character(at: length - 1) != 10 {
+            edits.append((NSRange(location: length, length: 0), "\n"))
+        }
+        guard !edits.isEmpty else { return }
+        undoManager.beginUndoGrouping()
+        for (range, replacement) in edits.reversed() { replaceText(in: range, with: replacement) }
+        undoManager.setActionName(trim ? "Trim Trailing Whitespace" : "Insert Final Newline")
+        undoManager.endUndoGrouping()
+    }
+
+    private func replaceText(in range: NSRange, with replacement: String) {
+        let old = string.substring(with: range)
+        let undoRange = NSRange(location: range.location, length: (replacement as NSString).length)
+        undoManager.registerUndo(withTarget: self) { $0.replaceText(in: undoRange, with: old) }
+        textStorage.replaceCharacters(in: range, with: replacement)
     }
 
     private func detectIndentation() {
@@ -352,6 +446,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         syntax.linesChanged(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted)
         editVersion += 1
         dirtyFlag = true
+        dirtyOnlyFromDeletion = false
         if undoManager.isUndoing || undoManager.isRedoing { scheduleCleanCheck() }
         for e in allEditors { e.documentDidEdit(range: editedRange, delta: delta) }
         postStateChange()
@@ -365,18 +460,37 @@ final class Document: NSObject, NSTextStorageDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.cleanCheckScheduled = false
-            // With the file gone from disk, matching the last saved text no longer means nothing would be lost.
-            if !self.fileMissing, self.length == self.savedLength, let h = self.savedHash, Document.contentHash(self.string) == h {
+            if self.matchesSavedVersion() {
                 self.dirtyFlag = false
                 self.postStateChange()
             }
         }
     }
 
+    /// With the file gone from disk, matching the last saved text no longer means nothing would be lost.
+    private func matchesSavedVersion() -> Bool {
+        guard !fileMissing, length == savedLength, url == nil || lineEnding == savedLineEnding, let h = savedHash else { return false }
+        return Document.contentHash(string) == h
+    }
+
     private func markClean() {
         dirtyFlag = false
+        dirtyOnlyFromDeletion = false
         savedLength = length
         savedHash = length <= 64_000_000 ? Document.contentHash(string) : nil
+        savedLineEnding = lineEnding
+    }
+
+    /// Changes the line endings the next save writes. It is an unsaved, undoable change like an edit.
+    func setLineEnding(_ ending: LineEnding) {
+        guard ending != lineEnding else { return }
+        let old = lineEnding
+        lineEnding = ending
+        undoManager.registerUndo(withTarget: self) { $0.setLineEnding(old) }
+        undoManager.setActionName("Change Line Endings")
+        dirtyFlag = !matchesSavedVersion()
+        postStateChange(force: true)
+        SessionStore.shared.setNeedsSave()
     }
 
     /// Fast 64-bit hash of the UTF-16 contents, processed in chunks.
@@ -439,7 +553,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         markClean()
         if nameChanged || isNewFile { startMonitoring() }
         isNewFile = false
-        if wasUntitled { applyEditorConfig() }
+        if wasUntitled { applyEditorConfig() } else if nameChanged { followEditorConfig() }
         DocumentRegistry.shared.register(self)
         refreshGitBaseline()
         if nameChanged && !languageWasSetManually {
@@ -458,6 +572,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         fileMissing = false
         startMonitoring()
         DocumentRegistry.shared.register(self)
+        followEditorConfig()
         refreshGitBaseline()
         if !languageWasSetManually {
             let lang = LanguageRegistry.shared.language(forFileName: newURL.lastPathComponent, firstLine: firstLine())
@@ -468,7 +583,8 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     /// Writes beside the destination and renames into place, so a failed write never truncates the
     /// original. The rename would drop the old file's metadata, so mode, ownership, ACL, extended
-    /// attributes (Finder tags, quarantine) and creation date are copied onto the new file first.
+    /// attributes (Finder tags, quarantine), the hidden flag and creation date are copied onto the
+    /// new file first.
     private static func writeFile(_ data: Data, replacing url: URL) throws {
         let path = url.path
         let fm = FileManager.default
@@ -477,28 +593,25 @@ final class Document: NSObject, NSTextStorageDelegate {
         if existing != nil && access(path, W_OK) != 0 {
             throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: path])
         }
+        var info = stat()
+        let hasInfo = existing != nil && stat(path, &info) == 0
+        // A new file would split the path from the file's other hard links, which would keep the old text.
+        if hasInfo && info.st_nlink > 1 && (info.st_mode & S_IFMT) == S_IFREG {
+            try writeInPlace(data, path: path)
+            return
+        }
         let temp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tovri-\(UUID().uuidString)").path
         // New files get the usual 0666 & ~umask; replacements stay private until they carry the original mode.
         let fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, existing == nil ? 0o666 : 0o600)
         guard fd >= 0 else { throw writeError(errno, path: path) }
-        var failure: Int32 = 0
-        data.withUnsafeBytes { raw in
-            guard var p = raw.baseAddress else { return }
-            var remaining = raw.count
-            while remaining > 0 {
-                let n = Darwin.write(fd, p, remaining)
-                if n < 0 {
-                    if errno == EINTR { continue }
-                    failure = errno
-                    return
-                }
-                p += n
-                remaining -= n
-            }
-        }
+        var failure = writeAll(data, to: fd)
         if failure == 0 && fsync(fd) != 0 { failure = errno }
         if failure == 0, let existing {
             copyfile(path, temp, nil, copyfile_flags_t(COPYFILE_ACL | COPYFILE_XATTR))
+            // Only flags that describe the file to the user; immutable, append-only and compression
+            // flags belong to the old file's storage or would block the rename.
+            let kept = hasInfo ? info.st_flags & UInt32(UF_HIDDEN | UF_NODUMP) : 0
+            if kept != 0 { _ = fchflags(fd, kept) }
             if let owner = existing[.ownerAccountID] as? NSNumber, let group = existing[.groupOwnerAccountID] as? NSNumber,
                fchown(fd, owner.uint32Value, group.uint32Value) != 0 {
                 _ = fchown(fd, uid_t.max, group.uint32Value)
@@ -514,6 +627,90 @@ final class Document: NSObject, NSTextStorageDelegate {
             unlink(temp)
             throw writeError(failure, path: path)
         }
+    }
+
+    /// Overwrites a file that has other hard links, so every link sees the new text. The old bytes
+    /// are read first and written back if the write fails partway.
+    private static func writeInPlace(_ data: Data, path: String) throws {
+        let fd = open(path, O_RDWR | O_CLOEXEC)
+        guard fd >= 0 else { throw writeError(errno, path: path) }
+        defer { close(fd) }
+        let old: Data
+        do { old = try readAll(fd, path: path) } catch { throw writeError(EIO, path: path) }
+        // Copy-on-write volumes need room for the whole new text before the old blocks are freed.
+        var fs = statfs()
+        if fstatfs(fd, &fs) == 0 && UInt64(fs.f_bavail) * UInt64(fs.f_bsize) < UInt64(data.count) {
+            throw writeError(ENOSPC, path: path)
+        }
+        var failure = writeAll(data, to: fd)
+        if failure == 0 && ftruncate(fd, off_t(data.count)) != 0 { failure = errno }
+        if failure == 0 && fsync(fd) != 0 { failure = errno }
+        guard failure != 0 else { return }
+        if writeAll(old, to: fd) == 0 { _ = ftruncate(fd, off_t(old.count)) }
+        _ = fsync(fd)
+        throw writeError(failure, path: path)
+    }
+
+    /// Writes all of `data` from the start of the file; returns 0 or the errno of the failure.
+    private static func writeAll(_ data: Data, to fd: Int32) -> Int32 {
+        var failure: Int32 = 0
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var done = 0
+            while done < raw.count {
+                let n = pwrite(fd, base + done, raw.count - done, off_t(done))
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    failure = errno
+                    return
+                }
+                done += n
+            }
+        }
+        return failure
+    }
+
+    /// Reads with read(2) rather than mapping the file: touching a mapped page after another
+    /// program truncates the file (log rotation, for one) crashes the app with SIGBUS.
+    static func readFile(_ url: URL) throws -> Data {
+        let path = url.path
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw readError(errno, path: path) }
+        defer { close(fd) }
+        return try readAll(fd, path: path)
+    }
+
+    private static func readAll(_ fd: Int32, path: String) throws -> Data {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw readError(errno, path: path) }
+        // One spare byte lets the final read report the end without growing the buffer.
+        var data = Data(count: max(Int(info.st_size), 0) + 1)
+        var filled = 0
+        while true {
+            if filled == data.count { data.count += max(1 << 16, data.count / 4) }
+            let n = data.withUnsafeMutableBytes { raw in
+                pread(fd, raw.baseAddress! + filled, raw.count - filled, off_t(filled))
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw readError(errno, path: path)
+            }
+            if n == 0 { break }
+            filled += n
+        }
+        data.count = filled
+        return data
+    }
+
+    private static func readError(_ code: Int32, path: String) -> CocoaError {
+        let kind: CocoaError.Code
+        switch code {
+        case ENOENT: kind = .fileReadNoSuchFile
+        case EACCES, EPERM: kind = .fileReadNoPermission
+        default: kind = .fileReadUnknown
+        }
+        let underlying = NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        return CocoaError(kind, userInfo: [NSFilePathErrorKey: path, NSUnderlyingErrorKey: underlying])
     }
 
     private static func writeError(_ code: Int32, path: String) -> CocoaError {
@@ -660,6 +857,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     func markDeletedOnDisk() {
         guard !dirtyFlag else { return }
         dirtyFlag = true
+        dirtyOnlyFromDeletion = true
         postStateChange(force: true)
     }
 
@@ -667,30 +865,20 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     enum DiskStatus { case unchanged, modified, deleted }
 
-    /// Any difference counts as a change: restoring a backup or syncing can set an older time, and
-    /// coarse-timestamp file systems can keep the time while the size changes.
-    private struct DiskStamp: Equatable {
-        let seconds: Int
-        let nanoseconds: Int
-        let size: Int64
-
-        /// stat(2) follows symlinks and, unlike URL resource values, is never served from a cache.
-        init?(_ url: URL) {
-            var info = stat()
-            guard stat(url.path, &info) == 0 else { return nil }
-            seconds = info.st_mtimespec.tv_sec
-            nanoseconds = info.st_mtimespec.tv_nsec
-            size = info.st_size
-        }
-    }
-
     func checkDiskStatus() -> DiskStatus {
         guard let url, !isNewFile else { return .unchanged }
         guard let current = DiskStamp(url) else {
             if !fileMissing { fileMissing = true; postStateChange(force: true) }
             return .deleted
         }
-        if fileMissing { fileMissing = false; postStateChange(force: true) }
+        if fileMissing {
+            fileMissing = false
+            // Unsaved only because the file was gone: once it is back, an unedited buffer is clean
+            // again, so a file that returns (switching Git branches) reloads instead of asking.
+            if dirtyFlag && (dirtyOnlyFromDeletion || matchesSavedVersion()) { dirtyFlag = false }
+            dirtyOnlyFromDeletion = false
+            postStateChange(force: true)
+        }
         // The watcher can't be re-armed while the file is missing; resume once it is back.
         if monitor == nil { startMonitoring() }
         return current == diskStamp ? .unchanged : .modified
@@ -831,6 +1019,28 @@ final class Document: NSObject, NSTextStorageDelegate {
             }
         }
         return Array(set)
+    }
+}
+
+/// A file's identity, modification time and size. Any difference counts as a change: restoring a
+/// backup or syncing can set an older time, coarse-timestamp file systems can keep the time while
+/// the size changes, and a same-size replacement within one timestamp tick gets a new inode.
+struct DiskStamp: Codable, Equatable {
+    let seconds: Int
+    let nanoseconds: Int
+    let size: Int64
+    let inode: UInt64
+    let device: Int32
+
+    /// stat(2) follows symlinks and, unlike URL resource values, is never served from a cache.
+    init?(_ url: URL) {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        seconds = info.st_mtimespec.tv_sec
+        nanoseconds = info.st_mtimespec.tv_nsec
+        size = info.st_size
+        inode = info.st_ino
+        device = info.st_dev
     }
 }
 

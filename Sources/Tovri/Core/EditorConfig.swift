@@ -61,8 +61,9 @@ enum EditorConfig {
         }
         var result = Properties()
         for f in files.reversed() {
-            guard path.hasPrefix(f.directory + "/") else { continue }
-            let relative = String(path.dropFirst(f.directory.count + 1))
+            let folder = folderPrefix(f.directory)
+            guard path.hasPrefix(folder) else { continue }
+            let relative = String(path.dropFirst(folder.count))
             for s in f.sections where s.glob.matches(relative) {
                 for (k, v) in s.values {
                     if v.0 == "unset" { result.values.removeValue(forKey: k) } else { result.values[k] = v.0 }
@@ -117,8 +118,14 @@ enum EditorConfig {
     }
 
     static func globMatches(_ glob: String, directory: String, path: String) -> Bool {
-        guard path.hasPrefix(directory + "/"), let g = EditorConfigGlob(glob) else { return false }
-        return g.matches(String(path.dropFirst(directory.count + 1)))
+        let folder = folderPrefix(directory)
+        guard path.hasPrefix(folder), let g = EditorConfigGlob(glob) else { return false }
+        return g.matches(String(path.dropFirst(folder.count)))
+    }
+
+    /// The root folder's path already ends in a slash.
+    private static func folderPrefix(_ directory: String) -> String {
+        directory.hasSuffix("/") ? directory : directory + "/"
     }
 
 }
