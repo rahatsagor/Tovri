@@ -8,10 +8,14 @@ struct MarkdownRenderer {
     private var references: [String: (url: String, title: String?)] = [:]
     private var footnotes: [String: (id: String, lines: [String], line: Int)] = [:]
     private var footnoteOrder: [String] = []
-    private var usedFootnotes: [String] = []
-    private var footnoteRefCounts: [String: Int] = [:]
-    private var slugCounts: [String: Int] = [:]
+    private var orderedFootnotes: [String] = []
+    private var footnoteNumbers: [String: Int] = [:]
+    private var footnoteIDs: [String: String] = [:]
+    private var footnoteRefIDs: [String: [String]] = [:]
+    private var idCounts: [String: Int] = [:]
+    private var usedIDs: Set<String> = []
     private var headings: [(level: Int, text: String, id: String)] = []
+    private var tablesOfContents: [(placeholder: String, attributes: String)] = []
 
     init(colors: [TokenKind: String]) {
         self.colors = colors
@@ -22,14 +26,29 @@ struct MarkdownRenderer {
         references = [:]
         footnotes = [:]
         footnoteOrder = []
-        usedFootnotes = []
-        footnoteRefCounts = [:]
-        slugCounts = [:]
+        orderedFootnotes = []
+        footnoteNumbers = [:]
+        footnoteIDs = [:]
+        footnoteRefIDs = [:]
+        idCounts = [:]
+        usedIDs = []
         headings = []
-        collectReferencesAndHeadings(&lines)
+        tablesOfContents = []
+        collectReferences(&lines)
+        for key in footnoteOrder {
+            guard let fn = footnotes[key] else { continue }
+            let label = slug(fn.id)
+            footnoteIDs[key] = uniqueID("fn-\(label.isEmpty ? "note" : label)")
+        }
         var out = ""
         renderBlocks(lines[...], lineOffset: 0, topLevel: true, into: &out)
         renderFootnotes(into: &out)
+        // The block renderer is the only source of headings, including nested and setext ones.
+        for toc in tablesOfContents {
+            var html = ""
+            renderTOC(attr: toc.attributes, into: &html)
+            out = out.replacingOccurrences(of: toc.placeholder, with: html)
+        }
         return out
     }
 
@@ -63,7 +82,7 @@ struct MarkdownRenderer {
         return t.count >= openFence.count && t.allSatisfy { $0 == fc }
     }
 
-    private mutating func collectReferencesAndHeadings(_ lines: inout [String]) {
+    private mutating func collectReferences(_ lines: inout [String]) {
         var activeFence: String?
         var i = 0
         // Skip YAML front matter at top of document
@@ -72,7 +91,6 @@ struct MarkdownRenderer {
             while k < lines.count && lines[k] != "---" && lines[k] != "..." { k += 1 }
             if k < lines.count { i = k + 1 }
         }
-        var preSlugCounts: [String: Int] = [:]
         while i < lines.count {
             let line = lines[i]
             if let fence = activeFence {
@@ -129,14 +147,6 @@ struct MarkdownRenderer {
                 i += 1
                 continue
             }
-            if let m = match(MarkdownRenderer.headingRe, line), let hashes = group(m, 1, line) {
-                let content = group(m, 2, line) ?? ""
-                let base = slug(content)
-                let count = preSlugCounts[base, default: 0]
-                preSlugCounts[base] = count + 1
-                let id = count == 0 ? base : "\(base)-\(count)"
-                headings.append((level: hashes.count, text: content, id: id))
-            }
             i += 1
         }
     }
@@ -169,11 +179,22 @@ struct MarkdownRenderer {
 
     private func attr(_ line: Int, _ top: Bool) -> String { top ? " data-line=\"\(line)\"" : "" }
 
-    private mutating func uniqueSlug(_ s: String) -> String {
-        let base = slug(s)
-        let count = slugCounts[base, default: 0]
-        slugCounts[base] = count + 1
-        return count == 0 ? base : "\(base)-\(count)"
+    private mutating func uniqueID(_ proposed: String) -> String {
+        let base = proposed.isEmpty ? "section" : proposed
+        var count = idCounts[base, default: 0]
+        var id = count == 0 ? base : "\(base)-\(count)"
+        while !usedIDs.insert(id).inserted {
+            count += 1
+            id = "\(base)-\(count)"
+        }
+        idCounts[base] = count + 1
+        return id
+    }
+
+    private mutating func renderHeading(_ level: Int, text: String, attr a: String, into out: inout String) {
+        let id = uniqueID(slug(text))
+        headings.append((level, text, id))
+        out += "<h\(level) id=\"\(id)\"\(a)>" + inline(text) + "</h\(level)>\n"
     }
 
     private mutating func renderBlocks(_ lines: ArraySlice<String>, lineOffset: Int, topLevel: Bool, into out: inout String) {
@@ -245,9 +266,7 @@ struct MarkdownRenderer {
 
             if let m = match(MarkdownRenderer.headingRe, line), let hashes = group(m, 1, line) {
                 let content = group(m, 2, line) ?? ""
-                let n = hashes.count
-                let id = uniqueSlug(content)
-                out += "<h\(n) id=\"\(id)\"\(a)>" + inline(content) + "</h\(n)>\n"
+                renderHeading(hashes.count, text: content, attr: a, into: &out)
                 i += 1
                 continue
             }
@@ -349,10 +368,11 @@ struct MarkdownRenderer {
             }
             let content = para.joined(separator: "\n")
             if setext > 0 {
-                let id = uniqueSlug(content)
-                out += "<h\(setext) id=\"\(id)\"\(a)>" + inline(content) + "</h\(setext)>\n"
+                renderHeading(setext, text: content, attr: a, into: &out)
             } else if para.count == 1 && (content.caseInsensitiveCompare("[toc]") == .orderedSame || content.caseInsensitiveCompare("[[toc]]") == .orderedSame) {
-                renderTOC(attr: a, into: &out)
+                let placeholder = "<!--tovri-toc-\(UUID().uuidString)-->"
+                tablesOfContents.append((placeholder, a))
+                out += placeholder
             } else {
                 out += "<p\(a)>" + inline(content) + "</p>\n"
             }
@@ -407,7 +427,7 @@ struct MarkdownRenderer {
         for h in headings {
             let depth = max(0, h.level - minLevel)
             let cls = depth > 0 ? " class=\"toc-level-\(min(depth, 4))\"" : ""
-            out += "<li\(cls)><a href=\"#\(esc(h.id))\">" + inline(h.text) + "</a></li>\n"
+            out += "<li\(cls)><a href=\"#\(esc(h.id))\">" + inline(h.text, forTOC: true) + "</a></li>\n"
         }
         out += "</ul></nav>\n"
     }
@@ -624,26 +644,49 @@ struct MarkdownRenderer {
         return i
     }
 
+    private mutating func footnoteNumber(for key: String) -> Int {
+        if let number = footnoteNumbers[key] { return number }
+        orderedFootnotes.append(key)
+        let number = orderedFootnotes.count
+        footnoteNumbers[key] = number
+        return number
+    }
+
     private mutating func renderFootnotes(into out: inout String) {
         guard !footnotes.isEmpty else { return }
-        var orderedKeys = usedFootnotes
-        for key in footnoteOrder where !orderedKeys.contains(key) {
-            orderedKeys.append(key)
-        }
-        guard !orderedKeys.isEmpty else { return }
-        out += "<section class=\"footnotes\"><hr><ol class=\"footnote-list\">\n"
-        for key in orderedKeys {
+        var bodies: [String: String] = [:]
+        var nextDefinition = 0
+        var nextUnused = 0
+        // References discovered inside a definition join the numbered queue. Drain it before
+        // adding unused definitions, and render each definition once even for cyclic references.
+        while nextDefinition < orderedFootnotes.count || nextUnused < footnoteOrder.count {
+            if nextDefinition == orderedFootnotes.count {
+                _ = footnoteNumber(for: footnoteOrder[nextUnused])
+                nextUnused += 1
+                continue
+            }
+            let key = orderedFootnotes[nextDefinition]
+            nextDefinition += 1
             guard let fn = footnotes[key] else { continue }
-            let safeId = slug(fn.id).isEmpty ? esc(key) : slug(fn.id)
             var body = ""
             renderBlocks(fn.lines[...], lineOffset: fn.line, topLevel: false, into: &body)
-            let backref = " <a href=\"#fnref-\(safeId)\" class=\"footnote-backref\" aria-label=\"Back to content\">↩</a>"
+            bodies[key] = body
+        }
+        out += "<section class=\"footnotes\"><hr><ol class=\"footnote-list\">\n"
+        for key in orderedFootnotes {
+            guard let id = footnoteIDs[key], var body = bodies[key] else { continue }
+            let refs = footnoteRefIDs[key] ?? []
+            let backrefs = refs.enumerated().map { index, ref in
+                let label = refs.count == 1 ? "Back to content" : "Back to reference \(index + 1)"
+                let arrow = refs.count == 1 ? "↩" : "↩\(index + 1)"
+                return " <a href=\"#\(ref)\" class=\"footnote-backref\" aria-label=\"\(label)\">\(arrow)</a>"
+            }.joined()
             if body.hasSuffix("</p>\n") {
-                body = String(body.dropLast(5)) + backref + "</p>\n"
+                body = String(body.dropLast(5)) + backrefs + "</p>\n"
             } else {
-                body += backref
+                body += backrefs
             }
-            out += "<li id=\"fn-\(safeId)\">" + body + "</li>\n"
+            out += "<li id=\"\(id)\">" + body + "</li>\n"
         }
         out += "</ol></section>\n"
     }
@@ -680,7 +723,7 @@ struct MarkdownRenderer {
         return out + ns.substring(from: last)
     }
 
-    private mutating func inline(_ text: String) -> String {
+    private mutating func inline(_ text: String, forTOC: Bool = false) -> String {
         var stash: [String] = []
         func hold(_ html: String) -> String {
             stash.append(html)
@@ -707,33 +750,33 @@ struct MarkdownRenderer {
         }
         s = Self.replace(Self.imageRe, in: s) { m, ns in
             let alt = g(m, 1, ns) ?? ""
+            if forTOC { return hold(esc(alt)) }
             let src = resolve(g(m, 2, ns) ?? "")
             let title = g(m, 3, ns).map { " title=\"\(esc($0))\"" } ?? ""
             return hold("<img src=\"\(esc(src))\" alt=\"\(esc(alt))\"\(title)>")
         }
         s = Self.replace(Self.linkRe, in: s) { m, ns in
             let label = g(m, 1, ns) ?? ""
+            let content = inline(label, forTOC: forTOC)
+            if forTOC { return hold(content) }
             let href = resolve(g(m, 2, ns) ?? "", isLink: true)
             let title = g(m, 3, ns).map { " title=\"\(esc($0))\"" } ?? ""
-            return hold("<a href=\"\(esc(href))\"\(title)>" + inline(label) + "</a>")
+            return hold("<a href=\"\(esc(href))\"\(title)>" + content + "</a>")
         }
-        if !footnotes.isEmpty {
+        if !forTOC && !footnotes.isEmpty {
             s = Self.replace(Self.footnoteRefRe, in: s) { m, ns in
                 let raw = g(m, 1, ns) ?? ""
                 let key = raw.lowercased()
-                guard let fn = footnotes[key] else { return ns.substring(with: m.range) }
-                let idx: Int
-                if let existing = usedFootnotes.firstIndex(of: key) {
-                    idx = existing + 1
-                } else {
-                    usedFootnotes.append(key)
-                    idx = usedFootnotes.count
-                }
-                let safeId = slug(fn.id).isEmpty ? esc(key) : slug(fn.id)
-                let count = footnoteRefCounts[key, default: 0] + 1
-                footnoteRefCounts[key] = count
-                let refId = count == 1 ? "fnref-\(safeId)" : "fnref-\(safeId)-\(count)"
-                return hold("<sup class=\"footnote-ref\"><a href=\"#fn-\(safeId)\" id=\"\(refId)\">[\(idx)]</a></sup>")
+                guard let id = footnoteIDs[key] else { return ns.substring(with: m.range) }
+                let idx = footnoteNumber(for: key)
+                let refId = uniqueID("fnref-" + id.dropFirst(3))
+                footnoteRefIDs[key, default: []].append(refId)
+                return hold("<sup class=\"footnote-ref\"><a href=\"#\(id)\" id=\"\(refId)\">[\(idx)]</a></sup>")
+            }
+        } else if forTOC {
+            s = Self.replace(Self.footnoteRefRe, in: s) { m, ns in
+                let key = (g(m, 1, ns) ?? "").lowercased()
+                return footnotes[key] == nil ? ns.substring(with: m.range) : ""
             }
         }
         if !references.isEmpty {
@@ -744,19 +787,22 @@ struct MarkdownRenderer {
                 if key.isEmpty { key = label.lowercased() }
                 guard let ref = references[key] else { return whole }
                 let title = ref.title.map { " title=\"\(esc($0))\"" } ?? ""
-                if g(m, 1, ns) == "!" { return hold("<img src=\"\(esc(resolve(ref.url)))\" alt=\"\(esc(label))\"\(title)>") }
-                return hold("<a href=\"\(esc(resolve(ref.url, isLink: true)))\"\(title)>" + inline(label) + "</a>")
+                if g(m, 1, ns) == "!" {
+                    return hold(forTOC ? esc(label) : "<img src=\"\(esc(resolve(ref.url)))\" alt=\"\(esc(label))\"\(title)>")
+                }
+                let content = inline(label, forTOC: forTOC)
+                return hold(forTOC ? content : "<a href=\"\(esc(resolve(ref.url, isLink: true)))\"\(title)>" + content + "</a>")
             }
         }
         s = Self.replace(Self.autoLinkRe, in: s) { m, ns in
             let u = ns.substring(with: m.range(at: 1))
-            return hold("<a href=\"\(esc(u))\">\(esc(u))</a>")
+            return hold(forTOC ? esc(u) : "<a href=\"\(esc(u))\">\(esc(u))</a>")
         }
-        s = Self.replace(Self.rawHTMLRe, in: s) { m, ns in hold(ns.substring(with: m.range)) }
+        s = Self.replace(Self.rawHTMLRe, in: s) { m, ns in forTOC ? "" : hold(ns.substring(with: m.range)) }
         s = esc(s)
         s = Self.replace(Self.bareURLRe, in: s) { m, ns in
             let u = ns.substring(with: m.range(at: 1))
-            return "<a href=\"\(u)\">\(u)</a>"
+            return forTOC ? u : "<a href=\"\(u)\">\(u)</a>"
         }
         s = Self.replace(Self.strongRe, in: s) { m, ns in "<strong>" + ns.substring(with: m.range(at: 2)) + "</strong>" }
         s = Self.replace(Self.emRe, in: s) { m, ns in "<em>" + (g(m, 1, ns) ?? g(m, 2, ns) ?? "") + "</em>" }
