@@ -213,4 +213,69 @@ final class ViewerFeatureTests: XCTestCase {
             XCTAssertEqual(editor.textView.selectedRange(), NSRange(location: 2, length: 0))
         }
     }
+
+    // MARK: Markdown rendering
+
+    func testMarkdownRendererAdvancedFormatting() {
+        var renderer = MarkdownRenderer(colors: [:])
+        let md = """
+        ---
+        title: "Tovri Guide"
+        tags: [editor, macos]
+        ---
+
+        [[toc]]
+
+        # Heading
+
+        ## Heading
+
+        Paragraph with ==highlight==, H~2~O, x^2^, inline math $a_1 + b_2$, and footnote[^note1].
+
+        > [!WARNING] Custom Alert
+        > Be careful here.
+
+        ```markdown
+        Example fence:
+            ```
+            indented fence stays inside code block
+            ```
+        ```
+
+        Term
+        : Definition body
+
+        1. Ordered parent
+          - Nested bullet
+          - [x] Done task
+          - [ ]
+
+        $$
+        E = mc^2
+        $$
+
+        [^note1]: Footnote explanation.
+        """
+        let html = renderer.render(md)
+        XCTAssertTrue(html.contains("<div class=\"front-matter\" data-line=\"0\"><table>"), html)
+        XCTAssertTrue(html.contains("<span class=\"fm-tag\">editor</span>"), html)
+        XCTAssertTrue(html.contains("<nav class=\"toc\""), html)
+        XCTAssertTrue(html.contains("id=\"heading\""), html)
+        XCTAssertTrue(html.contains("id=\"heading-1\""), html)
+        XCTAssertTrue(html.contains("<mark>highlight</mark>"), html)
+        XCTAssertTrue(html.contains("H<sub>2</sub>O"), html)
+        XCTAssertTrue(html.contains("x<sup>2</sup>"), html)
+        XCTAssertTrue(html.contains("<span class=\"math-inline\">a_1 + b_2</span>"), html)
+        XCTAssertTrue(html.contains("blockquote class=\"alert alert-warning\""), html)
+        XCTAssertTrue(html.contains("alert-icon"), html)
+        XCTAssertTrue(html.contains("Custom Alert</p><p>Be careful here.</p>"), html)
+        XCTAssertTrue(html.contains("indented fence stays inside code block\n    ```</code></pre>"), html)
+        XCTAssertTrue(html.contains("<dl"), html)
+        XCTAssertTrue(html.contains("<dt>Term</dt>\n<dd>Definition body</dd>"), html)
+        XCTAssertTrue(html.contains("Ordered parent<ul class=\"contains-task-list\">"), html)
+        XCTAssertTrue(html.contains("<div class=\"math-block\""), html)
+        XCTAssertTrue(html.contains("<sup class=\"footnote-ref\"><a href=\"#fn-note1\" id=\"fnref-note1\">[1]</a></sup>"), html)
+        XCTAssertTrue(html.contains("<section class=\"footnotes\">"), html)
+        XCTAssertTrue(html.contains("<li id=\"fn-note1\"><p>Footnote explanation. <a href=\"#fnref-note1\" class=\"footnote-backref\""), html)
+    }
 }

@@ -706,18 +706,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             app.newWindow(folder: url)
             return
         }
+        if isEmptyWindow {
+            for g in groups { while !g.tabs.isEmpty { g.removeTab(at: 0) } }
+        }
         setFolder(url)
     }
 
     /// The folder is kept by its real path: FileManager can't list a folder through a symlink,
     /// and FSEvents, the file tree and Git all report real paths (/private/tmp, not /tmp).
     func setFolder(_ url: URL?) {
+        let resolved = url.map { URL(fileURLWithPath: $0.realPathURL.path, isDirectory: true) }
+        if resolved?.path == folderURL?.path, (resolved == nil || sidebar.root != nil) {
+            if resolved != nil, !sidebarVisible {
+                sidebarVisible = true
+                rootView.needsLayout = true
+                rootView.layoutSubtreeIfNeeded()
+            }
+            return
+        }
         watcher?.stop()
         watcher = nil
-        let url = url.map { URL(fileURLWithPath: $0.realPathURL.path, isDirectory: true) }
-        folderURL = url
-        sidebar.setRoot(url)
-        if let url {
+        folderURL = resolved
+        if resolved != nil {
+            sidebarVisible = true
+        }
+        // Lay out the sidebar frame before populating the outline view so AppKit never renders a
+        // transitional zero-width or unpositioned frame.
+        rootView.needsLayout = true
+        rootView.layoutSubtreeIfNeeded()
+        sidebar.setRoot(resolved)
+        if let url = resolved {
             projectIndex = ProjectIndex(root: url)
             var pending = false
             watcher = FileWatcher(path: url.path) { [weak self] paths in
@@ -733,15 +751,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 }
             }
             RecentFiles.shared.add(url)
-            // Shown for this window only. The setting is the person's own choice from View → Sidebar,
-            // and restoring a window that had its sidebar hidden must not turn it back on.
-            sidebarVisible = true
         } else {
             projectIndex = nil
         }
         symbolIndex = nil
         rootView.needsLayout = true
+        rootView.layoutSubtreeIfNeeded()
         updateTitle()
+        updateStatusBar()
         refreshGitStatus()
         SessionStore.shared.setNeedsSave()
     }
@@ -777,7 +794,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 return
             }
             let s = Settings.shared
-            guard s.gitNeedsStatus else { return }
+            guard s.gitNeedsStatus, self.folderURL?.path == folder.path else { return }
             var abs: [String: GitFileStatus] = [:]
             if s.gitSidebarStatus {
                 for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
@@ -790,7 +807,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 // Line counts cost a `git diff`, so they're only read while the list is on screen.
                 if self.sidebar.isShowingChanges {
                     repo.changeList { [weak self] files in
-                        guard let self, Settings.shared.gitChangesAndHistory else { return }
+                        guard let self, Settings.shared.gitChangesAndHistory, self.folderURL?.path == folder.path else { return }
                         self.sidebar.setChanges(self.withLiveCounts(files, root: repo.root))
                     }
                 }
@@ -799,8 +816,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
         if s.gitSidebarStatus {
             repo.ignored { [weak self] list in
-                guard Settings.shared.gitSidebarStatus else { return }
-                self?.sidebar.setIgnoredPaths(Set(list.map { repo.root.appendingPathComponent($0).standardizedFileURL.path }))
+                guard let self, Settings.shared.gitSidebarStatus, self.folderURL?.path == folder.path else { return }
+                self.sidebar.setIgnoredPaths(Set(list.map { repo.root.appendingPathComponent($0).standardizedFileURL.path }))
             }
         } else {
             sidebar.setIgnoredPaths([])
@@ -1079,22 +1096,38 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                completion: ((Bool) -> Void)? = nil) {
         let editor = allGroupsTabs().first { $0.document === doc && $0.editor != nil }?.editor
         let cleanups = doc.saveCleanups(to: target)
-        if let tv = editor?.textView {
-            if cleanups.trimTrailingWhitespace { tv.trimTrailingWhitespace(nil) }
-            if cleanups.insertFinalNewline { tv.ensureTrailingNewline() }
-        } else {
-            doc.applySaveCleanups(trimTrailingWhitespace: cleanups.trimTrailingWhitespace, insertFinalNewline: cleanups.insertFinalNewline)
+        let versionBeforeCleanup = doc.editVersion
+        func rollbackCleanupsIfNeeded() {
+            if doc.editVersion != versionBeforeCleanup, doc.undoManager.canUndo {
+                doc.undoManager.undo()
+            }
         }
         do {
+            try doc.checkBeforeSaving(to: target, replacingExternalChanges: replacingExternalChanges)
+            if cleanups.trimTrailingWhitespace || cleanups.insertFinalNewline {
+                while doc.undoManager.groupingLevel > 0 { doc.undoManager.endUndoGrouping() }
+                doc.undoManager.beginUndoGrouping()
+                if cleanups.trimTrailingWhitespace {
+                    if let tv = editor?.textView { tv.trimTrailingWhitespace(nil) }
+                    else { doc.applySaveCleanups(trimTrailingWhitespace: true, insertFinalNewline: false) }
+                }
+                if cleanups.insertFinalNewline {
+                    if let tv = editor?.textView { tv.ensureTrailingNewline() }
+                    else { doc.applySaveCleanups(trimTrailingWhitespace: false, insertFinalNewline: true) }
+                }
+                doc.undoManager.endUndoGrouping()
+            }
             try doc.save(to: target, replacingExternalChanges: replacingExternalChanges)
             statusBar.flash("Saved “\(doc.displayName)”")
             if target != nil { updateTitle() }
             refreshGitStatus()
             completion?(true)
         } catch let error where !interactive {
+            rollbackCleanupsIfNeeded()
             statusBar.flash("“\(doc.displayName)” wasn’t saved automatically: \(MainWindowController.autosaveProblem(error))")
             completion?(false)
         } catch DocumentError.modifiedOnDisk {
+            rollbackCleanupsIfNeeded()
             let alert = NSAlert()
             alert.alertStyle = .warning
             alert.messageText = doc.isNewFile
@@ -1107,6 +1140,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 write(doc, to: target, replacingExternalChanges: true, completion: completion)
             } else { completion?(false) }
         } catch DocumentError.encodingFailed(let enc) {
+            rollbackCleanupsIfNeeded()
             let alert = NSAlert()
             alert.messageText = "This document can’t be saved as \(enc.rawValue)."
             alert.informativeText = "Save it using UTF-8 instead?"
@@ -1117,6 +1151,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 write(doc, to: target, replacingExternalChanges: replacingExternalChanges, completion: completion)
             } else { completion?(false) }
         } catch {
+            rollbackCleanupsIfNeeded()
             showError(error)
             completion?(false)
         }
@@ -1624,7 +1659,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             }
         }
         for top in main.items {
-            guard let sub = top.submenu, top.title != "Window" || true else { continue }
+            guard let sub = top.submenu else { continue }
             if top === main.items.first { walk(sub, prefix: "Tovri"); continue }
             walk(sub, prefix: top.title)
         }

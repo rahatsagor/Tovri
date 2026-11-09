@@ -486,9 +486,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
     }
 
     private func updateCount(invalid: Bool = false) {
-        let fmt = NumberFormatter()
-        fmt.numberStyle = .decimal
-        let total = fmt.string(from: NSNumber(value: matches.count)) ?? "\(matches.count)"
+        let total = matches.count.formatted()
         if invalid {
             countLabel.stringValue = "Invalid"
         } else if searching && matches.isEmpty {

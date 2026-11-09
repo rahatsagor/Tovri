@@ -337,6 +337,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     func setRoot(_ url: URL?) {
         nodesByPath.removeAll()
+        gitStatus = [:]
+        changedDirectories = []
+        ignoredPaths = []
         if let url {
             let node = FileNode(url: url, isDirectory: true, parent: nil)
             node.loadChildren()
@@ -345,8 +348,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         } else {
             root = nil
         }
-        outline.reloadData()
         updatePlaceholder()
+        layoutSubtreeIfNeeded()
+        outline.reloadData()
     }
 
     private func norm(_ p: String) -> String {

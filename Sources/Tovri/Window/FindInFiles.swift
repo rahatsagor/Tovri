@@ -34,6 +34,8 @@ final class FileSearcher {
         var matches: Int
         var files: Int
         var scanned: Int
+        /// Files skipped because they are at least `maxFileSize` (25 MB).
+        var skippedLarge = 0
         /// The search stopped at `maxMatches`, `maxFiles` or `maxMatchesPerFile`; `text` has the first ones.
         var limited = false
         var hits: [Hit] = []
@@ -53,6 +55,7 @@ final class FileSearcher {
     private let lock = NSLock()
     private var _cancelled = false
     private var found = (matches: 0, files: 0)
+    private var skippedLargeCount = 0
     var isCancelled: Bool {
         lock.lock(); defer { lock.unlock() }
         return _cancelled
@@ -67,6 +70,12 @@ final class FileSearcher {
         lock.lock()
         found.matches += matches
         found.files += 1
+        lock.unlock()
+    }
+
+    private func recordSkippedLarge() {
+        lock.lock()
+        skippedLargeCount += 1
         lock.unlock()
     }
 
@@ -135,8 +144,14 @@ final class FileSearcher {
                         if self.isCancelled { return }
                         let url = root.appendingPathComponent(files[i])
                         let isWordChar = FileSearcher.wordTest(o, path: files[i])
-                        let hit = unsaved[files[i]].map { FileSearcher.search(text: $0, path: url.path, re, isWordChar: isWordChar) }
-                            ?? FileSearcher.search(url, path: url.path, re, isWordChar: isWordChar, digest: digest)
+                        let hit: Found?
+                        if let text = unsaved[files[i]] {
+                            hit = FileSearcher.search(text: text, path: url.path, re, isWordChar: isWordChar)
+                        } else {
+                            var tooLarge = false
+                            hit = FileSearcher.search(url, path: url.path, re, isWordChar: isWordChar, digest: digest, tooLarge: &tooLarge)
+                            if tooLarge { self.recordSkippedLarge() }
+                        }
                         if let hit {
                             resultPtr[i] = hit
                             self.record(hit.matches)
@@ -162,7 +177,10 @@ final class FileSearcher {
             if found.truncated { limited = true }
             if o.recordsHits { hits.append(Hit(path: files[i], matches: found.matches, digest: found.digest)) }
         }
-        return Result(text: text, matches: total, files: fileCount, scanned: files.count, limited: limited, hits: hits)
+        lock.lock()
+        let skippedLarge = skippedLargeCount
+        lock.unlock()
+        return Result(text: text, matches: total, files: fileCount, scanned: files.count, skippedLarge: skippedLarge, limited: limited, hits: hits)
     }
 
     /// The Find Results text: a header, the matches by file, and a summary.
@@ -176,6 +194,9 @@ final class FileSearcher {
             text += "Showing the first \(matches) in \(files) (\(time)s). There are more: narrow the search or use Include and Exclude to see them.\n"
         } else {
             text += "\(matches) across \(files) (\(time)s)\n"
+        }
+        if r.skippedLarge > 0 {
+            text += "\(r.skippedLarge.formatted()) file\(r.skippedLarge == 1 ? "" : "s") of 25 MB or more \(r.skippedLarge == 1 ? "was" : "were") skipped.\n"
         }
         return text
     }
@@ -217,12 +238,16 @@ final class FileSearcher {
     }
 
     private static func search(_ url: URL, path: String, _ re: NSRegularExpression, isWordChar: ((UInt16) -> Bool)?,
-                               digest: Bool) -> Found? {
+                               digest: Bool, tooLarge: inout Bool) -> Found? {
         // Only regular files: opening a FIFO would wait forever.
         var info = stat()
-        guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
-              info.st_size > 0, info.st_size < FileSearcher.maxFileSize else { return nil }
-        guard let data = try? Document.readFile(url), !data.isEmpty, data.count < FileSearcher.maxFileSize,
+        guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
+        if info.st_size >= FileSearcher.maxFileSize {
+            tooLarge = true
+            return nil
+        }
+        guard info.st_size > 0,
+              let data = try? Document.readFile(url), !data.isEmpty, data.count < FileSearcher.maxFileSize,
               let s = text(of: data), var found = search(text: s, path: path, re, isWordChar: isWordChar) else { return nil }
         if digest { found.digest = SHA256.hash(data: data) }
         return found

@@ -624,9 +624,11 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         card.frame = NSRect(x: scrollView.frame.minX + 4, y: max(8, y), width: width, height: height).integral
     }
 
+    private static let isRunningTests = NSClassFromString("XCTestCase") != nil
+
     /// Code is full of identifiers that aren't words, so only prose is checked.
     func updateSpellChecking() {
-        let on = Settings.shared.spellCheckProse && document.isProse && !document.isReadOnly && document.length < 2_000_000
+        let on = !Self.isRunningTests && Settings.shared.spellCheckProse && document.isProse && !document.isReadOnly && document.length < 2_000_000
         if textView.isContinuousSpellCheckingEnabled != on { textView.isContinuousSpellCheckingEnabled = on }
     }
 

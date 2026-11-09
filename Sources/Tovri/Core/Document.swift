@@ -193,7 +193,7 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     private var appliedAttributesKey = ""
 
-    private var attributesKey: String { "\(font.fontName)|\(font.pointSize)|\(indentWidth)|\(Settings.shared.ligatureAttribute)" }
+    var attributesKey: String { "\(font.fontName)|\(font.pointSize)|\(Settings.shared.fontWeight.rawValue)|\(indentWidth)|\(Settings.shared.ligatureAttribute)" }
 
     @objc private func settingsChanged() {
         var indentationChanged = false
@@ -588,15 +588,41 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     // MARK: Saving
 
-    func save(to target: URL? = nil, replacingExternalChanges: Bool = false) throws {
+    private var preflightEncoded: (version: Int, encoding: TextEncoding, lineEnding: LineEnding, data: Data)?
+
+    /// Checks whether saving to `target` (or the file's own URL when nil) would replace external
+    /// changes on disk without permission or fail text encoding.
+    func checkBeforeSaving(to target: URL? = nil, replacingExternalChanges: Bool = false) throws {
         guard let dest = target ?? url else { return }
         let resolved = dest.resolvingSymlinksInPath()
         if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved), isNewFile || current != diskStamp {
             throw DocumentError.modifiedOnDisk
         }
-        var text = textStorage.mutableString as String
-        if lineEnding != .lf { text = text.replacingOccurrences(of: "\n", with: lineEnding.string) }
-        guard let data = encoding.encode(text) else { throw DocumentError.encodingFailed(encoding) }
+        guard let data = Document.encode(textStorage.mutableString, encoding: encoding, lineEnding: lineEnding) else {
+            throw DocumentError.encodingFailed(encoding)
+        }
+        preflightEncoded = (editVersion, encoding, lineEnding, data)
+    }
+
+    func save(to target: URL? = nil, replacingExternalChanges: Bool = false) throws {
+        defer { preflightEncoded = nil }
+        guard let dest = target ?? url else { return }
+        let resolved = dest.resolvingSymlinksInPath()
+        if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved), isNewFile || current != diskStamp {
+            throw DocumentError.modifiedOnDisk
+        }
+        let data = try Perf.measure("  encode") { () throws -> Data in
+            if let cached = preflightEncoded,
+               cached.version == editVersion,
+               cached.encoding == encoding,
+               cached.lineEnding == lineEnding {
+                return cached.data
+            }
+            guard let d = Document.encode(textStorage.mutableString, encoding: encoding, lineEnding: lineEnding) else {
+                throw DocumentError.encodingFailed(encoding)
+            }
+            return d
+        }
         LocalHistory.shared.recordBeforeOverwrite(of: resolved, with: data)
         try Document.writeFile(data, replacing: resolved)
         let nameChanged = url != dest
@@ -617,6 +643,32 @@ final class Document: NSObject, NSTextStorageDelegate {
         }
         if nameChanged { RecentFiles.shared.add(dest) }
         postStateChange(force: true)
+    }
+
+    /// Encodes `s` with `encoding` and `lineEnding` in chunks so large files don't copy the whole
+    /// buffer into a bridged Swift String first.
+    static func encode(_ s: NSString, encoding: TextEncoding, lineEnding: LineEnding) -> Data? {
+        let len = s.length
+        if len <= 262_144 {
+            var text = s as String
+            if lineEnding != .lf { text = text.replacingOccurrences(of: "\n", with: lineEnding.string) }
+            return encoding.encode(text)
+        }
+        var out = Data()
+        out.reserveCapacity(len + (lineEnding == .crlf ? max(1024, len / 40) : 16))
+        if !encoding.bom.isEmpty { out.append(contentsOf: encoding.bom) }
+        let chunk = 262_144
+        var pos = 0
+        while pos < len {
+            var end = min(len, pos + chunk)
+            if end < len && UTF16.isLeadSurrogate(s.character(at: end - 1)) { end += 1 }
+            var piece = s.substring(with: NSRange(location: pos, length: end - pos))
+            if lineEnding != .lf { piece = piece.replacingOccurrences(of: "\n", with: lineEnding.string) }
+            guard let d = piece.data(using: encoding.stringEncoding, allowLossyConversion: false) else { return nil }
+            out.append(d)
+            pos = end
+        }
+        return out
     }
 
     /// Follows a file that was renamed or moved (e.g. from the sidebar) without writing it, so unsaved
@@ -1102,6 +1154,7 @@ struct DiskStamp: Codable, Equatable {
 /// Keeps one Document per file so the same file opened in several tabs/windows shares a buffer.
 final class DocumentRegistry {
     static let shared = DocumentRegistry()
+    private let lock = NSLock()
     private var byPath: [String: WeakDocument] = [:]
 
     private struct WeakDocument { weak var doc: Document? }
@@ -1110,6 +1163,8 @@ final class DocumentRegistry {
 
     func existing(for url: URL) -> Document? {
         let path = key(url)
+        lock.lock()
+        defer { lock.unlock() }
         guard let doc = byPath[path]?.doc, let currentURL = doc.url, key(currentURL) == path else {
             byPath.removeValue(forKey: path)
             return nil
@@ -1125,20 +1180,57 @@ final class DocumentRegistry {
     }
 
     func register(_ d: Document) {
+        let path = d.url.map(key)
+        lock.lock()
         byPath = byPath.filter { $0.value.doc != nil && $0.value.doc !== d }
-        if let url = d.url { byPath[key(url)] = WeakDocument(doc: d) }
+        if let path { byPath[path] = WeakDocument(doc: d) }
+        lock.unlock()
     }
 
-    func allDocuments() -> [Document] { byPath.values.compactMap { $0.doc } }
+    func allDocuments() -> [Document] {
+        lock.lock()
+        defer { lock.unlock() }
+        return byPath.values.compactMap { $0.doc }
+    }
 }
 
 final class RecentFiles {
     static let shared = RecentFiles()
     private let key = "recentItems"
     private let maxItems = 24
+    private let lock = NSLock()
+    private var existingCache: [URL]?
+    private var checking = false
 
     var items: [URL] {
         (UserDefaults.standard.stringArray(forKey: key) ?? []).map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Recent items known to exist on disk, refreshed off the main thread so drawing the empty
+    /// state never stalls on an unmounted or network volume.
+    func availableItems(onUpdate: (() -> Void)? = nil) -> [URL] {
+        let current = items
+        lock.lock()
+        let cached = existingCache
+        let busy = checking
+        if !busy { checking = true }
+        lock.unlock()
+        if !busy {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let existing = current.filter { FileManager.default.fileExists(atPath: $0.path) }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.lock.lock()
+                    let changed = self.existingCache != existing
+                    self.existingCache = existing
+                    self.checking = false
+                    self.lock.unlock()
+                    if changed { onUpdate?() }
+                }
+            }
+        }
+        if let cached { return cached.filter { current.contains($0) } }
+        return current.filter { $0.path.hasPrefix("/Volumes/") ? false : FileManager.default.fileExists(atPath: $0.path) }
     }
 
     func add(_ url: URL) {
@@ -1147,11 +1239,21 @@ final class RecentFiles {
         list.insert(url.path, at: 0)
         if list.count > maxItems { list = Array(list.prefix(maxItems)) }
         UserDefaults.standard.set(list, forKey: key)
+        lock.lock()
+        if var c = existingCache {
+            c.removeAll { $0.path == url.path }
+            c.insert(url, at: 0)
+            existingCache = Array(c.prefix(maxItems))
+        }
+        lock.unlock()
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
     }
 
     func clear() {
         UserDefaults.standard.removeObject(forKey: key)
+        lock.lock()
+        existingCache = []
+        lock.unlock()
         NSDocumentController.shared.clearRecentDocuments(nil)
     }
 }

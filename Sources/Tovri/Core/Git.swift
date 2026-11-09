@@ -655,6 +655,13 @@ final class GitRepository {
         return result
     }
 
+    private static let backupDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        return f
+    }()
+
     /// Copies the files as they are now into one folder and moves it to the Trash. Deleted files
     /// have nothing to keep. False if any copy couldn't be made or the Trash refused the folder.
     private func backUp(_ paths: [String], trash: (URL) throws -> Void) -> Bool {
@@ -674,10 +681,8 @@ final class GitRepository {
         let parent = (try? fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: root, create: true))
             ?? fm.temporaryDirectory.appendingPathComponent("Tovri-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: parent) }
-        let date = DateFormatter()
-        date.locale = Locale(identifier: "en_US_POSIX")
-        date.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let folder = parent.appendingPathComponent("Discarded changes in \(root.lastPathComponent) \(date.string(from: Date()))")
+        let stamp = GitRepository.backupDateFormatter.string(from: Date())
+        let folder = parent.appendingPathComponent("Discarded changes in \(root.lastPathComponent) \(stamp)")
         do {
             for (p, url) in present {
                 let copy = folder.appendingPathComponent(p)

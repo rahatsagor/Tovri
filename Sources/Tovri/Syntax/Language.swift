@@ -186,10 +186,34 @@ final class Language {
     static func make(_ id: String, _ name: String, _ configure: (Language) -> Void) -> Language {
         let l = Language(id: id, name: name)
         configure(l)
+        l.prepare()
         return l
     }
 
-    // MARK: Compiled lookup tables (built lazily, used by the lexer)
+    // MARK: Compiled lookup tables (built once and thread-safe for concurrent lexing/search)
+
+    private let lock = NSLock()
+    private var prepared = false
+
+    func prepare() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !prepared else { return }
+        _ = wordTable
+        _ = functionDefHashes
+        _ = typeDefHashes
+        _ = lineCommentUnits
+        _ = blockCommentUnits
+        _ = linePrefixUnits
+        _ = identStartSet
+        _ = identPartSet
+        _ = variablePrefixSet
+        _ = annotationPrefixSet
+        _ = stringPrefixSet
+        _ = operatorSet
+        _ = sortedStringRules
+        prepared = true
+    }
 
     private(set) lazy var wordTable: [UInt64: TokenKind] = {
         var t: [UInt64: TokenKind] = [:]
@@ -222,10 +246,18 @@ final class Language {
     private(set) lazy var sortedStringRules: [(index: Int, rule: StringRule)] =
         strings.enumerated().map { ($0.offset, $0.element) }.sorted { $0.rule.open.count > $1.rule.open.count }
 
-    private(set) lazy var symbolRegex: NSRegularExpression? = {
-        let pattern = symbolPattern ?? Language.defaultSymbolPattern
-        return try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines])
-    }()
+    private var _symbolRegexBuilt = false
+    private var _symbolRegex: NSRegularExpression?
+    var symbolRegex: NSRegularExpression? {
+        lock.lock()
+        defer { lock.unlock() }
+        if !_symbolRegexBuilt {
+            let pattern = symbolPattern ?? Language.defaultSymbolPattern
+            _symbolRegex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines])
+            _symbolRegexBuilt = true
+        }
+        return _symbolRegex
+    }
 
     static let defaultSymbolPattern =
         #"^[ \t]*(?:(?:export|public|private|protected|internal|fileprivate|open|static|final|abstract|async|override|default|pub(?:\([a-z]+\))?|unsafe|extern|inline|virtual|const)\s+)*(?:func|function|def|fn|class|struct|enum|interface|trait|protocol|extension|impl|module|object|type|record|union|namespace|macro|proc|sub)\s+([A-Za-z_$][\w$]*)"#
@@ -241,6 +273,9 @@ final class Language {
     }
 
     var lexer: Lexer {
+        prepare()
+        lock.lock()
+        defer { lock.unlock() }
         if let l = _lexer { return l }
         let l: Lexer
         switch style {

@@ -146,9 +146,11 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
 
     /// The text row of a line fragment, without the gaps opened above or below it.
     func textBand(forGlyphAt g: Int) -> NSRect {
-        let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+        guard numberOfGlyphs > 0 else { return NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
+        let safeGlyph = min(max(0, g), numberOfGlyphs - 1)
+        let frag = lineFragmentRect(forGlyphAt: safeGlyph, effectiveRange: nil)
         guard gaps != nil else { return frag }
-        let used = lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil)
+        let used = lineFragmentUsedRect(forGlyphAt: safeGlyph, effectiveRange: nil)
         return NSRect(x: frag.minX, y: used.minY, width: frag.width, height: min(lineHeight, frag.height))
     }
 

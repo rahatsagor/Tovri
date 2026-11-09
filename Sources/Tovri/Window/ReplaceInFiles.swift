@@ -190,7 +190,7 @@ enum ReplaceInFiles {
         func cancel() { lock.lock(); cancelled = true; lock.unlock() }
     }
 
-    /// Replaces in the plan's files that weren't open, saving each the way the editor would.
+    /// Replaces in the plan's files that weren't open, keeping each file's encoding, line endings and permissions.
     /// Files in `openPaths` (real paths) were opened since the search and are left alone. Runs on any thread.
     static func applyOnDisk(_ plan: Plan, batch: ReplaceBatch, openPaths: Set<String> = [], history: LocalHistory? = nil,
                             cancel: Cancellation? = nil, progress: ((Int) -> Void)? = nil) -> [Outcome] {
@@ -276,7 +276,7 @@ enum ReplaceInFiles {
 
     /// The bytes the editor would save for `text`.
     static func encode(_ text: String, _ encoding: TextEncoding, _ ending: LineEnding) -> Data? {
-        encoding.encode(ending == .lf ? text : text.replacingOccurrences(of: "\n", with: ending.string))
+        Document.encode(text as NSString, encoding: encoding, lineEnding: ending)
     }
 
     // MARK: Reports
@@ -594,6 +594,7 @@ final class ReplaceInFilesController {
             : try? NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: plan.replacement))
         // A pattern that never matches clears the search's highlights from the previous text.
         c.showFindResults(ReplaceInFiles.report(plan, outcomes, stopped: stopped), highlight: literal ?? (try? NSRegularExpression(pattern: "(?!)")))
+        c.refreshGitStatus()
         let changed = outcomes.filter { $0.skipped == nil }
         let saved = changed.filter { !$0.inEditor }.count
         let edited = changed.count - saved
@@ -681,6 +682,8 @@ final class ReplaceInFilesController {
                 if !notDone.isEmpty {
                     text += "Left as they are: \(ReplaceInFiles.count(notDone.count, "file"))\n" + notDone.map { "\($0.0) — \($0.1)\n" }.joined()
                 }
+                self.controller?.checkExternalChanges()
+                self.controller?.refreshGitStatus()
                 self.controller?.showFindResults(text, highlight: try? NSRegularExpression(pattern: "(?!)"))
                 self.controller?.statusBar.flash(all.isEmpty ? "Nothing was undone" : "Undid Replace in \(ReplaceInFiles.count(all.count, "file"))")
                 completion?()

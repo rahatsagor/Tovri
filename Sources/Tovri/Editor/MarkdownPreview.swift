@@ -176,6 +176,13 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         let fg = css(t.foreground), muted = css(t.chromeSecondary), accent = css(t.color(.link) ?? t.accent)
         let border = css(t.chromeBorder), codeBg = css(t.fieldBackground), bg = t.translucent ? "transparent" : css(t.background)
         let heading = css(t.foreground), quote = css(t.chromeSecondary)
+        let inserted = css(t.color(.inserted) ?? t.accent)
+        let deleted = css(t.color(.deleted) ?? t.accent)
+        let importantColor = css(t.color(.keyword) ?? t.accent)
+        let warningColor = t.isDark ? "rgba(227,179,65,1.000)" : "rgba(154,103,0,1.000)"
+        let subtleBg = css(t.foreground.withAlphaComponent(t.isDark ? 0.04 : 0.025))
+        let zebraBg = css(t.foreground.withAlphaComponent(t.isDark ? 0.028 : 0.018))
+        let markBg = css(t.findMatch.withAlphaComponent(t.isDark ? 0.38 : 0.45))
         let thumb = css(t.foreground.withAlphaComponent(t.isDark ? 0.26 : 0.24))
         let thumbHover = css(t.foreground.withAlphaComponent(t.isDark ? 0.42 : 0.38))
         let mono = "ui-monospace, 'SF Mono', Menlo, monospace"
@@ -186,46 +193,93 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src \(remote) data: blob: \(s):; media-src \(remote) data: blob: \(s):; style-src 'unsafe-inline'; font-src data:; script-src 'nonce-\(nonce)'; form-action 'none'; frame-src 'none'; base-uri \(s):">
         <base id="base" href="\(s)://file/">
         <style>
-        :root { color-scheme: \(t.isDark ? "dark" : "light"); }
+        :root { color-scheme: \(t.isDark ? "dark" : "light"); --accent: \(accent); }
         html, body { background: \(bg); }
-        body { margin: 0; padding: 32px 40px 30vh; color: \(fg); font: \(Int(fontSize + 2))px/1.65 -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
-               -webkit-font-smoothing: antialiased; word-wrap: break-word; }
-        #content { max-width: 880px; margin: 0 auto; }
-        h1, h2, h3, h4, h5, h6 { color: \(heading); font-weight: 650; line-height: 1.25; margin: 1.6em 0 0.6em; scroll-margin-top: 16px; }
-        h1 { font-size: 2em; padding-bottom: .3em; border-bottom: 1px solid \(border); margin-top: .4em; }
-        h2 { font-size: 1.5em; padding-bottom: .3em; border-bottom: 1px solid \(border); }
-        h3 { font-size: 1.25em; } h4 { font-size: 1em; } h5 { font-size: .875em; } h6 { font-size: .85em; color: \(muted); }
-        p, ul, ol, blockquote, table, pre, details { margin: 0 0 1em; }
-        a { color: \(accent); text-decoration: none; } a:hover { text-decoration: underline; }
-        code { font-family: \(mono); font-size: .88em; background: \(codeBg); padding: .15em .4em; border-radius: 5px; }
-        pre { background: \(codeBg); border: 1px solid \(border); border-radius: 8px; padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
-        pre code { background: none; padding: 0; font-size: .86em; white-space: pre; }
-        blockquote { margin-left: 0; padding: .1em 1em; color: \(quote); border-left: 3px solid \(border); }
-        blockquote.alert { border-left-color: \(accent); } .alert-title { font-weight: 600; color: \(accent); margin-bottom: .3em; }
-        .alert-warning, .alert-caution { border-left-color: \(css(t.color(.deleted) ?? t.accent)); }
-        .alert-warning .alert-title, .alert-caution .alert-title { color: \(css(t.color(.deleted) ?? t.accent)); }
-        .alert-tip .alert-title { color: \(css(t.color(.inserted) ?? t.accent)); } .alert-tip { border-left-color: \(css(t.color(.inserted) ?? t.accent)); }
+        body { margin: 0; padding: 36px 44px 30vh; color: \(fg); font: \(Int(fontSize + 2))px/1.68 -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+               -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; word-wrap: break-word; overflow-wrap: break-word; }
+        #content { max-width: 860px; margin: 0 auto; }
+        h1, h2, h3, h4, h5, h6 { color: \(heading); font-weight: 650; line-height: 1.28; letter-spacing: -0.012em; margin: 1.65em 0 0.6em; scroll-margin-top: 20px; }
+        h1 { font-size: 2.05em; padding-bottom: .32em; border-bottom: 1px solid \(border); margin-top: .3em; letter-spacing: -0.02em; }
+        h2 { font-size: 1.52em; padding-bottom: .28em; border-bottom: 1px solid \(border); }
+        h3 { font-size: 1.25em; } h4 { font-size: 1.05em; } h5 { font-size: .92em; } h6 { font-size: .86em; color: \(muted); text-transform: uppercase; letter-spacing: 0.04em; }
+        p, ul, ol, dl, blockquote, table, pre, details, .math-block, .toc, .front-matter { margin: 0 0 1.1em; }
+        a { color: \(accent); text-decoration: none; text-underline-offset: 3px; } a:hover { text-decoration: underline; }
+        strong { font-weight: 650; }
+        del { color: \(muted); text-decoration-thickness: 1.5px; }
+        mark { background: \(markBg); color: inherit; padding: .08em .28em; border-radius: 4px; }
+        sup, sub { font-size: .76em; line-height: 0; }
+        code { font-family: \(mono); font-size: .87em; background: \(codeBg); border: 1px solid \(border); padding: .14em .42em; border-radius: 5px; }
+        pre { position: relative; background: \(codeBg); border: 1px solid \(border); border-radius: 9px; padding: 14px 16px; overflow-x: auto; line-height: 1.52; }
+        pre[data-lang] { padding-top: 34px; }
+        pre[data-lang]::before { content: attr(data-lang); position: absolute; top: 8px; left: 14px; font: 600 11px/1 \(mono); color: \(muted); text-transform: uppercase; letter-spacing: 0.05em; pointer-events: none; user-select: none; }
+        pre code { background: none; border: 0; padding: 0; font-size: .86em; white-space: pre; tab-size: 4; }
+        .code-copy { position: absolute; top: 6px; right: 8px; font: 500 11px/1 -apple-system, BlinkMacSystemFont, sans-serif; color: \(muted); background: \(subtleBg); border: 1px solid \(border); border-radius: 5px; padding: 4px 8px; cursor: pointer; opacity: 0; transition: opacity .14s ease, color .14s ease, background .14s ease; user-select: none; }
+        pre:hover .code-copy, .code-copy:focus-visible, .code-copy.copied { opacity: 1; }
+        .code-copy:hover { color: \(fg); background: \(codeBg); }
+        .code-copy.copied { color: \(inserted); border-color: \(inserted); }
+        blockquote { margin-left: 0; padding: .35em 1.1em; color: \(quote); border-left: 3.5px solid \(border); background: \(subtleBg); border-radius: 0 7px 7px 0; }
+        blockquote > :first-child { margin-top: 0; } blockquote > :last-child { margin-bottom: 0; }
+        blockquote.alert { --alert-color: \(accent); border-left: 4px solid var(--alert-color); padding: 12px 16px; color: \(fg); background: \(subtleBg); border-radius: 0 8px 8px 0; }
+        .alert-title { display: flex; align-items: center; gap: 7px; font-weight: 650; color: var(--alert-color); margin: 0 0 .4em; line-height: 1.3; }
+        .alert-icon { flex-shrink: 0; fill: currentColor; }
+        .alert-note { --alert-color: \(accent); }
+        .alert-tip { --alert-color: \(inserted); }
+        .alert-important { --alert-color: \(importantColor); }
+        .alert-warning { --alert-color: \(warningColor); }
+        .alert-caution { --alert-color: \(deleted); }
         hr { border: 0; border-top: 1px solid \(border); margin: 2em 0; }
-        table { border-collapse: collapse; display: block; overflow-x: auto; }
-        th, td { border: 1px solid \(border); padding: 6px 13px; } th { font-weight: 600; background: \(codeBg); }
-        img, video { max-width: 100%; } img { border-radius: 6px; }
+        table { border-collapse: separate; border-spacing: 0; display: block; width: max-content; max-width: 100%; overflow-x: auto; border: 1px solid \(border); border-radius: 8px; }
+        th, td { border-right: 1px solid \(border); border-bottom: 1px solid \(border); padding: 8px 14px; }
+        th:last-child, td:last-child { border-right: 0; }
+        tbody tr:last-child td { border-bottom: 0; }
+        th { font-weight: 650; background: \(codeBg); text-align: left; }
+        tbody tr:nth-child(even) { background: \(zebraBg); }
+        img, video { max-width: 100%; height: auto; } img { border-radius: 7px; }
         img[align=right] { float: right; margin-left: 1em; } img[align=left] { float: left; margin-right: 1em; }
-        ul, ol { padding-left: 2em; } li + li { margin-top: .25em; }
-        .contains-task-list { list-style: none; padding-left: 1.2em; } .task-list-item input { margin: 0 .45em 0 -1.2em; vertical-align: middle; }
-        .front-matter { opacity: .75; }
-        kbd { font-family: \(mono); font-size: .8em; border: 1px solid \(border); border-bottom-width: 2px; border-radius: 4px; padding: .1em .4em; }
-        mark { background: \(css(t.findMatch)); color: inherit; }
+        ul, ol { padding-left: 1.85em; } li + li { margin-top: .28em; }
+        li > ul, li > ol { margin-top: .28em; margin-bottom: .28em; }
+        .contains-task-list { list-style: none; padding-left: 1.4em; }
+        .task-list-item input[type=checkbox] { margin: 0 .5em 0 -1.3em; vertical-align: middle; accent-color: \(accent); width: 14px; height: 14px; }
+        dl { padding: 0; }
+        dt { font-weight: 650; margin-top: .8em; color: \(heading); }
+        dt:first-child { margin-top: 0; }
+        dd { margin: .25em 0 .75em 1.4em; color: \(fg); }
+        details { border: 1px solid \(border); border-radius: 8px; padding: .6em 1em; background: \(subtleBg); }
+        summary { font-weight: 600; cursor: pointer; user-select: none; }
+        details[open] > summary { margin-bottom: .6em; padding-bottom: .45em; border-bottom: 1px solid \(border); }
+        .front-matter { font-size: .88em; }
+        div.front-matter { background: \(codeBg); border: 1px solid \(border); border-radius: 8px; padding: 8px 12px; }
+        div.front-matter table { border: 0; border-radius: 0; display: table; width: 100%; margin: 0; }
+        div.front-matter th, div.front-matter td { border: 0; background: none !important; padding: 4px 8px; vertical-align: top; }
+        div.front-matter .fm-key { width: 1%; white-space: nowrap; color: \(muted); font-family: \(mono); font-weight: 600; font-size: .92em; padding-right: 14px; }
+        div.front-matter .fm-tag { display: inline-block; font-family: \(mono); font-size: .86em; background: \(subtleBg); border: 1px solid \(border); border-radius: 999px; padding: 1px 8px; margin: 1px 4px 1px 0; }
+        pre.front-matter { opacity: .82; }
+        .math-block { background: \(codeBg); border: 1px solid \(border); border-radius: 8px; padding: 12px 16px; overflow-x: auto; text-align: center; }
+        .math-block code { background: none; border: 0; padding: 0; font-family: 'STIX Two Math', 'Cambria Math', 'Latin Modern Math', \(mono); font-size: 1.02em; }
+        .math-inline { font-family: 'STIX Two Math', 'Cambria Math', 'Latin Modern Math', \(mono); font-size: .95em; background: \(subtleBg); padding: .08em .32em; border-radius: 4px; }
+        .toc { background: \(subtleBg); border: 1px solid \(border); border-radius: 8px; padding: 12px 16px; }
+        .toc ul { list-style: none; padding-left: 0; margin: 0; }
+        .toc li { margin: .25em 0; }
+        .toc .toc-level-1 { padding-left: 1.1em; } .toc .toc-level-2 { padding-left: 2.2em; } .toc .toc-level-3 { padding-left: 3.3em; } .toc .toc-level-4 { padding-left: 4.4em; }
+        .footnote-ref a { font-family: \(mono); font-size: .85em; padding: 0 2px; }
+        section.footnotes { margin-top: 2.5em; font-size: .88em; color: \(muted); }
+        section.footnotes hr { margin-bottom: 1em; }
+        section.footnotes ol { padding-left: 1.5em; }
+        section.footnotes li { margin-bottom: .45em; }
+        .footnote-backref { font-size: .9em; margin-left: 4px; }
+        kbd { font-family: \(mono); font-size: .82em; background: \(codeBg); border: 1px solid \(border); border-bottom-width: 2px; border-radius: 5px; padding: .12em .42em; box-shadow: inset 0 -1px 0 \(border); }
         @media print {
           :root { color-scheme: light; }
           html, body { background: #fff !important; }
           body { color: #1f2328; padding: 0; }
-          h1, h2, h3, h4, h5, h6 { color: #1f2328; }
-          h1, h2, hr, th, td, pre, kbd, blockquote { border-color: #d0d7de; }
+          h1, h2, h3, h4, h5, h6, dt { color: #1f2328; }
+          h1, h2, hr, th, td, pre, kbd, blockquote, table, details, div.front-matter, .math-block, .toc { border-color: #d0d7de; }
           a { color: #0969da; }
-          code, pre, th { background: #f6f8fa; }
-          blockquote, h6, .front-matter { color: #59636e; }
+          code, pre, th, div.front-matter, .math-block { background: #f6f8fa; }
+          blockquote, h6, .front-matter, section.footnotes { color: #59636e; }
+          .code-copy { display: none !important; }
           pre, pre code { white-space: pre-wrap; }
-          pre, img, tr { break-inside: avoid; }
+          pre, img, tr, blockquote { break-inside: avoid; }
           \(t.isDark ? "pre code span { color: inherit !important; }" : "")
         }
         ::-webkit-scrollbar { width: 12px; height: 12px; background: transparent; }
@@ -236,7 +290,16 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         </style><script nonce="\(nonce)">
         function tovriSetContent(html, base) {
           if (base) document.getElementById('base').href = base;
-          document.getElementById('content').innerHTML = html;
+          const root = document.getElementById('content');
+          root.innerHTML = html;
+          for (const pre of root.querySelectorAll('pre:not(.front-matter)')) {
+            if (!pre.querySelector('code')) continue;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'code-copy';
+            btn.textContent = 'Copy';
+            pre.appendChild(btn);
+          }
         }
         function tovriScrollToLine(line) {
           const els = document.querySelectorAll('#content > [data-line]');
@@ -258,6 +321,20 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
           window.webkit.messageHandlers.tovri.postMessage({ remoteBlocked: true });
         });
         document.addEventListener('click', e => {
+          const copyBtn = e.target.closest && e.target.closest('button.code-copy');
+          if (copyBtn) {
+            const code = copyBtn.parentElement && copyBtn.parentElement.querySelector('code');
+            if (code) {
+              const text = code.textContent || '';
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(() => {});
+              }
+              copyBtn.textContent = 'Copied';
+              copyBtn.classList.add('copied');
+              setTimeout(() => { copyBtn.textContent = 'Copy'; copyBtn.classList.remove('copied'); }, 1400);
+            }
+            return;
+          }
           const a = e.target.closest && e.target.closest('a[href^="#"]');
           if (!a) return;
           e.preventDefault();

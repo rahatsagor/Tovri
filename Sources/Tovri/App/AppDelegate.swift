@@ -62,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 let c = makeController()
                 c.restore(w)
+                c.rootView.layoutSubtreeIfNeeded()
                 c.showWindow(nil)
             }
         }
@@ -300,9 +301,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @discardableResult
     func newWindow(folder: URL? = nil) -> MainWindowController {
         let c = makeController()
-        if let folder { c.setFolder(folder) }
+        if let folder { c.setFolder(folder) } else { c.newTab(nil) }
+        c.rootView.layoutSubtreeIfNeeded()
         c.showWindow(nil)
-        if folder == nil { c.newTab(nil) }
         return c
     }
 
@@ -334,8 +335,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func restoreClosed(_ s: WindowSession) -> MainWindowController {
         let c = makeController()
         c.restore(s)
-        c.showWindow(nil)
         if c.groups.allSatisfy({ $0.tabs.isEmpty }) && c.folderURL == nil { c.newTab(nil) }
+        c.rootView.layoutSubtreeIfNeeded()
+        c.showWindow(nil)
         return c
     }
 
@@ -381,6 +383,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
                 if let c = activeController, c.isEmptyWindow || c.folderURL == nil {
+                    if c.isEmptyWindow {
+                        for g in c.groups { while !g.tabs.isEmpty { g.removeTab(at: 0) } }
+                    }
                     c.setFolder(url)
                     c.window?.makeKeyAndOrderFront(nil)
                 } else {
@@ -501,14 +506,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === recentMenu else { return }
         menu.removeAllItems()
-        let items = RecentFiles.shared.items.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let items = RecentFiles.shared.availableItems()
         for url in items {
             let item = NSMenuItem(title: (url.path as NSString).abbreviatingWithTildeInPath, action: #selector(openRecentItem(_:)), keyEquivalent: "")
             item.representedObject = url
             item.target = self
-            var isDir: ObjCBool = false
-            FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-            let icon = NSImage(systemSymbolName: isDir.boolValue ? "folder" : "doc", accessibilityDescription: nil)
+            let icon = NSImage(systemSymbolName: url.hasDirectoryPath ? "folder" : "doc", accessibilityDescription: nil)
             icon?.size = NSSize(width: 14, height: 14)
             item.image = icon
             menu.addItem(item)

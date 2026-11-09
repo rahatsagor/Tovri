@@ -20,6 +20,7 @@ final class ProjectSymbolIndex {
     private struct Stamp: Equatable {
         let size: Int64
         let mtime: Int
+        let inode: UInt64
     }
 
     let root: URL
@@ -98,7 +99,7 @@ final class ProjectSymbolIndex {
                 let full = rootPath + "/" + item.path
                 var st = stat()
                 guard stat(full, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= ProjectSymbolIndex.maxFileSize else { return }
-                let stamp = Stamp(size: Int64(st.st_size), mtime: Int(st.st_mtimespec.tv_sec) &* 1_000_000_000 &+ Int(st.st_mtimespec.tv_nsec))
+                let stamp = Stamp(size: Int64(st.st_size), mtime: Int(st.st_mtimespec.tv_sec) &* 1_000_000_000 &+ Int(st.st_mtimespec.tv_nsec), inode: st.st_ino)
                 if let cached = old[item.path], cached.stamp == stamp { buf[i] = cached; return }
                 guard let data = FileManager.default.contents(atPath: full) else { return }
                 if data.prefix(4096).contains(0) { buf[i] = FileSymbols(stamp: stamp, symbols: []); return }

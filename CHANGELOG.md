@@ -9,6 +9,42 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Richer Markdown preview.** The Markdown preview now supports footnotes
+  (`[^1]`), highlighted text (`==mark==`), superscript and subscript (`^sup^`
+  and `~sub~`), definition lists, inline and block math (`$...$` and
+  `$$...$$`), `[TOC]` tables of contents, structured YAML front matter,
+  GitHub alerts with icons and custom titles, and a **Copy** button on code
+  blocks.
+- **Tab overflow menu.** When a window has more tabs than fit across the tab
+  bar, a menu button at the right end of the bar lists all open tabs and jumps
+  straight to any of them.
+
+### Changed
+
+- Overflowing tabs keep readable widths and middle-truncated titles, clip
+  cleanly before the window edge and right-side buttons, and auto-scroll while
+  dragging a tab near the edge of the bar.
+- Opening a folder lays out the sidebar and window before first paint so the
+  window appears without flickering.
+- Saving large files encodes in chunks to use less memory, and recent file
+  checks run in the background so slow or unmounted volumes don't stall the
+  interface.
+
+### Fixed
+
+- Save-time cleanups (trimming trailing spaces and adding a final newline) no
+  longer change the open document when a save is cancelled or blocked.
+- Changing the font weight in **Settings → Appearance** updates open
+  documents right away.
+- Indented code fences inside a Markdown code block no longer close the block
+  early in the preview.
+- **Undo Replace in Files** refreshes open clean tabs and sidebar Git status
+  immediately.
+- **Find in Files** notes in the results summary when files of 25 MB or more
+  were skipped.
+
 ## [0.4.0] - 2026-11-02
 
 ### Added

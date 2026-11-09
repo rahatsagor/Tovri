@@ -270,7 +270,7 @@ final class WindowRegressionTests: XCTestCase {
 
     func testAFastTabDragLandsWhereTheMouseIs() throws {
         let dir = try makeFolder(["a.txt": "a", "b.txt": "b", "c.txt": "c", "d.txt": "d"])
-        try withController { c in
+        withController { c in
             c.window?.setContentSize(NSSize(width: 1200, height: 600))
             for n in ["a", "b", "c", "d"] { _ = c.open(url: dir.appendingPathComponent("\(n).txt")) }
             c.rootView.layoutSubtreeIfNeeded()
@@ -357,5 +357,97 @@ final class WindowRegressionTests: XCTestCase {
         XCTAssertNotNil(Fuzzy.match(Fuzzy.prepare("Cafe\u{301}"), Array("café".utf16)), "a decomposed query didn't match")
         XCTAssertNotNil(Fuzzy.match(Fuzzy.prepare("ПРИВЕТ"), Array("привет.txt".utf16)))
         XCTAssertNil(Fuzzy.match(Fuzzy.prepare("x"), Array("é".utf16)))
+    }
+
+    func testTabOverflowReservesSpaceForOverflowMenuAndClipsWithinStrip() throws {
+        var files: [String: String] = [:]
+        for i in 1...10 { files["document-number-\(i).swift"] = "let x = \(i)\n" }
+        let dir = try makeFolder(files)
+        try withController { c in
+            c.window?.setContentSize(NSSize(width: 720, height: 500))
+            for i in 1...10 { _ = c.open(url: dir.appendingPathComponent("document-number-\(i).swift")) }
+            c.rootView.layoutSubtreeIfNeeded()
+            let bar = c.activeGroup.tabBar
+            bar.layout()
+            XCTAssertTrue(bar.isOverflowing)
+            for f in bar.frames {
+                XCTAssertGreaterThanOrEqual(f.width, TabBarView.minTabWidth)
+            }
+            let menuRect = try XCTUnwrap(bar.overflowButtonRect)
+            XCTAssertGreaterThan(menuRect.width, 0)
+            XCTAssertLessThanOrEqual(bar.stripRect.maxX, menuRect.minX + 0.5)
+        }
+    }
+
+    func testSaveCleanupsDoNotMutateBufferWhenSaveIsBlockedByExternalChange() throws {
+        let dir = try makeFolder(["a.txt": "hello\n"])
+        let url = dir.appendingPathComponent("a.txt")
+        let d = UserDefaults.standard
+        let oldTrim = d.object(forKey: Settings.Key.trimTrailingWhitespace)
+        let oldNewline = d.object(forKey: Settings.Key.ensureNewlineAtEOF)
+        defer {
+            d.set(oldTrim, forKey: Settings.Key.trimTrailingWhitespace)
+            d.set(oldNewline, forKey: Settings.Key.ensureNewlineAtEOF)
+        }
+        d.set(true, forKey: Settings.Key.trimTrailingWhitespace)
+        d.set(true, forKey: Settings.Key.ensureNewlineAtEOF)
+
+        try withController { c in
+            let doc = try XCTUnwrap(c.open(url: url))
+            try type("   ", in: c)
+            let beforeSaveText = doc.string as String
+            let beforeVersion = doc.editVersion
+            // Modify file externally on disk so preflight save check fails.
+            try "changed externally\n".write(to: url, atomically: true, encoding: .utf8)
+            var saved = true
+            c.save(doc, replacingExternalChanges: false, interactive: false) { ok in saved = ok }
+            XCTAssertFalse(saved)
+            XCTAssertEqual(doc.string as String, beforeSaveText, "failed background save mutated the open buffer")
+            XCTAssertEqual(doc.editVersion, beforeVersion)
+
+            // Also verify rollback when encoding fails after cleanups run.
+            try doc.reload()
+            doc.encoding = .latin1
+            try type("🎉   ", in: c)
+            let beforeEncodeFail = doc.string as String
+            saved = true
+            c.save(doc, replacingExternalChanges: true, interactive: false) { ok in saved = ok }
+            XCTAssertFalse(saved)
+            XCTAssertEqual(doc.string as String, beforeEncodeFail, "failed encoding save left cleanup edits behind")
+        }
+    }
+
+    func testFontWeightChangeUpdatesDocumentAttributesKey() {
+        let d = UserDefaults.standard
+        let prev = d.object(forKey: Settings.Key.fontWeight)
+        defer { d.set(prev, forKey: Settings.Key.fontWeight) }
+        let doc = Document()
+        d.set(Settings.FontWeight.regular.rawValue, forKey: Settings.Key.fontWeight)
+        let regularKey = doc.attributesKey
+        d.set(Settings.FontWeight.semibold.rawValue, forKey: Settings.Key.fontWeight)
+        let boldKey = doc.attributesKey
+        XCTAssertNotEqual(regularKey, boldKey)
+    }
+
+    func testPerformEditsPreservesMultipleZeroLengthInsertionsAndOrderAtSameLocation() throws {
+        let dir = try makeFolder(["a.txt": "hello world\n"])
+        try withController { c in
+            let doc = try XCTUnwrap(c.open(url: dir.appendingPathComponent("a.txt")))
+            let tv = try XCTUnwrap(c.activeEditor?.textView)
+            tv.performEdits([
+                TextEdit(NSRange(location: 0, length: 0), "["),
+                TextEdit(NSRange(location: 0, length: 0), "<"),
+                TextEdit(NSRange(location: 5, length: 0), ">]")
+            ])
+            XCTAssertEqual(doc.string as String, "[<hello>] world\n")
+        }
+    }
+
+    func testFindInFilesReportMentionsSkippedLargeFiles() {
+        let root = URL(fileURLWithPath: "/tmp")
+        let o = FileSearcher.Options(query: "needle", regex: false, caseSensitive: false, wholeWord: false, root: root, include: [], exclude: [])
+        let r = FileSearcher.Result(text: "", matches: 0, files: 0, scanned: 3, skippedLarge: 2, limited: false, hits: [])
+        let report = FileSearcher.report(r, for: o, elapsed: 0.05)
+        XCTAssertTrue(report.contains("2 files of 25 MB or more were skipped."), report)
     }
 }

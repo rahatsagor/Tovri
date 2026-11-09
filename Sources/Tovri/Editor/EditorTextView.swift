@@ -214,16 +214,17 @@ final class EditorTextView: NSTextView {
         var frag: NSRect
         var x: CGFloat
         let tlm = tovriLayoutManager
-        if len == 0 || (loc >= len && text.character(at: len - 1) == 10) {
+        let glyphCount = lm.numberOfGlyphs
+        if len == 0 || glyphCount == 0 || (loc >= len && text.character(at: len - 1) == 10) {
             frag = tlm.extraTextBand
             if frag.height == 0 { frag = NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
             x = frag.minX + tc.lineFragmentPadding
         } else if loc >= len {
-            let g = lm.glyphIndexForCharacter(at: len - 1)
+            let g = min(lm.glyphIndexForCharacter(at: len - 1), glyphCount - 1)
             frag = tlm.textBand(forGlyphAt: g)
             x = lm.boundingRect(forGlyphRange: NSRange(location: g, length: 1), in: tc).maxX
         } else {
-            let g = lm.glyphIndexForCharacter(at: loc)
+            let g = min(lm.glyphIndexForCharacter(at: loc), glyphCount - 1)
             frag = tlm.textBand(forGlyphAt: g)
             x = frag.minX + lm.location(forGlyphAt: g).x
         }
@@ -617,13 +618,22 @@ final class EditorTextView: NSTextView {
     func performEdits(_ edits: [TextEdit], selection: SelectionUpdate = .fromEdits, actionName: String? = nil,
                       keepFolds: Bool = false, addedFolds: [NSRange] = []) {
         guard let storage = textStorage, !document.isReadOnly else { NSSound.beep(); return }
-        let sorted = edits.sorted { $0.range.location < $1.range.location }
+        let sorted = edits.sorted {
+            $0.range.location != $1.range.location ? $0.range.location < $1.range.location : $0.range.length < $1.range.length
+        }
         var filtered: [TextEdit] = []
         var lastEnd = -1
         for e in sorted where e.range.location >= lastEnd {
+            if let last = filtered.last,
+               NSMaxRange(last.range) == e.range.location,
+               (last.range.length == 0 || last.text.isEmpty),
+               e.range.length == 0 {
+                let combined = last.text + e.text
+                filtered[filtered.count - 1] = TextEdit(last.range, combined)
+                continue
+            }
             filtered.append(e)
             lastEnd = NSMaxRange(e.range)
-            if e.range.length == 0 { lastEnd = e.range.location + 0 }
         }
         guard !filtered.isEmpty else { return }
         let oldSelections = allSelections

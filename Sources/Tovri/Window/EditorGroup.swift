@@ -282,8 +282,7 @@ final class EmptyStateView: NSView {
     }
 
     private func recents() -> [URL] {
-        let fm = FileManager.default
-        return Array(RecentFiles.shared.items.filter { fm.fileExists(atPath: $0.path) }.prefix(6))
+        Array(RecentFiles.shared.availableItems { [weak self] in self?.needsDisplay = true }.prefix(6))
     }
 
     /// Nil when the view is too short to show anything.
