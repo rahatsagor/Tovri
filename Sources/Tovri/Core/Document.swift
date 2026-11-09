@@ -645,11 +645,16 @@ final class Document: NSObject, NSTextStorageDelegate {
         postStateChange(force: true)
     }
 
-    /// Encodes `s` with `encoding` and `lineEnding` in chunks so large files don't copy the whole
-    /// buffer into a bridged Swift String first.
+    /// Unicode encodings can be converted in chunks without copying the whole buffer. Legacy
+    /// encoders need the complete text to compose characters and handle conversion boundaries.
     static func encode(_ s: NSString, encoding: TextEncoding, lineEnding: LineEnding) -> Data? {
         let len = s.length
-        if len <= 262_144 {
+        let canChunk: Bool
+        switch encoding {
+        case .utf8, .utf8BOM, .utf16LE, .utf16BE: canChunk = true
+        default: canChunk = false
+        }
+        if len <= 262_144 || !canChunk {
             var text = s as String
             if lineEnding != .lf { text = text.replacingOccurrences(of: "\n", with: lineEnding.string) }
             return encoding.encode(text)

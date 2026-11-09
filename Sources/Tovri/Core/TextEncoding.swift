@@ -104,9 +104,34 @@ enum TextEncoding: String, CaseIterable {
     }
 
     func encode(_ text: String) -> Data? {
+        if self == .gb18030 { return TextEncoding.encodeGB18030(text) }
         // The explicit-endian UTF-16 encodings never emit a BOM, so a leading U+FEFF here is text.
         guard let data = text.data(using: stringEncoding, allowLossyConversion: false) else { return nil }
         return bom.isEmpty ? data : Data(bom) + data
+    }
+
+    private static func encodeGB18030(_ text: String) -> Data? {
+        // The system converter can consume U+FEFF as a BOM at internal boundaries or miscount
+        // its output size, causing a Foundation exception. Encode spans without it and preserve each
+        // occurrence as the GB 18030 character bytes, including at the start of the text.
+        let source = text as NSString
+        var data = Data()
+        data.reserveCapacity(source.length)
+        var position = 0
+        while position < source.length {
+            let marker = source.range(of: "\u{FEFF}", options: .literal,
+                                      range: NSRange(location: position, length: source.length - position))
+            let end = marker.location == NSNotFound ? source.length : marker.location
+            if end > position {
+                let span = source.substring(with: NSRange(location: position, length: end - position))
+                guard let bytes = span.data(using: TextEncoding.gb18030.stringEncoding, allowLossyConversion: false) else { return nil }
+                data.append(bytes)
+            }
+            guard marker.location != NSNotFound else { break }
+            data.append(contentsOf: [0x84, 0x31, 0x95, 0x33])
+            position = NSMaxRange(marker)
+        }
+        return data
     }
 }
 
