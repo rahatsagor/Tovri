@@ -622,8 +622,12 @@ final class EditorTextView: NSTextView {
             $0.range.location != $1.range.location ? $0.range.location < $1.range.location : $0.range.length < $1.range.length
         }
         var filtered: [TextEdit] = []
+        var logicalEdits: [TextEdit] = []
         var lastEnd = -1
         for e in sorted where e.range.location >= lastEnd {
+            // AppKit gets coalesced replacements, but every requested edit keeps its own caret
+            // and boundary mapping, including insertions at the same position.
+            logicalEdits.append(e)
             if let last = filtered.last,
                NSMaxRange(last.range) == e.range.location,
                (last.range.length == 0 || last.text.isEmpty),
@@ -679,14 +683,14 @@ final class EditorTextView: NSTextView {
         isSettingMulti = false
         if let name = actionName { undoManager?.setActionName(name) }
         if keepFolds, let editor, !foldsBefore.isEmpty || !addedFolds.isEmpty {
-            editor.applyFolds(EditorTextView.mapFolds(foldsBefore, through: filtered) + addedFolds)
+            editor.applyFolds(EditorTextView.mapFolds(foldsBefore, through: logicalEdits) + addedFolds)
         }
 
         switch selection {
         case .fromEdits:
             var delta = 0
             var sels: [NSRange] = []
-            for e in filtered {
+            for e in logicalEdits {
                 let base = e.range.location + delta
                 sels.append(NSRange(location: base + e.selection.location, length: e.selection.length))
                 delta += e.text.utf16.count - e.range.length
@@ -694,8 +698,8 @@ final class EditorTextView: NSTextView {
             setAllSelections(sels)
         case .preserve:
             let sels = oldSelections.map { r -> NSRange in
-                let a = EditorTextView.map(r.location, through: filtered)
-                let b = EditorTextView.map(NSMaxRange(r), through: filtered)
+                let a = EditorTextView.map(r.location, through: logicalEdits)
+                let b = EditorTextView.map(NSMaxRange(r), through: logicalEdits)
                 return NSRange(location: a, length: max(0, b - a))
             }
             setAllSelections(sels, scroll: false)

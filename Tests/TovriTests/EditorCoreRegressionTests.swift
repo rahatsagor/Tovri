@@ -156,6 +156,42 @@ final class EditorCoreRegressionTests: XCTestCase {
         for r in e.textView.allSelections where r.length > 0 { XCTAssertEqual(s.substring(with: r), "de") }
     }
 
+    func testInsertLineBeforeKeepsEveryCaretWhenInsertionsShareAnOffset() {
+        let e = makeEditor("abc\n")
+        defer { e.close() }
+        let tv = e.textView
+        let undo = e.document.undoManager
+        undo.groupsByEvent = false
+        let originalCarets = [NSRange(location: 0, length: 0), NSRange(location: 2, length: 0)]
+        tv.setAllSelections(originalCarets)
+        undo.beginUndoGrouping()
+        tv.insertLineBefore(nil)
+        undo.endUndoGrouping()
+        let insertedCarets = [NSRange(location: 0, length: 0), NSRange(location: 1, length: 0)]
+        XCTAssertEqual(e.document.string as String, "\n\nabc\n")
+        XCTAssertEqual(tv.allSelections, insertedCarets)
+        undo.undo()
+        XCTAssertEqual(e.document.string as String, "abc\n")
+        XCTAssertEqual(tv.allSelections, originalCarets)
+        undo.redo()
+        XCTAssertEqual(tv.allSelections, insertedCarets)
+        undo.beginUndoGrouping()
+        tv.insertText("X", replacementRange: NSRange(location: NSNotFound, length: 0))
+        undo.endUndoGrouping()
+        XCTAssertEqual(e.document.string as String, "X\nX\nabc\n")
+    }
+
+    func testCoalescedInsertionsKeepCustomSelections() {
+        let e = makeEditor("end")
+        defer { e.close() }
+        e.textView.performEdits([
+            TextEdit(NSRange(location: 0, length: 0), "ab", selection: NSRange(location: 0, length: 1)),
+            TextEdit(NSRange(location: 0, length: 0), "cd", selection: NSRange(location: 1, length: 0)),
+        ])
+        XCTAssertEqual(e.document.string as String, "abcdend")
+        XCTAssertEqual(e.textView.allSelections, [NSRange(location: 0, length: 1), NSRange(location: 3, length: 0)])
+    }
+
     func testDroppedWindowsTextIsNormalized() {
         let e = makeEditor("x\n")
         defer { e.close() }
