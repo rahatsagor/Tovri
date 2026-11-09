@@ -9,11 +9,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-09
+
 ### Added
 
 - **Richer Markdown preview.** The Markdown preview now supports footnotes
   (`[^1]`), highlighted text (`==mark==`), superscript and subscript (`^sup^`
-  and `~sub~`), definition lists, inline and block math (`$...$` and
+  and `~sub~`), definition lists, styled inline and block math (`$...$` and
   `$$...$$`), `[TOC]` tables of contents, structured YAML front matter,
   GitHub alerts with icons and custom titles, and a **Copy** button on code
   blocks.
@@ -28,12 +30,19 @@ and versions follow [Semantic Versioning](https://semver.org/).
   dragging a tab near the edge of the bar.
 - Opening a folder lays out the sidebar and window before first paint so the
   window appears without flickering.
-- Saving large files encodes in chunks to use less memory, and recent file
-  checks run in the background so slow or unmounted volumes don't stall the
-  interface.
+- Saving large UTF-8 and UTF-16 files encodes in chunks to use less memory, and
+  recent file checks run in the background so slow or unmounted volumes don't
+  stall the interface.
 
 ### Fixed
 
+- Large files using older text encodings preserve combining characters when
+  saved, and GB 18030 text containing a BOM character no longer crashes saving.
+- **Insert Line Before** keeps every caret in its new line when several carets
+  start on the same line, including after Undo and Redo.
+- Markdown tables of contents link to the rendered headings, including nested
+  and underlined headings. Footnotes keep distinct links, correct numbering
+  for nested references, and links back to every repeated reference.
 - Save-time cleanups (trimming trailing spaces and adding a final newline) no
   longer change the open document when a save is cancelled or blocked.
 - Changing the font weight in **Settings → Appearance** updates open
@@ -404,7 +413,8 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rahatsagor/Tovri/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rahatsagor/Tovri/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rahatsagor/Tovri/compare/v0.2.0...v0.2.1
