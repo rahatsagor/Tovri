@@ -192,17 +192,26 @@ final class AuditImprovementsTests: XCTestCase {
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(DummyScheme(), forURLScheme: MarkdownPreviewView.scheme)
         let wv = WKWebView(frame: NSRect(x: 0, y: 0, width: 500, height: 400), configuration: config)
-        wv.loadHTMLString("<!doctype html><html><body><div id=\"content\">\(html)</div></body></html>",
-                          baseURL: URL(string: "\(MarkdownPreviewView.scheme)://page/index.html")!)
+        final class NavigationObserver: NSObject, WKNavigationDelegate {
+            let loaded: XCTestExpectation
+            init(loaded: XCTestExpectation) { self.loaded = loaded }
+            func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loaded.fulfill() }
+        }
+        let loaded = expectation(description: "webkit navigation")
+        let observer = NavigationObserver(loaded: loaded)
+        wv.navigationDelegate = observer
+        withExtendedLifetime(observer) {
+            wv.loadHTMLString("<!doctype html><html><body><div id=\"content\">\(html)</div></body></html>",
+                              baseURL: URL(string: "\(MarkdownPreviewView.scheme)://page/index.html")!)
+            wait(for: [loaded], timeout: 10)
+        }
         let exp = expectation(description: "webkit parse")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            wv.evaluateJavaScript("[document.querySelector('details')?.textContent.includes('Terminal') ?? false, document.querySelector('div[align=center] h1')?.textContent ?? '']") { result, error in
-                XCTAssertNil(error)
-                let pair = result as? [Any]
-                XCTAssertEqual(pair?.first as? Bool, true, "Markdown body inside <details> was closed prematurely: \(html)")
-                XCTAssertEqual(pair?.last as? String, "Centered Heading")
-                exp.fulfill()
-            }
+        wv.evaluateJavaScript("[document.querySelector('details')?.textContent.includes('Terminal') ?? false, document.querySelector('div[align=center] h1')?.textContent ?? '']") { result, error in
+            XCTAssertNil(error)
+            let pair = result as? [Any]
+            XCTAssertEqual(pair?.first as? Bool, true, "Markdown body inside <details> was closed prematurely: \(html)")
+            XCTAssertEqual(pair?.last as? String, "Centered Heading")
+            exp.fulfill()
         }
         wait(for: [exp], timeout: 5)
     }
