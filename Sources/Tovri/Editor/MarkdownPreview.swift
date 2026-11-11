@@ -38,6 +38,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         super.init(frame: frame)
         messages.onLine = { [weak self] line in self?.topLine = line }
         messages.onRemoteContentBlocked = { [weak self] in self?.remoteContentWasBlocked() }
+        messages.onCopy = { text in MarkdownPreviewView.copyCodeText(text) }
         webView.setValue(false, forKey: "drawsBackground")
         webView.navigationDelegate = self
         webView.allowsMagnification = true
@@ -77,6 +78,11 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
             theme.chromeBorder.setFill()
             NSRect(x: 0, y: 0, width: 1, height: bounds.height).fill()
         }
+    }
+
+    static func copyCodeText(_ text: String, to pasteboard: NSPasteboard = .general) {
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 
     func focus() { window?.makeFirstResponder(webView) }
@@ -301,8 +307,30 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
             pre.appendChild(btn);
           }
         }
+        function tovriIsVisible(el) {
+          if (el.closest('[hidden]')) return false;
+          for (let p = el.parentElement; p && p.id !== 'content'; p = p.parentElement) {
+            if (p.tagName === 'DETAILS' && !p.open) {
+              if (p.hasAttribute('data-line')) return false;
+              const summary = p.querySelector(':scope > summary');
+              if (!summary || !summary.contains(el)) return false;
+            }
+          }
+          if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) return false;
+          return el.getClientRects().length > 0;
+        }
+        function tovriLineElements() {
+          const visible = [...document.querySelectorAll('#content [data-line]')].filter(tovriIsVisible);
+          const set = new Set(visible);
+          return visible.filter(el => {
+            for (const child of el.querySelectorAll('[data-line]')) {
+              if (set.has(child)) return false;
+            }
+            return true;
+          });
+        }
         function tovriScrollToLine(line) {
-          const els = document.querySelectorAll('#content > [data-line]');
+          const els = tovriLineElements();
           let best = null, next = null;
           for (const el of els) { const l = +el.dataset.line; if (l <= line) best = el; else { next = el; break; } }
           if (!best) { window.scrollTo(0, 0); return; }
@@ -326,9 +354,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
             const code = copyBtn.parentElement && copyBtn.parentElement.querySelector('code');
             if (code) {
               const text = code.textContent || '';
-              if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).catch(() => {});
-              }
+              window.webkit.messageHandlers.tovri.postMessage({ copy: text });
               copyBtn.textContent = 'Copied';
               copyBtn.classList.add('copied');
               setTimeout(() => { copyBtn.textContent = 'Copy'; copyBtn.classList.remove('copied'); }, 1400);
@@ -342,21 +368,21 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
           const el = document.getElementById(id) || document.getElementsByName(id)[0];
           if (el) el.scrollIntoView({ block: 'start' });
         });
-        let frame = 0, hideTimer = 0;
+        let scrollTimer = 0, hideTimer = 0;
         window.addEventListener('scroll', () => {
           document.documentElement.classList.add('scrolling');
           clearTimeout(hideTimer);
           hideTimer = setTimeout(() => document.documentElement.classList.remove('scrolling'), 900);
-          if (frame) return;
-          frame = requestAnimationFrame(() => {
-            frame = 0;
+          if (scrollTimer) return;
+          scrollTimer = setTimeout(() => {
+            scrollTimer = 0;
             let line = 0;
-            for (const el of document.querySelectorAll('#content > [data-line]')) {
+            for (const el of tovriLineElements()) {
               line = +el.dataset.line;
               if (el.getBoundingClientRect().bottom > 8) break;
             }
             window.webkit.messageHandlers.tovri.postMessage(line);
-          });
+          }, 16);
         }, { passive: true });
         </script></head><body><div id="content"></div></body></html>
         """
@@ -367,9 +393,13 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
 private final class PreviewMessageProxy: NSObject, WKScriptMessageHandler {
     var onLine: ((Int) -> Void)?
     var onRemoteContentBlocked: (() -> Void)?
+    var onCopy: ((String) -> Void)?
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         if let n = message.body as? Int { onLine?(n) } else if let d = message.body as? Double { onLine?(Int(d)) }
-        else if let d = message.body as? [String: Any], d["remoteBlocked"] as? Bool == true { onRemoteContentBlocked?() }
+        else if let d = message.body as? [String: Any] {
+            if d["remoteBlocked"] as? Bool == true { onRemoteContentBlocked?() }
+            if let text = d["copy"] as? String { onCopy?(text) }
+        }
     }
 }
 

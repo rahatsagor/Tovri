@@ -81,6 +81,7 @@ enum MainMenu {
         recentItem.submenu = recentMenu
         file.addItem(recentItem)
         add(file, "Reopen Closed Tab", #selector(MainWindowController.reopenClosedTab(_:)), "t", [.command, .shift])
+        add(file, "Reopen Closed Window", #selector(AppDelegate.reopenClosedWindow(_:)), "t", [.command, .option, .shift], target: app)
         file.addItem(.separator())
         add(file, "Save", #selector(MainWindowController.saveDocument(_:)), "s")
         add(file, "Save As…", #selector(MainWindowController.saveDocumentAs(_:)), "s", [.command, .shift])

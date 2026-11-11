@@ -214,6 +214,21 @@ extension EditorTextView {
     }
 
     func foldPlaceholder(at point: NSPoint) -> NSRange? {
-        tovriLayoutManager.folds.first { foldPlaceholderRect($0).insetBy(dx: -2, dy: -2).contains(point) }
+        let folds = tovriLayoutManager.folds
+        guard !folds.isEmpty else { return nil }
+        let vis = visibleCharacterRange
+        let minLoc = max(0, vis.location - 1)
+        let maxLoc = NSMaxRange(vis)
+        var lo = 0, hi = folds.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if folds[mid].location < minLoc { lo = mid + 1 } else { hi = mid }
+        }
+        var i = lo
+        while i < folds.count && folds[i].location <= maxLoc {
+            if foldPlaceholderRect(folds[i]).insetBy(dx: -2, dy: -2).contains(point) { return folds[i] }
+            i += 1
+        }
+        return nil
     }
 }

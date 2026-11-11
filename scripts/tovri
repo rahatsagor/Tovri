@@ -31,11 +31,24 @@ for arg in "$@"; do
     if [ $OPTIONS -eq 0 ]; then PATHS+=("$arg"); continue; fi
     case "$arg" in
         --) OPTIONS=0 ;;
-        -n|--new-window) NEW=1 ;;
-        -w|--wait) WAIT=1 ;;
-        -h|--help) usage; exit 0 ;;
+        --new-window) NEW=1 ;;
+        --wait) WAIT=1 ;;
+        --help) usage; exit 0 ;;
         -) STDIN=1 ;;
-        -*) echo "tovri: unknown option $arg" >&2; usage >&2; exit 2 ;;
+        --*) echo "tovri: unknown option $arg" >&2; usage >&2; exit 2 ;;
+        -*)
+            flags="${arg#-}"
+            while [ -n "$flags" ]; do
+                ch="${flags:0:1}"
+                flags="${flags:1}"
+                case "$ch" in
+                    n) NEW=1 ;;
+                    w) WAIT=1 ;;
+                    h) usage; exit 0 ;;
+                    *) echo "tovri: unknown option -$ch" >&2; usage >&2; exit 2 ;;
+                esac
+            done
+            ;;
         *) PATHS+=("$arg") ;;
     esac
 done

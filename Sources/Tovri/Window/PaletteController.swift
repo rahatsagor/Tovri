@@ -458,7 +458,13 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         }
 
         if q.isEmpty {
-            for url in openDocs + RecentFiles.shared.availableItems() where seen.insert(url.path).inserted {
+            let gen = loadGeneration
+            let recents = RecentFiles.shared.availableItems { [weak self] in
+                guard let self, self.isVisible, self.mode == .files, gen == self.loadGeneration else { return }
+                self.update()
+                self.layout()
+            }
+            for url in openDocs + recents where seen.insert(url.path).inserted {
                 items.append(make(url, url.lastPathComponent, rel(url)))
                 if items.count > 40 { break }
             }

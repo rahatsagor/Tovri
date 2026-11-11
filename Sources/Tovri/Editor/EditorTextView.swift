@@ -44,8 +44,10 @@ final class EditorTextView: NSTextView {
     var wholeWordNeedle: String?
     /// Column kept while repeatedly adding carets above/below, so short lines don't pull it left.
     var caretGoalColumn: Int?
-    /// For multiple selections: the fixed end of each selection extended with Shift, and the x
-    /// that Up and Down aim for, keyed by the selection they belong to.
+    /// For a single selection, the fixed end and vertical goal x when extending with Shift; for
+    /// multiple selections, both are keyed by selection.
+    private var singleAnchor: Int?
+    private var singleGoalX: CGFloat?
     private var multiAnchors: [NSRange: Int] = [:]
     private var multiGoalX: [NSRange: CGFloat] = [:]
 
@@ -562,6 +564,8 @@ final class EditorTextView: NSTextView {
         extraSelections = extras
         isSettingMulti = false
         caretGoalColumn = nil
+        singleGoalX = nil
+        singleAnchor = merged.count == 1 && merged[0].length == 0 ? merged[0].location : nil
         multiAnchors.removeAll()
         multiGoalX.removeAll()
         if scroll { scrollRangeToVisible(merged[pi]) }
@@ -580,10 +584,22 @@ final class EditorTextView: NSTextView {
             return
         }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        if ranges.count == 1, let r = ranges.first?.rangeValue {
+            if r.length == 0 {
+                singleAnchor = r.location
+            } else if let a = singleAnchor, a == r.location || a == NSMaxRange(r) {
+                // Keep `singleAnchor`: one end of the selection stayed at the anchor.
+            } else {
+                singleAnchor = nil
+            }
+        } else {
+            singleAnchor = nil
+        }
         if !isSettingMulti && !stillSelecting {
             if !extraSelections.isEmpty { extraSelections = [] }
             wholeWordNeedle = nil
             caretGoalColumn = nil
+            singleGoalX = nil
             if !multiAnchors.isEmpty || !multiGoalX.isEmpty {
                 multiAnchors.removeAll()
                 multiGoalX.removeAll()
@@ -1179,10 +1195,111 @@ final class EditorTextView: NSTextView {
     override func moveToBeginningOfLineAndModifySelection(_ sender: Any?) { smartHome(extend: true) }
     override func moveToLeftEndOfLineAndModifySelection(_ sender: Any?) { smartHome(extend: true) }
 
+    override func moveLeftAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveLeft:") { super.moveLeftAndModifySelection(sender) }
+    }
+    override func moveRightAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveRight:") { super.moveRightAndModifySelection(sender) }
+    }
+    override func moveBackwardAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveBackward:") { super.moveBackwardAndModifySelection(sender) }
+    }
+    override func moveForwardAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveForward:") { super.moveForwardAndModifySelection(sender) }
+    }
+    override func moveWordLeftAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveWordLeft:") { super.moveWordLeftAndModifySelection(sender) }
+    }
+    override func moveWordRightAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveWordRight:") { super.moveWordRightAndModifySelection(sender) }
+    }
+    override func moveWordBackwardAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveWordBackward:") { super.moveWordBackwardAndModifySelection(sender) }
+    }
+    override func moveWordForwardAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveWordForward:") { super.moveWordForwardAndModifySelection(sender) }
+    }
+    override func moveUpAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveUp:") { super.moveUpAndModifySelection(sender) }
+    }
+    override func moveDownAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveDown:") { super.moveDownAndModifySelection(sender) }
+    }
+    override func moveToEndOfLineAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveToEndOfLine:") { super.moveToEndOfLineAndModifySelection(sender) }
+    }
+    override func moveToRightEndOfLineAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveToRightEndOfLine:") { super.moveToRightEndOfLineAndModifySelection(sender) }
+    }
+    override func moveToBeginningOfParagraphAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveToBeginningOfParagraph:") { super.moveToBeginningOfParagraphAndModifySelection(sender) }
+    }
+    override func moveToEndOfParagraphAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveToEndOfParagraph:") { super.moveToEndOfParagraphAndModifySelection(sender) }
+    }
+    override func moveParagraphForwardAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveParagraphForward:") { super.moveParagraphForwardAndModifySelection(sender) }
+    }
+    override func moveParagraphBackwardAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveParagraphBackward:") { super.moveParagraphBackwardAndModifySelection(sender) }
+    }
+    override func moveToBeginningOfDocumentAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveToBeginningOfDocument:") { super.moveToBeginningOfDocumentAndModifySelection(sender) }
+    }
+    override func moveToEndOfDocumentAndModifySelection(_ sender: Any?) {
+        if !modifySelectionPreservingAnchor("moveToEndOfDocument:") { super.moveToEndOfDocumentAndModifySelection(sender) }
+    }
+
+    private func modifySelectionPreservingAnchor(_ baseSelector: String) -> Bool {
+        guard extraSelections.isEmpty else { return false }
+        let sel = selectedRange()
+        let anchor: Int
+        if sel.length == 0 {
+            anchor = sel.location
+        } else if let a = singleAnchor, a == sel.location || a == NSMaxRange(sel) {
+            anchor = a
+        } else {
+            anchor = selectionAffinity == .downstream ? sel.location : NSMaxRange(sel)
+        }
+        let head = anchor == sel.location ? NSMaxRange(sel) : sel.location
+        let vertical = baseSelector == "moveUp:" || baseSelector == "moveDown:"
+        let savedGoal = singleGoalX
+        let newHead: Int
+        let nextGoal: CGFloat?
+        isSettingMulti = true
+        if vertical {
+            let (loc, goal) = moveVertically(from: head, up: baseSelector == "moveUp:", goal: savedGoal)
+            newHead = loc
+            nextGoal = goal
+        } else {
+            newHead = moveCaret(from: head, baseSelector)
+            nextGoal = nil
+        }
+        isSettingMulti = false
+        let affinity: NSSelectionAffinity = newHead < anchor ? .upstream : .downstream
+        setSelectedRange(NSRange(location: min(anchor, newHead), length: abs(newHead - anchor)),
+                         affinity: affinity, stillSelecting: false)
+        singleAnchor = anchor
+        singleGoalX = nextGoal
+        scrollRangeToVisible(NSRange(location: newHead, length: 0))
+        return true
+    }
+
     private func smartHome(extend: Bool) {
         let sel = selectedRange()
-        let caret = sel.location
-        let anchor = NSMaxRange(sel)
+        let anchor: Int
+        let caret: Int
+        if extend, sel.length > 0 {
+            if let a = singleAnchor, a == sel.location || a == NSMaxRange(sel) {
+                anchor = a
+            } else {
+                anchor = selectionAffinity == .downstream ? sel.location : NSMaxRange(sel)
+            }
+            caret = anchor == sel.location ? NSMaxRange(sel) : sel.location
+        } else {
+            anchor = NSMaxRange(sel)
+            caret = sel.location
+        }
         let r = lineRange(at: caret)
         var start = r.location
         if let lm = layoutManager, textContainer?.widthTracksTextView == true, caret < document.length {
@@ -1199,7 +1316,11 @@ final class EditorTextView: NSTextView {
         }
         let target = caret == firstNonWS ? r.location : firstNonWS
         if extend {
-            setSelectedRange(NSRange(location: min(target, anchor), length: abs(anchor - target)))
+            let keptAnchor = singleAnchor ?? anchor
+            let affinity: NSSelectionAffinity = target < anchor ? .upstream : .downstream
+            setSelectedRange(NSRange(location: min(target, anchor), length: abs(anchor - target)),
+                             affinity: affinity, stillSelecting: false)
+            singleAnchor = keptAnchor
         } else {
             setSelectedRange(NSRange(location: target, length: 0))
         }
@@ -1315,6 +1436,11 @@ final class EditorTextView: NSTextView {
     }
 
     private func moveCaret(from head: Int, _ selector: String) -> Int {
+        switch selector {
+        case "moveToBeginningOfDocument:": return 0
+        case "moveToEndOfDocument:": return document.length
+        default: break
+        }
         super.setSelectedRanges([NSValue(range: NSRange(location: head, length: 0))], affinity: .downstream, stillSelecting: false)
         switch selector {
         // These have no plain counterpart; they go to the paragraph's end, or the next one's.

@@ -282,8 +282,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         }
         updatePlaceholder()
         needsLayout = true
-        guard let root else { return }
-        refresh(node: root, recursive: true)
+        refreshTree()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -376,10 +375,29 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         for n in nodes { refresh(node: n, recursive: false) }
     }
 
-    private func refresh(node: FileNode, recursive: Bool) {
+    private func reloadLoadedTree(_ node: FileNode) {
         guard node.children != nil else { return }
         node.loadChildren()
-        if recursive { for c in node.children ?? [] where c.isDirectory && c.children != nil { c.loadChildren() } }
+        nodesByPath[norm(node.path)] = node
+        for c in node.children ?? [] where c.isDirectory && c.children != nil {
+            reloadLoadedTree(c)
+        }
+    }
+
+    func refreshTree() {
+        guard let root else { return }
+        refresh(node: root, recursive: true)
+    }
+
+    private func refresh(node: FileNode, recursive: Bool) {
+        guard node.children != nil else { return }
+        if recursive {
+            if node === root { nodesByPath.removeAll() }
+            reloadLoadedTree(node)
+        } else {
+            node.loadChildren()
+            nodesByPath[norm(node.path)] = node
+        }
         outline.reloadItem(node === root ? nil : node, reloadChildren: true)
     }
 
@@ -741,8 +759,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     @objc private func refreshMenu() {
         if isShowingChanges { delegate?.sidebarNeedsChanges(self); return }
-        guard let root else { return }
-        refresh(node: root, recursive: true)
+        refreshTree()
     }
     private func reloadDirectory(_ url: URL) {
         if let n = nodesByPath[norm(url.path)] { refresh(node: n, recursive: false) }

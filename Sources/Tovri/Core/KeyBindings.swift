@@ -88,6 +88,7 @@ final class KeyBindings: ObservableObject {
 
     @Published private(set) var commands: [CommandBinding] = []
     private var defaults: [String: KeyShortcut?] = [:]
+    private var hiddenDefaults: [ObjectIdentifier: KeyShortcut] = [:]
     private var overrides: [String: String]
     static let storeKey = "keyBindings"
     private var storeKey: String { KeyBindings.storeKey }
@@ -120,10 +121,28 @@ final class KeyBindings: ObservableObject {
         }
     }
 
+    private func walkHiddenAlternates(_ menu: NSMenu, path: [String], _ visit: (NSMenuItem, String) -> Void) {
+        for item in menu.items where !item.isSeparatorItem {
+            if let sub = item.submenu {
+                if KeyBindings.skippedSubmenus.contains(item.title) { continue }
+                walkHiddenAlternates(sub, path: path + [item.title], visit)
+                continue
+            }
+            if item.isHidden && item.allowsKeyEquivalentWhenHidden {
+                let p = path.joined(separator: " › ")
+                visit(item, p + "/" + item.title)
+            }
+        }
+    }
+
     func install(on menu: NSMenu) {
         self.menu = menu
         walk(menu, path: []) { item, id, _ in
             if defaults[id] == nil { defaults[id] = .some(KeyShortcut(item: item)) }
+        }
+        walkHiddenAlternates(menu, path: []) { item, _ in
+            let key = ObjectIdentifier(item)
+            if hiddenDefaults[key] == nil, let sc = KeyShortcut(item: item) { hiddenDefaults[key] = sc }
         }
         apply()
     }
@@ -136,11 +155,27 @@ final class KeyBindings: ObservableObject {
     private func apply() {
         guard let menu else { return }
         var list: [CommandBinding] = []
+        var claimed: [KeyShortcut] = []
         walk(menu, path: []) { item, id, path in
             let sc = current(for: id)
             item.keyEquivalent = sc?.key ?? ""
             item.keyEquivalentModifierMask = sc?.modifiers ?? []
+            if let sc { claimed.append(sc) }
             list.append(CommandBinding(id: id, title: item.title, path: path, defaultShortcut: defaults[id] ?? nil, shortcut: sc))
+        }
+        // Hidden alternate shortcuts yield whenever a visible command uses the same keys or
+        // when their owning command's shortcut has been cleared.
+        walkHiddenAlternates(menu, path: []) { item, ownerID in
+            guard let def = hiddenDefaults[ObjectIdentifier(item)] else { return }
+            let ownerCleared = defaults.keys.contains(ownerID) && current(for: ownerID) == nil
+            let shiftedPlusOrphaned = def.key == "+" && current(for: ownerID) != (defaults[ownerID] ?? nil)
+            if claimed.contains(def) || ownerCleared || shiftedPlusOrphaned {
+                item.keyEquivalent = ""
+                item.keyEquivalentModifierMask = []
+            } else {
+                item.keyEquivalent = def.key
+                item.keyEquivalentModifierMask = def.modifiers
+            }
         }
         commands = list
     }

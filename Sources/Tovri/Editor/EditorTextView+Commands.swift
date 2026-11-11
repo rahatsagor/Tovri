@@ -745,12 +745,23 @@ extension EditorTextView {
         guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { NSSound.beep(); return }
         do {
             var result = try JSONFormatter.reformat(source, indent: pretty ? indentUnit : nil)
-            if pretty && sel.length > 0 {
-                // Keep a value formatted inside a larger file aligned with the line it starts on.
+            let isSubSelection = sel.length > 0 && sel != NSRange(location: 0, length: document.length)
+            if isSubSelection {
+                // Keep a value formatted inside a larger file aligned with the line it starts on,
+                // including when the selection begins at column 0 of an indented line.
                 let lineStart = document.lines.start(of: document.lines.line(containing: sel.location))
-                let lead = text.substring(with: NSRange(location: lineStart, length: sel.location - lineStart))
-                let indent = String(lead.prefix { $0 == " " || $0 == "\t" })
-                if !indent.isEmpty { result = result.replacingOccurrences(of: "\n", with: "\n" + indent) }
+                if sel.location > lineStart {
+                    let lead = text.substring(with: NSRange(location: lineStart, length: sel.location - lineStart))
+                    let indent = String(lead.prefix { $0 == " " || $0 == "\t" })
+                    if pretty && !indent.isEmpty { result = result.replacingOccurrences(of: "\n", with: "\n" + indent) }
+                } else {
+                    let firstLine = source.split(separator: "\n", omittingEmptySubsequences: true)
+                        .first { !$0.allSatisfy { $0 == " " || $0 == "\t" || $0 == "\r" } }
+                    let indent = firstLine.map { String($0.prefix { $0 == " " || $0 == "\t" }) } ?? ""
+                    if !indent.isEmpty {
+                        result = indent + (pretty ? result.replacingOccurrences(of: "\n", with: "\n" + indent) : result)
+                    }
+                }
             }
             if source.hasSuffix("\n") { result += "\n" }
             guard result != source else { return }

@@ -2,7 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private(set) var controllers: [MainWindowController] = []
     private(set) var isTerminating = false
     private var pendingURLs: [URL] = []
@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = Settings.shared
+        _ = RecentFiles.shared.availableItems()
         ThemeManager.shared.refresh()
         appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { _, _ in
             DispatchQueue.main.async { ThemeManager.shared.refresh() }
@@ -137,6 +138,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.flatMap { Int($0) }.map { min(max($0, 1), 100_000_000) }
     }
 
+    static func decodeStandardInput(_ data: Data) -> (text: String, encoding: TextEncoding) {
+        let decoded = TextEncoding.decode(data)
+        return (decoded.text, decoded.isBinary ? .utf8 : decoded.encoding)
+    }
+
     /// Handles `tovri://open?req=<hex path>`. The request file holds the CLI's query
     /// (`path=<hex>&line=&col=&new=1&wait=<id>&stdin=<hex>`); any other tovri:// URL only
     /// brings Tovri to the front.
@@ -167,10 +173,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let tmp = AppDelegate.unhex(q["stdin"]) {
             guard let file = AppDelegate.cliTempFile(tmp, prefix: "tovri-stdin.") else { finish(nil); return }
-            let text = (try? String(contentsOf: file, encoding: .utf8)) ?? (try? String(contentsOf: file, encoding: .isoLatin1)) ?? ""
+            let data = (try? Document.readFile(file)) ?? Data()
             try? FileManager.default.removeItem(at: file)
+            let decoded = AppDelegate.decodeStandardInput(data)
             let c = target()
-            finish(c.openText(text))
+            finish(c.openText(decoded.text, encoding: decoded.encoding))
             c.window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -310,9 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Runs from windowShouldClose, while failure can still keep every editor alive.
     func saveSessionBeforeClosingWindow(_ c: MainWindowController) -> Bool {
         guard saveSessionBeforeExit() else { return false }
-        var s = c.sessionState()
-        s.closed = true
-        closedWindows = AppDelegate.remembering(closedWindows, closing: s)
+        recordClosedWindow(c.sessionState())
         return true
     }
 
@@ -326,10 +331,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Settings.shared.hotExit && controllers.count == 1 && controllers.first === c
     }
 
+    var canReopenClosedWindow: Bool { !closedWindows.isEmpty }
+
+    func recordClosedWindow(_ session: WindowSession) {
+        var s = session
+        s.closed = true
+        closedWindows = AppDelegate.remembering(closedWindows, closing: s)
+    }
+
     @discardableResult
     private func reopenLastWindowOrCreate() -> MainWindowController {
         guard let s = closedWindows.popLast() else { return newWindow() }
-        return restoreClosed(s)
+        let c = restoreClosed(s)
+        SessionStore.shared.setNeedsSave()
+        return c
+    }
+
+    @discardableResult
+    @objc func reopenClosedWindow(_ sender: Any?) -> MainWindowController? {
+        guard let s = closedWindows.popLast() else { NSSound.beep(); return nil }
+        let c = restoreClosed(s)
+        c.window?.makeKeyAndOrderFront(nil)
+        SessionStore.shared.setNeedsSave()
+        return c
     }
 
     private func restoreClosed(_ s: WindowSession) -> MainWindowController {
@@ -499,6 +523,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for item in items(#selector(makeDefaultEditor(_:)), in: NSApp.mainMenu) {
             item.isHidden = integration.isDefaultEditor
         }
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(reopenClosedWindow(_:)) { return canReopenClosedWindow }
+        if menuItem.action == #selector(clearRecent(_:)) { return !RecentFiles.shared.paths.isEmpty }
+        return true
     }
 
     // MARK: Recent menu

@@ -367,7 +367,7 @@ final class FindInFilesPanel: NSObject, NSTextFieldDelegate {
             let sel = e.textView.selectedRange()
             if sel.length > 0 && sel.length < 300 {
                 let s = e.document.string.substring(with: sel)
-                if !s.contains("\n") { query = s }
+                if !s.contains("\n") { query = st.regex ? NSRegularExpression.escapedPattern(for: s) : s }
             }
         }
         findField.stringValue = query

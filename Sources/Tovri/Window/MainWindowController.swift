@@ -656,8 +656,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     /// Opens text (e.g. piped from the CLI) in a new untitled tab.
-    func openText(_ text: String) -> Document {
+    func openText(_ text: String, encoding: TextEncoding = .utf8) -> Document {
         let doc = Document()
+        doc.encoding = encoding
         let (text, ending) = LineEnding.normalize(text, rawData: nil)
         doc.lineEnding = ending
         doc.restoreBuffer(text)
@@ -1522,7 +1523,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let s = FileSearcher()
         searcher = s
         var options = options
-        options.unsaved = unsavedTexts(under: options.root)
+        let openInputs = openSearchInputs(under: options.root)
+        options.unsaved = openInputs.unsaved
+        options.languages = openInputs.languages
         statusBar.message = "Searching for “\(options.query)”…"
         let started = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self, options] in
@@ -1547,17 +1550,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
     }
 
-    /// Open documents with unsaved edits inside `root`, by path relative to it, so Find in Files
-    /// searches what's on screen rather than the older file on disk.
-    private func unsavedTexts(under root: URL) -> [String: String] {
-        var out: [String: String] = [:]
+    /// Open documents inside `root`, by path relative to it, so Find in Files searches unsaved
+    /// buffer text and uses each open document's active language for Whole Word matching.
+    func openSearchInputs(under root: URL) -> (unsaved: [String: String], languages: [String: Language]) {
+        var unsaved: [String: String] = [:]
+        var languages: [String: Language] = [:]
         let rootPath = root.realPathURL.path
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        for d in (NSApp.delegate as? AppDelegate)?.controllers.flatMap({ $0.allOpenDocuments() }) ?? allOpenDocuments() where d.isDirty {
+        let docs = (NSApp.delegate as? AppDelegate)?.controllers.flatMap({ $0.allOpenDocuments() }) ?? allOpenDocuments()
+        for d in docs where !d.isTransient {
             guard let path = d.url?.realPathURL.path, path.hasPrefix(prefix) else { continue }
-            out[String(path.dropFirst(prefix.count))] = d.string.copy() as? String
+            let rel = String(path.dropFirst(prefix.count))
+            languages[rel] = d.language
+            if d.isDirty, unsaved[rel] == nil {
+                unsaved[rel] = d.string.copy() as? String
+            }
         }
-        return out
+        return (unsaved, languages)
     }
 
     @discardableResult
@@ -2224,22 +2233,40 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     // MARK: Help
 
-    @objc func showKeyboardShortcuts(_ sender: Any?) {
-        guard let main = NSApp.mainMenu else { return }
+    static func keyboardShortcutsText(for main: NSMenu) -> String {
         var text = "Tovri Keyboard Shortcuts\n========================\n\n"
         func walk(_ menu: NSMenu, depth: Int) {
+            var rows: [(title: String, shortcuts: [String])] = []
             for item in menu.items where !item.isSeparatorItem {
                 if let sub = item.submenu {
+                    guard !item.isHidden else { continue }
                     if ["Open Recent", "Services", "Window", "Syntax", "Theme"].contains(item.title) { continue }
+                    if !rows.isEmpty {
+                        for r in rows {
+                            text += "- " + r.title.padding(toLength: 44, withPad: " ", startingAt: 0) + r.shortcuts.joined(separator: " / ") + "\n"
+                        }
+                        rows = []
+                        text += "\n"
+                    }
                     let header = item.title
                     if depth == 0 { text += "## \(header)\n\n" } else { text += "### \(header)\n" }
                     walk(sub, depth: depth + 1)
                     text += "\n"
                     continue
                 }
+                if item.isHidden && !item.allowsKeyEquivalentWhenHidden { continue }
+                // Hidden `⌘+` is only the shifted alias for `⌘=`.
+                if item.isHidden && item.keyEquivalent == "+" { continue }
                 let sc = MainWindowController.shortcutString(item)
                 guard !sc.isEmpty else { continue }
-                text += "- " + item.title.padding(toLength: 44, withPad: " ", startingAt: 0) + sc + "\n"
+                if let idx = rows.firstIndex(where: { $0.title == item.title }) {
+                    if !rows[idx].shortcuts.contains(sc) { rows[idx].shortcuts.append(sc) }
+                } else {
+                    rows.append((item.title, [sc]))
+                }
+            }
+            for r in rows {
+                text += "- " + r.title.padding(toLength: 44, withPad: " ", startingAt: 0) + r.shortcuts.joined(separator: " / ") + "\n"
             }
         }
         walk(main, depth: 0)
@@ -2254,6 +2281,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         - Find: next / previous / select all          ↩ / ⇧↩ / ⌥↩
 
         """
+        return text
+    }
+
+    @objc func showKeyboardShortcuts(_ sender: Any?) {
+        guard let main = NSApp.mainMenu else { return }
+        let text = MainWindowController.keyboardShortcutsText(for: main)
         let doc = Document(text: text, name: "Keyboard Shortcuts", language: LanguageRegistry.shared.language(id: "markdown") ?? LanguageRegistry.shared.plain)
         doc.isTransient = true
         doc.isReadOnly = true
@@ -2354,7 +2387,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 ts.bookmarks = d.bookmarks.isEmpty ? nil : d.bookmarks.lines
                 if Settings.shared.hotExit && (d.isDirty || (d.url == nil && d.length > 0)) {
                     ts.buffer = SessionStore.shared.bufferName(for: d)
-                    if ts.buffer != nil { ts.diskStamp = d.lastReadDiskStamp }
+                    if let buf = ts.buffer {
+                        ts.diskStamp = d.lastReadDiskStamp
+                        // Throttled large-buffer saves reuse an earlier written buffer; record its actual version.
+                        if let src = SessionStore.backupSource(ofBufferNamed: buf) { ts.editVersion = src.version }
+                    }
                 } else if d.url == nil && d.length == 0 {
                     continue
                 }

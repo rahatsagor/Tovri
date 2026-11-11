@@ -246,6 +246,16 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
         return s
     }
 
+    /// Top-left position where an invisible character at `charIndex` is drawn, or nil when hidden by a fold.
+    func invisibleDrawPosition(forCharacterAt charIndex: Int, at origin: NSPoint = .zero) -> NSPoint? {
+        if !folds.isEmpty, fold(at: charIndex) != nil { return nil }
+        let g = glyphIndexForCharacter(at: charIndex)
+        let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil, withoutAdditionalLayout: true)
+        let top = gaps == nil ? frag.minY : lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil, withoutAdditionalLayout: true).minY
+        let loc = location(forGlyphAt: g)
+        return NSPoint(x: origin.x + frag.minX + loc.x, y: origin.y + top + baseline - font.ascender)
+    }
+
     override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
         if showInvisibles, let storage = textStorage {
             let chars = storage.mutableString
@@ -253,14 +263,13 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
             let end = NSMaxRange(charRange)
             var i = charRange.location
             while i < end {
+                if !folds.isEmpty, let f = fold(at: i) {
+                    i = NSMaxRange(f)
+                    continue
+                }
                 let c = chars.character(at: i)
-                if c == 32 || c == 9 || c == 10 {
-                    let g = glyphIndexForCharacter(at: i)
-                    let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil, withoutAdditionalLayout: true)
-                    let loc = location(forGlyphAt: g)
-                    let s = invisible(c)
-                    let p = NSPoint(x: origin.x + frag.minX + loc.x, y: origin.y + frag.minY + baseline - font.ascender)
-                    s.draw(at: p)
+                if c == 32 || c == 9 || c == 10, let p = invisibleDrawPosition(forCharacterAt: i, at: origin) {
+                    invisible(c).draw(at: p)
                 }
                 i += 1
             }

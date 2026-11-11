@@ -66,6 +66,7 @@ struct MarkdownRenderer {
     private static let alertRe = try! NSRegularExpression(pattern: #"^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:[ \t]+(.*))?$"#, options: .caseInsensitive)
     private static let frontMatterKVRe = try! NSRegularExpression(pattern: #"^([A-Za-z0-9_.-]+)[ \t]*:[ \t]*(.*)$"#)
     private static let htmlBlockRe = try! NSRegularExpression(pattern: #"^ {0,3}<(/?(?:address|article|aside|blockquote|details|summary|dialog|div|dl|dt|dd|fieldset|figure|figcaption|footer|form|h[1-6]|header|hr|iframe|li|main|nav|ol|p|picture|pre|section|source|table|tbody|td|tfoot|th|thead|tr|ul|video|audio|img|br|center)\b|!--)"#, options: .caseInsensitive)
+    private static let htmlOpeningTagRe = try! NSRegularExpression(pattern: #"^( {0,3}<[A-Za-z][A-Za-z0-9-]*)(?=\s|>|/>)"#)
 
     private func match(_ re: NSRegularExpression, _ s: String) -> NSTextCheckingResult? {
         re.firstMatch(in: s, range: NSRange(location: 0, length: (s as NSString).length))
@@ -159,11 +160,27 @@ struct MarkdownRenderer {
         return n
     }
 
+    private func visualWidth(of s: String) -> Int {
+        var n = 0
+        for c in s { if c == "\t" { n += 4 - n % 4 } else { n += 1 } }
+        return n
+    }
+
     private func dedent(_ s: String, _ count: Int) -> String {
         var removed = 0
         var idx = s.startIndex
         while idx < s.endIndex && removed < count {
-            if s[idx] == " " { removed += 1 } else if s[idx] == "\t" { removed += 4 - removed % 4 } else { break }
+            if s[idx] == " " {
+                removed += 1
+            } else if s[idx] == "\t" {
+                let step = 4 - removed % 4
+                if removed + step > count {
+                    return String(repeating: " ", count: removed + step - count) + String(s[s.index(after: idx)...])
+                }
+                removed += step
+            } else {
+                break
+            }
             idx = s.index(after: idx)
         }
         return String(s[idx...])
@@ -175,6 +192,19 @@ struct MarkdownRenderer {
             match(MarkdownRenderer.hrRe, s) != nil || trimmed.hasPrefix(">") ||
             (indent(of: s) < 4 && trimmed.hasPrefix("$$")) ||
             match(MarkdownRenderer.listRe, s) != nil || match(MarkdownRenderer.htmlBlockRe, s) != nil
+    }
+
+    private func startsTable(_ lines: ArraySlice<String>, at k: Int) -> Bool {
+        k + 1 < lines.endIndex && lines[k].contains("|")
+            && match(MarkdownRenderer.tableDelimRe, lines[k + 1]) != nil
+            && lines[k + 1].contains("-")
+    }
+
+    private func annotateHTMLOpeningTag(_ line: String, attr a: String) -> String {
+        guard !a.isEmpty, !line.contains("data-line="),
+              let m = match(MarkdownRenderer.htmlOpeningTagRe, line) else { return line }
+        let ns = line as NSString
+        return ns.substring(to: m.range.length) + a + ns.substring(from: m.range.length)
     }
 
     private func attr(_ line: Int, _ top: Bool) -> String { top ? " data-line=\"\(line)\"" : "" }
@@ -287,7 +317,7 @@ struct MarkdownRenderer {
                         var rest = Substring(trimmed.dropFirst())
                         if rest.hasPrefix(" ") { rest = rest.dropFirst() }
                         inner.append(String(rest))
-                    } else if !isBlank(t) && !inner.isEmpty && !isBlank(inner.last!) && !startsBlock(t) {
+                    } else if !isBlank(t) && !inner.isEmpty && !isBlank(inner.last!) && !startsBlock(t) && !startsTable(lines, at: k) {
                         inner.append(t)
                     } else { break }
                     k += 1
@@ -321,7 +351,7 @@ struct MarkdownRenderer {
                 continue
             }
 
-            if i + 1 < end, line.contains("|"), match(MarkdownRenderer.tableDelimRe, lines[i + 1]) != nil, lines[i + 1].contains("-") {
+            if startsTable(lines, at: i) {
                 i = renderTable(lines, from: i, attr: a, into: &out)
                 continue
             }
@@ -329,8 +359,20 @@ struct MarkdownRenderer {
             if match(MarkdownRenderer.htmlBlockRe, line) != nil {
                 var k = i
                 var html: [String] = []
-                while k < end && !isBlank(lines[k]) { html.append(lines[k]); k += 1 }
-                out += "<div class=\"html\"\(a)>" + html.joined(separator: "\n") + "</div>\n"
+                if trimmedLine.hasPrefix("<!--") {
+                    while k < end {
+                        html.append(lines[k])
+                        let closed = lines[k].contains("-->")
+                        k += 1
+                        if closed { break }
+                    }
+                } else {
+                    while k < end && !isBlank(lines[k]) { html.append(lines[k]); k += 1 }
+                }
+                if !html.isEmpty { html[0] = annotateHTMLOpeningTag(html[0], attr: a) }
+                // Emit raw HTML without wrapping it in a synthetic <div>...</div>, which would
+                // force HTML5 to prematurely close multi-paragraph containers like <details>.
+                out += html.joined(separator: "\n") + "\n"
                 i = k
                 continue
             }
@@ -361,7 +403,7 @@ struct MarkdownRenderer {
                     let trimmed = t.trimmingCharacters(in: .whitespaces)
                     if !trimmed.isEmpty && trimmed.allSatisfy({ $0 == "=" }) { setext = 1; k += 1; break }
                     if !trimmed.isEmpty && trimmed.allSatisfy({ $0 == "-" }) && trimmed.count >= 2 { setext = 2; k += 1; break }
-                    if startsBlock(t) || match(MarkdownRenderer.defLineRe, t) != nil { break }
+                    if startsBlock(t) || startsTable(lines, at: k) || match(MarkdownRenderer.defLineRe, t) != nil { break }
                 }
                 para.append(t.trimmingCharacters(in: .whitespaces) == t ? t : String(t.drop(while: { $0 == " " })))
                 k += 1
@@ -535,8 +577,10 @@ struct MarkdownRenderer {
                 if mk.first!.isNumber != ordered || (!ordered && mk != marker) { break }
                 if blankPending { loose = true }
                 blankPending = false
-                let contentIndent = m.range.length
-                let content = (line as NSString).substring(from: min(m.range.length, (line as NSString).length))
+                let nsLine = line as NSString
+                let splitAt = min(m.range.length, nsLine.length)
+                let contentIndent = visualWidth(of: nsLine.substring(to: splitAt))
+                let content = nsLine.substring(from: splitAt)
                 items.append((lineOffset + (i - lines.startIndex), [content]))
                 var k = i + 1
                 while k < end {
@@ -551,7 +595,7 @@ struct MarkdownRenderer {
                         items[items.count - 1].body.append(dedent(t, contentIndent))
                     } else if tIndent > baseIndent && match(MarkdownRenderer.anyListRe, t) != nil {
                         items[items.count - 1].body.append(dedent(t, tIndent))
-                    } else if match(MarkdownRenderer.listRe, t) == nil && !startsBlock(t) && items[items.count - 1].body.last != "" {
+                    } else if match(MarkdownRenderer.listRe, t) == nil && !startsBlock(t) && !startsTable(lines, at: k) && items[items.count - 1].body.last != "" {
                         items[items.count - 1].body.append(t.trimmingCharacters(in: .whitespaces))
                     } else { break }
                     k += 1
@@ -560,6 +604,7 @@ struct MarkdownRenderer {
                     items[items.count - 1].body.removeLast()
                     blankPending = true
                 }
+                if items[items.count - 1].body.contains("") { loose = true }
                 i = k
                 if i < end, isBlank(lines[i]) { blankPending = true; i += 1 }
                 while i < end, isBlank(lines[i]) { i += 1 }

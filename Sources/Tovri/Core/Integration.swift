@@ -41,14 +41,24 @@ final class Integration: ObservableObject {
         }
     }
 
+    /// True when the app is running from Gatekeeper App Translocation or a read-only disk image,
+    /// where a symlink into the bundle would break as soon as the app closes or the image ejects.
+    /// Permanent APFS or external volumes under `/Volumes` are allowed.
+    static func isTemporaryOrDiskImageLocation(_ url: URL) -> Bool {
+        if url.path.contains("/AppTranslocation/") { return true }
+        guard let v = try? url.resourceValues(forKeys: [.volumeIsReadOnlyKey, .volumeIsEjectableKey, .volumeIsRemovableKey]) else {
+            return false
+        }
+        return v.volumeIsReadOnly == true && (v.volumeIsEjectable == true || v.volumeIsRemovable == true)
+    }
+
     /// Links `tovri` into the first writable bin directory on the usual PATH; no admin rights are
     /// needed when Homebrew's prefix exists. Otherwise copies the one-line sudo command.
     func installCommandLine() {
         guard let script = launcher else { NSSound.beep(); return }
         let fm = FileManager.default
         let alert = NSAlert()
-        // A link into a translocated or mounted copy breaks once the disk image is ejected.
-        if script.path.contains("/AppTranslocation/") || script.path.hasPrefix("/Volumes/") {
+        if Integration.isTemporaryOrDiskImageLocation(script) {
             alert.messageText = "Move Tovri to Applications first"
             alert.informativeText = "Tovri is running from a disk image or a temporary location. Drag it to the Applications folder, open it from there, and install the command again."
             alert.runModal()

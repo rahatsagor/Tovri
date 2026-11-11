@@ -74,7 +74,25 @@ final class GitRepository {
     let root: URL
     private static var cache: [String: GitRepository] = [:]
     private static let cacheLock = NSLock()
-    private static let queue = DispatchQueue(label: "app.tovri.git", qos: .utility, attributes: .concurrent)
+    /// Caps concurrent background git processes (e.g. when restoring dozens of tabs at launch).
+    private static let queue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "app.tovri.git"
+        q.qualityOfService = .utility
+        q.maxConcurrentOperationCount = 4
+        return q
+    }()
+    private static func runAsync(_ work: @escaping () -> Void) { queue.addOperation(work) }
+
+    /// Maximum bytes read from a committed blob (`headContents` / `contents(of:at:)`).
+    static let maxBlobSize = 20_000_000
+
+    private struct FilterCacheStamp: Equatable {
+        let env: [String: String]
+        let files: [DiskStamp?]
+    }
+    private let filterLock = NSLock()
+    private var cachedFilters: (stamp: FilterCacheStamp, expiresAt: TimeInterval, names: Set<String>)?
 
     static let executable: String? = {
         let fm = FileManager.default
@@ -226,17 +244,108 @@ final class GitRepository {
         return env
     }
 
-    private func run(_ args: [String], acceptedStatuses: Set<Int32> = [0]) -> Data? {
+    private func run(_ args: [String], acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = nil) -> Data? {
         guard let filters = configuredFilters() else { return nil }
-        return rawRun(args, GitRepository.safetySettings + GitRepository.filterSettings(names: filters), acceptedStatuses: acceptedStatuses)
+        return rawRun(args, GitRepository.safetySettings + GitRepository.filterSettings(names: filters),
+                      acceptedStatuses: acceptedStatuses, maxOutputBytes: maxOutputBytes)
+    }
+
+    private static let defaultSystemConfigPaths: [URL] = {
+        guard let git = executable else { return [URL(fileURLWithPath: "/etc/gitconfig")] }
+        var urls: [URL] = []
+        var seen = Set<String>()
+        func add(_ url: URL) {
+            let std = url.standardizedFileURL
+            if seen.insert(std.path).inserted { urls.append(std) }
+        }
+        if let data = runProcess(URL(fileURLWithPath: git), ["var", "GIT_CONFIG_SYSTEM"],
+                                 environment: ["LC_ALL": "C", "PATH": "/usr/bin:/bin"], timeout: 5),
+           let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !s.isEmpty {
+            add(URL(fileURLWithPath: s))
+        }
+        let execURL = URL(fileURLWithPath: git)
+        for bin in [execURL, execURL.resolvingSymlinksInPath()] {
+            let prefix = bin.deletingLastPathComponent().deletingLastPathComponent()
+            add(prefix.appendingPathComponent("etc/gitconfig"))
+        }
+        add(URL(fileURLWithPath: "/etc/gitconfig"))
+        add(URL(fileURLWithPath: "/opt/homebrew/etc/gitconfig"))
+        add(URL(fileURLWithPath: "/usr/local/etc/gitconfig"))
+        add(URL(fileURLWithPath: "/Library/Developer/CommandLineTools/usr/etc/gitconfig"))
+        return urls
+    }()
+
+    private func filterCacheStamp() -> FilterCacheStamp {
+        let env = GitRepository.userEnvironment
+        let dir = gitDir
+        var paths = GitRepository.defaultSystemConfigPaths
+        if let sys = env["GIT_CONFIG_SYSTEM"], !sys.isEmpty {
+            paths.append(URL(fileURLWithPath: sys))
+        }
+        if let global = env["GIT_CONFIG_GLOBAL"], !global.isEmpty {
+            paths.append(URL(fileURLWithPath: global))
+        }
+        if let explicit = env["GIT_CONFIG"], !explicit.isEmpty {
+            paths.append(URL(fileURLWithPath: explicit))
+        }
+        paths.append(dir.appendingPathComponent("config"))
+        paths.append(dir.appendingPathComponent("config.worktree"))
+        if let common = try? String(contentsOf: dir.appendingPathComponent("commondir"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !common.isEmpty {
+            let commonDir = URL(fileURLWithPath: common, relativeTo: dir).standardizedFileURL
+            paths.append(commonDir.appendingPathComponent("config"))
+            paths.append(commonDir.appendingPathComponent("config.worktree"))
+        }
+        if let home = env["HOME"], !home.isEmpty {
+            let homeURL = URL(fileURLWithPath: home, isDirectory: true)
+            paths.append(homeURL.appendingPathComponent(".gitconfig"))
+            let xdg = env["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? homeURL.appendingPathComponent(".config", isDirectory: true)
+            paths.append(xdg.appendingPathComponent("git/config"))
+        }
+        return FilterCacheStamp(env: env, files: paths.map { DiskStamp($0) })
     }
 
     /// Names of the filter drivers in the repository's and the user's config. `git config` only
     /// reads settings, so it can safely list them. It exits with 1 when there are none; any other
-    /// failure returns nil, and no command runs.
+    /// failure returns nil, and no command runs. Cached only when no `include` or `includeIf`
+    /// directive is active, because included files can change without touching `.git/config`.
     private func configuredFilters() -> Set<String>? {
-        rawRun(["config", "-z", "--get-regexp", "^filter\\."], GitRepository.safetySettings, acceptedStatuses: [0, 1])
-            .flatMap(GitRepository.filterNames)
+        let stamp = filterCacheStamp()
+        let now = Date.timeIntervalSinceReferenceDate
+        filterLock.lock()
+        if let hit = cachedFilters, hit.stamp == stamp, now < hit.expiresAt {
+            filterLock.unlock()
+            return hit.names
+        }
+        filterLock.unlock()
+        guard let parsed = rawRun(["config", "-z", "--get-regexp", "^(filter|include|includeif)\\."],
+                                  GitRepository.safetySettings, acceptedStatuses: [0, 1])
+            .flatMap(GitRepository.parseConfigFilters) else { return nil }
+        filterLock.lock()
+        cachedFilters = parsed.hasIncludes ? nil : (stamp, Date.timeIntervalSinceReferenceDate + 2.0, parsed.names)
+        filterLock.unlock()
+        return parsed.names
+    }
+
+    private static let includePrefix = Data("include.".utf8)
+    private static let includeIfPrefix = Data("includeif.".utf8)
+
+    private static func parseConfigFilters(_ configOutput: Data) -> (names: Set<String>, hasIncludes: Bool)? {
+        var names = Set<String>()
+        var hasIncludes = false
+        for entry in configOutput.split(separator: 0) {
+            let keyBytes = entry.prefix { $0 != 10 }
+            if keyBytes.starts(with: includePrefix) || keyBytes.starts(with: includeIfPrefix) {
+                hasIncludes = true
+                continue
+            }
+            guard let key = String(bytes: keyBytes, encoding: .utf8) else { return nil }
+            guard key.hasPrefix("filter."), let dot = key.lastIndex(of: "."), dot >= key.index(key.startIndex, offsetBy: 7) else { continue }
+            names.insert(String(key[key.index(key.startIndex, offsetBy: 7)..<dot]))
+        }
+        return (names, hasIncludes)
     }
 
     /// Filter names in `git config -z --get-regexp ^filter\.` output. Each entry is the key, a
@@ -264,23 +373,28 @@ final class GitRepository {
         }
     }
 
-    private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0]) -> Data? {
+    private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0],
+                        maxOutputBytes: Int? = nil) -> Data? {
         guard let git = GitRepository.executable else { return nil }
         // A repository's core.worktree could point git at another folder, so a restore would
         // write files outside the one shown. The work tree is always the folder holding `.git`.
         return GitRepository.runProcess(URL(fileURLWithPath: git), ["-C", root.path, "--work-tree=" + root.path] + args,
-                                        environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses)
+                                        environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses,
+                                        maxOutputBytes: maxOutputBytes)
     }
 
     /// Longest a git command may run before it is stopped.
     static let timeout: TimeInterval = 30
 
-    /// Standard output of a run that exited with one of `acceptedStatuses`, or nil if it failed
-    /// or ran past `timeout`. The output is read on another thread, so a stalled network volume,
-    /// or a child process that keeps the pipe open, can't hold the caller past the timeout.
+    /// Standard output of a run that exited with one of `acceptedStatuses`, or nil if it failed,
+    /// exceeded `maxOutputBytes`, or ran past `timeout`. The output is read on another thread, so a
+    /// stalled network volume, or a child process that keeps the pipe open, can't hold the caller past the timeout.
     static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout,
-                           acceptedStatuses: Set<Int32> = [0]) -> Data? {
-        final class Output: @unchecked Sendable { var data = Data() }
+                           acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = nil) -> Data? {
+        final class Output: @unchecked Sendable {
+            var data = Data()
+            var tooLarge = false
+        }
         let p = Process()
         p.executableURL = executable
         p.arguments = args
@@ -297,7 +411,18 @@ final class GitRepository {
         let output = Output()
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
-            output.data = out.fileHandleForReading.readDataToEndOfFile()
+            if let limit = maxOutputBytes {
+                let data = (try? out.fileHandleForReading.read(upToCount: limit + 1)) ?? Data()
+                if data.count > limit {
+                    output.tooLarge = true
+                    p.terminate()
+                    try? out.fileHandleForReading.close()
+                } else {
+                    output.data = data
+                }
+            } else {
+                output.data = out.fileHandleForReading.readDataToEndOfFile()
+            }
             exited.wait()
             done.signal()
         }
@@ -309,13 +434,14 @@ final class GitRepository {
             }
             return nil
         }
+        if output.tooLarge { return nil }
         return p.terminationReason == .exit && acceptedStatuses.contains(p.terminationStatus) ? output.data : nil
     }
 
     static let statusArguments = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]
 
     func status(_ completion: @escaping ([String: GitFileStatus]) -> Void) {
-        GitRepository.queue.async {
+        GitRepository.runAsync {
             let data = self.run(GitRepository.statusArguments)
             let result = data.map(GitRepository.parseStatus) ?? [:]
             DispatchQueue.main.async { completion(result) }
@@ -418,7 +544,7 @@ final class GitRepository {
     /// every line as added; binary and very large files have no counts. Pass a `status` that was
     /// just read to skip running `git status` again.
     func changedFiles(status known: [String: GitFileStatus]? = nil, _ completion: @escaping ([ChangedFile]) -> Void) {
-        GitRepository.queue.async {
+        GitRepository.runAsync {
             let status = known ?? self.run(GitRepository.statusArguments).map(GitRepository.parseStatus) ?? [:]
             let counts = status.isEmpty ? [:] : (self.run(["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
             var out: [ChangedFile] = []
@@ -439,7 +565,7 @@ final class GitRepository {
     /// The Changes list: each file's staged change, counted against HEAD, and its unstaged change,
     /// counted against the staged copy. A file with both is listed twice.
     func changeList(_ completion: @escaping ([ChangedFile]) -> Void) {
-        GitRepository.queue.async {
+        GitRepository.runAsync {
             let entries = self.run(GitRepository.statusArguments).map(GitRepository.parseStatusEntries) ?? []
             let out = self.changeList(entries)
             DispatchQueue.main.async { completion(out) }
@@ -531,7 +657,7 @@ final class GitRepository {
 
     /// Ignored files and directories (directories collapsed, with a trailing slash removed).
     func ignored(_ completion: @escaping ([String]) -> Void) {
-        GitRepository.queue.async {
+        GitRepository.runAsync {
             var out: [String] = []
             if let data = self.run(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]) {
                 for part in data.split(separator: 0) {
@@ -576,9 +702,10 @@ final class GitRepository {
         guard !paths.isEmpty else { return [] }
         guard let drivers = configuredFilters() else { return nil }
         guard !drivers.isEmpty else { return [] }
+        let settings = GitRepository.safetySettings + GitRepository.filterSettings(names: drivers)
         var out = Set<String>()
         for chunk in GitRepository.chunks(paths) {
-            guard let data = run(["check-attr", "-z", "filter", "--"] + chunk) else { return nil }
+            guard let data = rawRun(["check-attr", "-z", "filter", "--"] + chunk, settings) else { return nil }
             // Each answer is the path, the attribute and its value, in the order the paths were given.
             let fields = data.split(separator: 0, omittingEmptySubsequences: false)
             guard fields.count >= chunk.count * 3 else { return nil }
@@ -605,10 +732,21 @@ final class GitRepository {
     }
 
     /// Puts the staged copies of the files back to HEAD's, leaving the work tree alone. Runs on the
-    /// calling thread.
+    /// calling thread. Plain paths are batched in chunks; staged renames reset both new and old paths.
     func unstage(_ files: [ChangedFile]) -> ActionResult {
         var result = ActionResult()
-        for f in GitRepository.unique(files, by: \.path) {
+        let unique = GitRepository.unique(files, by: \.path)
+        let plain = unique.filter { $0.originalPath == nil }.map(\.path)
+        for chunk in GitRepository.chunks(plain) {
+            if run(["reset", "-q", "--"] + chunk) != nil {
+                result.done += chunk
+            } else {
+                for path in chunk {
+                    if run(["reset", "-q", "--", path]) != nil { result.done.append(path) } else { result.failed.append(path) }
+                }
+            }
+        }
+        for f in unique where f.originalPath != nil {
             // A staged rename is undone at both its new and its old path. `reset` also works
             // before the first commit, where `restore --staged` has no HEAD to restore from.
             let paths = [f.path] + (f.originalPath.map { [$0] } ?? [])
@@ -720,7 +858,7 @@ final class GitRepository {
     /// The files' changes as `git diff` writes them: staged changes against HEAD, the others
     /// against the staged copy, and new files in full.
     func patch(for files: [ChangedFile], _ completion: @escaping (String) -> Void) {
-        GitRepository.queue.async {
+        GitRepository.runAsync {
             let diff = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=all"]
             var out = Data()
             let staged = GitRepository.unique(files.filter(\.staged).flatMap { [$0.path] + ($0.originalPath.map { [$0] } ?? []) })
@@ -752,7 +890,7 @@ final class GitRepository {
     /// Commits that changed the file, newest first, following renames.
     func history(of url: URL, limit: Int = 200, _ completion: @escaping ([Commit]) -> Void) {
         guard let rel = relativePath(url) else { completion([]); return }
-        GitRepository.queue.async {
+        GitRepository.runAsync {
             // -z writes each path as-is, ending in NUL; without it git quotes and escapes
             // non-ASCII names, tabs, quotes and newlines.
             let data = self.run(["log", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--follow", "-z", "-n", String(limit), "--format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s", "--name-only", "--", rel])
@@ -781,20 +919,24 @@ final class GitRepository {
         }
     }
 
-    /// Raw bytes of `path` (relative to the repository) in `commit`, or nil if it isn't there.
-    func contents(of path: String, at commit: String, _ completion: @escaping (Data?) -> Void) {
-        GitRepository.queue.async {
-            let data = self.run(["show", "--no-textconv", commit + ":" + path])
+    /// Raw bytes of `path` (relative to the repository) in `commit`, or nil if it isn't a blob
+    /// or exceeds `maxBlobSize`. `cat-file blob` refuses trees, commits and tags and runs no filters.
+    func contents(of path: String, at commit: String, maxBytes: Int = GitRepository.maxBlobSize,
+                  _ completion: @escaping (Data?) -> Void) {
+        GitRepository.runAsync {
+            let data = self.run(["cat-file", "blob", commit + ":" + path], maxOutputBytes: maxBytes)
             DispatchQueue.main.async { completion(data) }
         }
     }
 
-    /// Raw bytes of the file at HEAD, or nil if it isn't tracked. The caller decodes them with the
-    /// document's encoding, since UTF-16 or Windows-1252 bytes read as UTF-8 would be garbage.
-    func headContents(of url: URL, _ completion: @escaping (Data?) -> Void) {
+    /// Raw bytes of the file at HEAD, or nil if it isn't a tracked blob or exceeds `maxBytes`. The
+    /// caller decodes them with the document's encoding, since UTF-16 or Windows-1252 bytes read as
+    /// UTF-8 would be garbage.
+    func headContents(of url: URL, maxBytes: Int = GitRepository.maxBlobSize,
+                      _ completion: @escaping (Data?) -> Void) {
         guard let rel = relativePath(url) else { completion(nil); return }
-        GitRepository.queue.async {
-            let data = self.run(["show", "--no-textconv", "HEAD:" + rel])
+        GitRepository.runAsync {
+            let data = self.run(["cat-file", "blob", "HEAD:" + rel], maxOutputBytes: maxBytes)
             DispatchQueue.main.async { completion(data) }
         }
     }

@@ -869,10 +869,10 @@ final class Document: NSObject, NSTextStorageDelegate {
             scheduleGitDiff(delay: 0)
             return
         }
-        repo.headContents(of: url) { [weak self] data in
+        repo.headContents(of: url, maxBytes: 12_000_000) { [weak self] data in
             guard let self, self.url == url, Settings.shared.gitGutter else { return }
             let decoded = data.map { TextEncoding.decode($0, preferred: enc) }
-            guard let decoded, !decoded.isBinary else { self.clearGitBaseline(); return }
+            guard let decoded, !decoded.isBinary, decoded.text.utf16.count < 3_000_000 else { self.clearGitBaseline(); return }
             self.gitBaseline = LineEnding.normalize(decoded.text, rawData: nil).0
             self.gitBaselineSource = source
             self.scheduleGitDiff(delay: 0)
@@ -1201,65 +1201,140 @@ final class DocumentRegistry {
 
 final class RecentFiles {
     static let shared = RecentFiles()
-    private let key = "recentItems"
+    private let key: String
+    private let probe: (String) -> URL?
     private let maxItems = 24
     private let lock = NSLock()
     private var existingCache: [URL]?
+    /// Items added in this session that have not yet been verified by a background disk probe.
+    private var unprobedAdditions: [String: (generation: Int, url: URL)] = [:]
+    private var mutationGeneration = 0
+    private var pendingUpdates: [() -> Void] = []
     private var checking = false
 
+    init(defaultsKey: String = "recentItems", probe: @escaping (String) -> URL? = RecentFiles.probeOnDisk) {
+        self.key = defaultsKey
+        self.probe = probe
+    }
+
+    static func probeOnDisk(_ path: String) -> URL? {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: isDir.boolValue)
+    }
+
+    var paths: [String] {
+        UserDefaults.standard.stringArray(forKey: key) ?? []
+    }
+
     var items: [URL] {
-        (UserDefaults.standard.stringArray(forKey: key) ?? []).map { URL(fileURLWithPath: $0) }
+        paths.map { URL(fileURLWithPath: $0, isDirectory: false) }
     }
 
     /// Recent items known to exist on disk, refreshed off the main thread so drawing the empty
-    /// state never stalls on an unmounted or network volume.
+    /// state, opening menus, or invoking the palette never touches the filesystem on the main
+    /// thread—even on a cold cache. Uses `URL(fileURLWithPath:isDirectory:)` because single-arg
+    /// `URL(fileURLWithPath:)` synchronously stats every path on the caller.
     func availableItems(onUpdate: (() -> Void)? = nil) -> [URL] {
-        let current = items
+        let currentPaths = paths
+        if currentPaths.isEmpty {
+            lock.lock()
+            existingCache = []
+            unprobedAdditions.removeAll()
+            lock.unlock()
+            return []
+        }
         lock.lock()
-        let cached = existingCache
-        let busy = checking
-        if !busy { checking = true }
+        let visible = resolvedLocked(for: currentPaths)
+        if let onUpdate { pendingUpdates.append(onUpdate) }
+        let shouldStart = !checking
+        let startGen = mutationGeneration
+        if shouldStart { checking = true }
         lock.unlock()
-        if !busy {
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                let existing = current.filter { FileManager.default.fileExists(atPath: $0.path) }
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.lock.lock()
-                    let changed = self.existingCache != existing
-                    self.existingCache = existing
-                    self.checking = false
-                    self.lock.unlock()
-                    if changed { onUpdate?() }
+        if shouldStart {
+            startBackgroundRefresh(for: currentPaths, generation: startGen, previousVisible: visible)
+        }
+        return visible
+    }
+
+    private func resolvedLocked(for currentPaths: [String]) -> [URL] {
+        if let cached = existingCache {
+            let byPath = Dictionary(uniqueKeysWithValues: cached.map { ($0.path, $0) })
+            return currentPaths.compactMap { byPath[$0] ?? unprobedAdditions[$0]?.url }
+        }
+        return currentPaths.compactMap { unprobedAdditions[$0]?.url }
+    }
+
+    private func startBackgroundRefresh(for snapshot: [String], generation startGen: Int, previousVisible: [URL]) {
+        let probe = self.probe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let existing = snapshot.compactMap(probe)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let latestPaths = self.paths
+                let probedSet = Set(snapshot)
+                self.lock.lock()
+                for p in snapshot {
+                    if let entry = self.unprobedAdditions[p], entry.generation <= startGen {
+                        self.unprobedAdditions.removeValue(forKey: p)
+                    }
+                }
+                var merged = existing
+                let seen = Set(merged.map(\.path))
+                for p in latestPaths where !seen.contains(p) {
+                    if let pending = self.unprobedAdditions[p]?.url { merged.append(pending) }
+                }
+                let byPath = Dictionary(uniqueKeysWithValues: merged.map { ($0.path, $0) })
+                let ordered = latestPaths.compactMap { byPath[$0] }
+                let changed = self.existingCache != ordered || previousVisible != ordered
+                self.existingCache = ordered
+                let callbacks = self.pendingUpdates
+                self.pendingUpdates.removeAll()
+                let nextGen = self.mutationGeneration
+                let needsFollowUp = latestPaths.contains { !probedSet.contains($0) }
+                self.checking = needsFollowUp
+                self.lock.unlock()
+                if changed {
+                    for cb in callbacks { cb() }
+                }
+                if needsFollowUp {
+                    self.startBackgroundRefresh(for: latestPaths, generation: nextGen, previousVisible: ordered)
                 }
             }
         }
-        if let cached { return cached.filter { current.contains($0) } }
-        return current.filter { $0.path.hasPrefix("/Volumes/") ? false : FileManager.default.fileExists(atPath: $0.path) }
     }
 
     func add(_ url: URL) {
+        let normalized = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
         var list = UserDefaults.standard.stringArray(forKey: key) ?? []
-        list.removeAll { $0 == url.path }
-        list.insert(url.path, at: 0)
+        list.removeAll { $0 == normalized.path }
+        list.insert(normalized.path, at: 0)
         if list.count > maxItems { list = Array(list.prefix(maxItems)) }
         UserDefaults.standard.set(list, forKey: key)
         lock.lock()
+        mutationGeneration += 1
+        unprobedAdditions[normalized.path] = (mutationGeneration, normalized)
         if var c = existingCache {
-            c.removeAll { $0.path == url.path }
-            c.insert(url, at: 0)
+            c.removeAll { $0.path == normalized.path }
+            c.insert(normalized, at: 0)
             existingCache = Array(c.prefix(maxItems))
         }
         lock.unlock()
-        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        if key == "recentItems" {
+            NSDocumentController.shared.noteNewRecentDocumentURL(normalized)
+        }
     }
 
     func clear() {
         UserDefaults.standard.removeObject(forKey: key)
         lock.lock()
+        mutationGeneration += 1
         existingCache = []
+        unprobedAdditions.removeAll()
         lock.unlock()
-        NSDocumentController.shared.clearRecentDocuments(nil)
+        if key == "recentItems" {
+            NSDocumentController.shared.clearRecentDocuments(nil)
+        }
     }
 }
 

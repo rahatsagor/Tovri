@@ -46,8 +46,13 @@ final class GutterView: NSView {
         let theme = ThemeManager.shared.active
         theme.editorBackground.setFill()
         dirtyRect.intersection(bounds).fill()
-        // Without line numbers the narrow gutter still shows bookmarks.
-        guard let tv = textView, showsNumbers || !tv.document.bookmarks.isEmpty, let lm = tv.layoutManager, let tc = tv.textContainer,
+        // Without line numbers the narrow gutter still shows bookmarks, Git change markers and inline diffs.
+        let hasDecorations = showsNumbers
+            || (textView?.document.bookmarks.isEmpty == false)
+            || (textView?.editor?.lineDiff.isEmpty == false)
+            || (textView?.tovriLayoutManager.hasGaps == true)
+            || (textView?.editor?.inlineDiff != nil)
+        guard let tv = textView, hasDecorations, let lm = tv.layoutManager, let tc = tv.textContainer,
               let clip = tv.enclosingScrollView?.contentView else { return }
         let numbers = showsNumbers
         let bookmarks = tv.document.bookmarks
@@ -128,22 +133,17 @@ final class GutterView: NSView {
             }
             let y = frag.minY + yOffset
             if full.minY + yOffset > bounds.maxY { break }
-            if gaps && numbers {
+            if gaps {
                 drawRemoved(top: full.minY + yOffset, height: frag.minY - full.minY)
                 if line == lines.count - 1 { drawRemoved(top: full.maxY + yOffset - tlm.trailingGapHeight, height: tlm.trailingGapHeight) }
             }
-            if numbers, inline?.changed.contains(line) == true {
+            if inline?.changed.contains(line) == true {
                 insertedTint.setFill()
                 NSRect(x: 0, y: y, width: bounds.width, height: frag.height).fill()
             }
             if y + frag.height >= dirtyRect.minY {
-                if !numbers {
-                    if bookmarks.contains(line) { drawBookmark(x: 5, y: y, height: frag.height, color: bookmarkColor) }
-                    line += 1
-                    continue
-                }
                 let isActive = activeLines.contains(line)
-                if isActive && Settings.shared.highlightCurrentLine && sels.allSatisfy({ $0.length == 0 }) {
+                if numbers && isActive && Settings.shared.highlightCurrentLine && sels.allSatisfy({ $0.length == 0 }) {
                     theme2.lineHighlight.setFill()
                     NSRect(x: 0, y: y, width: bounds.width, height: frag.height).fill()
                 }
@@ -165,7 +165,11 @@ final class GutterView: NSView {
                         tri.fill()
                     }
                 }
-                if marking && bookmarks.contains(line) { drawBookmark(x: 7, y: y, height: frag.height, color: bookmarkColor) }
+                if marking && bookmarks.contains(line) { drawBookmark(x: !numbers && diff.isEmpty ? 5 : 7, y: y, height: frag.height, color: bookmarkColor) }
+                guard numbers else {
+                    line += 1
+                    continue
+                }
                 let s = String(line + 1) as NSString
                 let attrs = isActive ? activeAttrs : numberAttrs
                 let font = attrs[.font] as! NSFont
@@ -236,27 +240,50 @@ final class GutterView: NSView {
     override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true }
     override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
 
-    override func mouseDown(with event: NSEvent) {
-        guard let tv = textView, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
-        let p = tv.convert(event.locationInWindow, from: nil)
+    enum HitAction: Equatable {
+        case change(DiffHunk)
+        case fold(Int)
+        case selectLine(Int)
+    }
+
+    /// Resolves what clicking at `localPoint` (in `GutterView` coordinates) acts on.
+    func hitAction(at localPoint: NSPoint) -> HitAction? {
+        guard let tv = textView, let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
+        let p = tv.convert(localPoint, from: self)
         let glyph = lm.glyphIndex(for: NSPoint(x: 0, y: p.y - tv.textContainerOrigin.y), in: tc)
         let charIndex = lm.characterIndexForGlyph(at: glyph)
-        let doc = tv.document
-        let startLine = doc.lines.line(containing: charIndex)
-        let x = convert(event.locationInWindow, from: nil).x
+        let startLine = tv.document.lines.line(containing: charIndex)
+        let x = localPoint.x
         if x < 14, let editor = tv.editor {
             // A deletion marker straddles the boundary, so a click just above a line also counts.
             let nextTop = GutterView.top(ofLine: startLine + 1, in: tv)
             let below = editor.gitHunk(at: startLine + 1)
             if let hunk = (below?.isDeletion == true && nextTop - (p.y - tv.textContainerOrigin.y) < 5 ? below : nil) ?? editor.gitHunk(at: startLine) {
-                editor.showGitChange(hunk, toggle: true)
-                return
+                return .change(hunk)
             }
         }
-        if x >= bounds.width - GutterView.foldColumn - 2 {
-            tv.editor?.toggleFold(line: startLine)
-            return
+        if showsNumbers && x >= bounds.width - GutterView.foldColumn - 2 {
+            return .fold(startLine)
         }
+        return .selectLine(startLine)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let tv = textView, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        guard let action = hitAction(at: localPoint) else { return }
+        let startLine: Int
+        switch action {
+        case .change(let hunk):
+            tv.editor?.showGitChange(hunk, toggle: true)
+            return
+        case .fold(let line):
+            tv.editor?.toggleFold(line: line)
+            return
+        case .selectLine(let line):
+            startLine = line
+        }
+        let doc = tv.document
         let anchorRange = doc.lines.fullRange(of: startLine, textLength: doc.length)
         if event.modifierFlags.contains(.shift) {
             tv.setAllSelections([NSUnionRange(tv.selectedRange(), anchorRange)])

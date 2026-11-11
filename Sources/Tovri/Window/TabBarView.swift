@@ -457,6 +457,16 @@ final class TabBarView: NSView, NSViewToolTipOwner {
 
     private var tabElements: [DrawnAccessibilityElement] = []
     private var closeElements: [DrawnAccessibilityElement] = []
+    private lazy var overflowElement: DrawnAccessibilityElement = {
+        let e = DrawnAccessibilityElement(in: self, role: .popUpButton) { [weak self] in self?.overflowButtonRect }
+        e.setAccessibilityLabel("All tabs")
+        e.setAccessibilityHelp("Show all open tabs")
+        e.onPress = { [weak self] in
+            guard let self, let ob = self.overflowButtonRect else { return }
+            self.showOverflowMenu(at: ob)
+        }
+        return e
+    }()
 
     override func isAccessibilityElement() -> Bool { true }
     override func accessibilityRole() -> NSAccessibility.Role? { .tabGroup }
@@ -465,7 +475,9 @@ final class TabBarView: NSView, NSViewToolTipOwner {
     override func accessibilityValue() -> Any? { selectedIndex >= 0 && selectedIndex < tabElements.count ? tabElements[selectedIndex] : nil }
 
     override func accessibilityChildren() -> [Any]? {
-        zip(tabElements, closeElements).flatMap { [$0, $1] }
+        var children = zip(tabElements, closeElements).flatMap { [$0, $1] }
+        if isOverflowing { children.append(overflowElement) }
+        return children
     }
 
     override func accessibilityHitTest(_ point: NSPoint) -> Any? {
@@ -478,7 +490,8 @@ final class TabBarView: NSView, NSViewToolTipOwner {
             let i = tabElements.count
             let tab = DrawnAccessibilityElement(in: self, role: .radioButton) { [weak self] in
                 guard let self, i < self.frames.count else { return nil }
-                return self.visibleFrame(i)
+                let r = self.visibleFrame(i).intersection(self.stripRect)
+                return r.isNull || r.width < 4 ? nil : r
             }
             tab.onPress = { [weak self] in
                 guard let self, i < self.items.count else { return }
@@ -486,7 +499,10 @@ final class TabBarView: NSView, NSViewToolTipOwner {
             }
             let close = DrawnAccessibilityElement(in: self, role: .button) { [weak self] in
                 guard let self, i < self.frames.count else { return nil }
-                return self.closeRect(self.visibleFrame(i))
+                let tabRect = self.visibleFrame(i).intersection(self.stripRect)
+                guard !tabRect.isNull else { return nil }
+                let r = self.closeRect(self.visibleFrame(i)).intersection(self.stripRect)
+                return r.isNull || r.width < 4 ? nil : r
             }
             close.onPress = { [weak self] in
                 guard let self, i < self.items.count else { return }

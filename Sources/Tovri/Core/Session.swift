@@ -81,6 +81,7 @@ final class SessionStore {
     }
     private let writtenLock = NSLock()
     private var writtenVersions: [UUID: WrittenBuffer] = [:]
+    private var inFlightBuffers: [UUID: String] = [:]
     /// Buffer files garbage collection may delete: ones this store wrote or found in the session it
     /// loaded. Anything else, such as backups listed in an unreadable Session.json, is left alone.
     private var ownedBuffers: Set<String> = []
@@ -124,11 +125,19 @@ final class SessionStore {
         let name = "\(doc.id.uuidString)-\(doc.editVersion).txt"
         if pendingWrites[name] != nil { return name }
         if doc.length > SessionStore.largeBuffer && !allowLarge {
-            // Copying a huge buffer stalls typing, so between quits it is backed up less often.
+            // Copying a huge buffer stalls typing, so between quits it is backed up less often,
+            // reusing the buffer already on disk or currently being written on `queue`.
             let now = Date.timeIntervalSinceReferenceDate
             let interval = max(60, Double(doc.length) / 1_000_000 * 3)
-            if let last = lastLargeWrite[doc.id], now - last < interval { return available?.name }
+            writtenLock.lock()
+            let last = lastLargeWrite[doc.id]
+            let inFlight = inFlightBuffers[doc.id]
+            if let last, now - last < interval {
+                writtenLock.unlock()
+                return available?.name ?? inFlight
+            }
             lastLargeWrite[doc.id] = now
+            writtenLock.unlock()
         }
         pendingWrites[name] = BufferWrite(documentID: doc.id, version: doc.editVersion, name: name,
                                           text: doc.string.copy() as! NSString)
@@ -164,10 +173,13 @@ final class SessionStore {
         let keep = Set(session.windows.flatMap { w in w.groups.flatMap { g in g.tabs.compactMap { $0.buffer } } })
         let writes = pendingWrites.values.filter { keep.contains($0.name) }
         pendingWrites = [:]
+        writtenLock.lock()
+        for write in writes { inFlightBuffers[write.documentID] = write.name }
+        writtenLock.unlock()
         let dir = bufferDirectory
         let file = sessionFile
         let work = { [self] () -> Result<Void, Error> in
-            Result {
+            let result = Result {
                 let fm = FileManager.default
                 // Unsaved buffers can hold secrets, so only this user may read them.
                 let privateFolder: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
@@ -179,6 +191,7 @@ final class SessionStore {
                     try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
                     writtenLock.lock()
                     writtenVersions[write.documentID] = WrittenBuffer(version: write.version, name: write.name)
+                    if inFlightBuffers[write.documentID] == write.name { inFlightBuffers.removeValue(forKey: write.documentID) }
                     ownedBuffers.insert(write.name)
                     writtenLock.unlock()
                 }
@@ -202,6 +215,15 @@ final class SessionStore {
                 }
                 writtenLock.unlock()
             }
+            if case .failure = result {
+                writtenLock.lock()
+                for write in writes {
+                    if inFlightBuffers[write.documentID] == write.name { inFlightBuffers.removeValue(forKey: write.documentID) }
+                    lastLargeWrite.removeValue(forKey: write.documentID)
+                }
+                writtenLock.unlock()
+            }
+            return result
         }
         if synchronously { return queue.sync(execute: work) }
         queue.async { _ = work() }

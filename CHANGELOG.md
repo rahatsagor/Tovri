@@ -9,6 +9,52 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Reopen Closed Window** (⌥⇧⌘T) in the File menu brings back closed windows
+  and their unsaved changes, even after opening another window.
+- The `tovri` command line tool now accepts combined short flags such as
+  `tovri -nw`, and piped input detects UTF-16 and legacy text encodings.
+
+### Changed
+
+- Background Git status, history and diff checks limit concurrent subprocesses,
+  cache filter checks across bursts, and unstage plain files in batches.
+- Recent file lookups avoid main-thread filesystem `stat` calls, and clicking
+  near folded blocks in large files checks only visible folds.
+
+### Fixed
+
+- Background session saves for large unsaved files keep the previous backup on
+  disk while throttled instead of dropping it until the next write window.
+- **Invisible Characters** skips folded blocks instead of drawing hidden
+  characters over the fold marker, and aligns with text rows when inline diff
+  gaps are open above a line.
+- Turning off **Line Numbers** keeps Git change markers visible in the narrow
+  gutter and lets gutter clicks select lines instead of toggling invisible
+  folds.
+- Multi-paragraph HTML blocks in Markdown (such as `<details>` and centered
+  `<div>` sections) stay open across blank lines, tables can follow a paragraph
+  without a blank line, tab-indented list items keep their continuation indent,
+  and the preview's code **Copy** button writes directly to the clipboard.
+- Installing the `tovri` command works when Tovri lives on a permanent volume
+  under `/Volumes`, while still refusing mounted disk images and translocated
+  copies.
+- Sidebar **Refresh** and hidden-file setting changes reload expanded folders at
+  every depth, not only the top two levels.
+- **Format JSON** and **Minify JSON** preserve base indentation when full lines
+  of an indented block are selected.
+- **Smart Home** with Shift (`⇧⌘←`) respects left-to-right selection anchors.
+- Git Gutter and File History ignore non-blob objects (such as a path that used
+  to be a directory) and skip oversized committed blobs.
+- Overflowing tab bars clip off-strip accessibility frames away from window
+  buttons and expose the **All tabs** overflow menu to VoiceOver.
+- **Find in Files** escapes the editor's selection when Regular Expression is on
+  and uses open documents' chosen languages for Whole Word matching.
+- Custom shortcuts in **Settings → Key Bindings** take precedence over hidden
+  alternate menu shortcuts, and **Help → Keyboard Shortcuts** merges alternate
+  shortcuts onto a single row.
+
 ## [0.5.0] - 2026-11-09
 
 ### Added
