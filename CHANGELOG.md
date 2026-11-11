@@ -9,6 +9,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
 ### Added
 
 - **Reopen Closed Window** (⌥⇧⌘T) in the File menu brings back closed windows
@@ -37,6 +39,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `<div>` sections) stay open across blank lines, tables can follow a paragraph
   without a blank line, tab-indented list items keep their continuation indent,
   and the preview's code **Copy** button writes directly to the clipboard.
+- Markdown preview preserves reading position inside HTML containers and around
+  collapsed `<details>` sections.
 - Installing the `tovri` command works when Tovri lives on a permanent volume
   under `/Volumes`, while still refusing mounted disk images and translocated
   copies.
@@ -44,16 +48,21 @@ and versions follow [Semantic Versioning](https://semver.org/).
   every depth, not only the top two levels.
 - **Format JSON** and **Minify JSON** preserve base indentation when full lines
   of an indented block are selected.
-- **Smart Home** with Shift (`⇧⌘←`) respects left-to-right selection anchors.
+- **Smart Home** with Shift (`⇧⌘←`) preserves selection direction through
+  subsequent Shift movements, and Shift-Up/Down keeps the original column
+  while crossing short lines.
 - Git Gutter and File History ignore non-blob objects (such as a path that used
   to be a directory) and skip oversized committed blobs.
+- Git filter checks follow changes to included, global and system settings so
+  background Git commands keep external filter programs disabled.
+- Deleted recent files disappear after the background existence check.
 - Overflowing tab bars clip off-strip accessibility frames away from window
   buttons and expose the **All tabs** overflow menu to VoiceOver.
 - **Find in Files** escapes the editor's selection when Regular Expression is on
   and uses open documents' chosen languages for Whole Word matching.
 - Custom shortcuts in **Settings → Key Bindings** take precedence over hidden
-  alternate menu shortcuts, and **Help → Keyboard Shortcuts** merges alternate
-  shortcuts onto a single row.
+  alternate menu shortcuts, clearing a shortcut disables its hidden aliases,
+  and **Help → Keyboard Shortcuts** merges alternate shortcuts onto a single row.
 
 ## [0.5.0] - 2026-11-09
 
@@ -459,7 +468,8 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/rahatsagor/Tovri/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/rahatsagor/Tovri/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rahatsagor/Tovri/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rahatsagor/Tovri/compare/v0.2.1...v0.3.0
