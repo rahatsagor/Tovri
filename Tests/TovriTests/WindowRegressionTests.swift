@@ -450,4 +450,88 @@ final class WindowRegressionTests: XCTestCase {
         let report = FileSearcher.report(r, for: o, elapsed: 0.05)
         XCTAssertTrue(report.contains("2 files of 25 MB or more were skipped."), report)
     }
+
+    func testClosingLastTabInOpenFolderKeepsWindowAndAppOpen() throws {
+        let dir = try makeFolder(["a.txt": "alpha\n", "b.txt": "beta\n"])
+        let d = UserDefaults.standard
+        let oldQuit = d.object(forKey: Settings.Key.quitWhenLastWindowCloses)
+        defer { d.set(oldQuit, forKey: Settings.Key.quitWhenLastWindowCloses) }
+        d.set(true, forKey: Settings.Key.quitWhenLastWindowCloses)
+
+        let app = AppDelegate()
+        let c = app.newWindow(folder: dir)
+        defer {
+            c.teardown()
+            c.window?.delegate = nil
+            c.window?.close()
+        }
+        XCTAssertNotNil(c.folderURL)
+        XCTAssertTrue(c.window?.isVisible == true)
+
+        _ = try XCTUnwrap(c.open(url: dir.appendingPathComponent("a.txt")))
+        _ = try XCTUnwrap(c.open(url: dir.appendingPathComponent("b.txt")))
+        XCTAssertEqual(c.activeGroup.tabs.count, 2)
+
+        // Closing the tabs via Close Tab (⌘W) or Close All Tabs (⌥⌘W) keeps the folder window open.
+        c.closeTabCommand(nil)
+        drain()
+        XCTAssertEqual(c.activeGroup.tabs.count, 1)
+        XCTAssertTrue(c.window?.isVisible == true)
+
+        c.closeTabCommand(nil)
+        drain()
+        XCTAssertTrue(c.activeGroup.tabs.isEmpty)
+        XCTAssertTrue(c.window?.isVisible == true, "closing the last tab closed a window that had a folder open")
+        XCTAssertEqual(app.controllers.count, 1)
+        XCTAssertNotNil(c.statusBar.values[.theme])
+
+        // Pressing ⌘W again with no tabs open in a folder window does not close the window.
+        XCTAssertFalse(c.validateMenuItem(NSMenuItem(title: "Close Tab", action: #selector(MainWindowController.closeTabCommand(_:)), keyEquivalent: "w")))
+        XCTAssertTrue(c.validateMenuItem(NSMenuItem(title: "Close Folder", action: #selector(MainWindowController.closeFolder(_:)), keyEquivalent: "w")))
+        c.closeTabCommand(nil)
+        drain()
+        XCTAssertTrue(c.window?.isVisible == true)
+
+        // Close All Tabs in a folder window also keeps the window open.
+        _ = try XCTUnwrap(c.open(url: dir.appendingPathComponent("a.txt")))
+        c.closeAllTabs(nil)
+        drain()
+        XCTAssertTrue(c.activeGroup.tabs.isEmpty)
+        XCTAssertTrue(c.window?.isVisible == true)
+    }
+
+    func testClosingLastStandaloneFileTabStillClosesWindowWhenQuitOnLastCloseIsEnabled() throws {
+        let dir = try makeFolder(["a.txt": "alpha\n", "b.txt": "beta\n"])
+        let d = UserDefaults.standard
+        let oldQuit = d.object(forKey: Settings.Key.quitWhenLastWindowCloses)
+        let oldHotExit = d.object(forKey: Settings.Key.hotExit)
+        defer {
+            d.set(oldQuit, forKey: Settings.Key.quitWhenLastWindowCloses)
+            d.set(oldHotExit, forKey: Settings.Key.hotExit)
+        }
+        d.set(true, forKey: Settings.Key.quitWhenLastWindowCloses)
+        d.set(false, forKey: Settings.Key.hotExit)
+
+        let app = AppDelegate()
+        let c = app.newWindow()
+        defer {
+            c.teardown()
+            c.window?.delegate = nil
+            c.window?.close()
+        }
+        XCTAssertNil(c.folderURL)
+        _ = try XCTUnwrap(c.open(url: dir.appendingPathComponent("a.txt")))
+        _ = try XCTUnwrap(c.open(url: dir.appendingPathComponent("b.txt")))
+        XCTAssertEqual(c.activeGroup.tabs.count, 2)
+
+        c.closeTabCommand(nil)
+        drain()
+        XCTAssertEqual(c.activeGroup.tabs.count, 1)
+        XCTAssertTrue(c.window?.isVisible == true)
+
+        c.closeTabCommand(nil)
+        drain()
+        XCTAssertTrue(c.activeGroup.tabs.isEmpty)
+        XCTAssertFalse(c.window?.isVisible == true, "standalone files window did not close when its last tab closed")
+    }
 }

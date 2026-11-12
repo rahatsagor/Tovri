@@ -343,6 +343,7 @@ struct FilesSettings: View {
                 Toggle("Restore windows and tabs on launch", isOn: $restore)
                 Toggle("Hot exit (keep unsaved changes between launches)", isOn: $hotExit)
                 Toggle("Quit when the last tab or window closes", isOn: $quitOnLastClose)
+                    .help("Windows with an open folder stay open when their last tab closes.")
             }
             Section("Opening") {
                 Toggle("Open Markdown files in preview mode", isOn: $markdownPreview)

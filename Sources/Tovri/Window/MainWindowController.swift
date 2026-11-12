@@ -490,7 +490,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     func updateStatusBar() {
         guard let e = activeEditor else {
-            statusBar.values = [:]
+            statusBar.values = folderURL == nil ? [:] : [
+                .branch: gitBranch(for: nil),
+                .changes: Settings.shared.gitStatusBarChanges && changedFileCount > 0 ? "\(changedFileCount) changed" : "",
+                .theme: ThemeManager.shared.current.name,
+            ]
             return
         }
         let doc = e.document
@@ -529,8 +533,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// every caret move. Cleared whenever Git status is refreshed.
     private var gitContext: (key: String, branch: String)?
 
-    private func gitBranch(for doc: Document) -> String {
-        guard Settings.shared.gitEnabled, let base = doc.url ?? folderURL else { return "" }
+    private func gitBranch(for doc: Document?) -> String {
+        guard Settings.shared.gitEnabled, let base = doc?.url ?? folderURL else { return "" }
         let key = base.hasDirectoryPath ? base.path : base.deletingLastPathComponent().path
         if let c = gitContext, c.key == key { return c.branch }
         let branch = GitRepository.find(for: base)?.branch ?? ""
@@ -849,7 +853,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             if let i = group.index(of: doc) { group.removeTab(at: i) }
             let stillOpen = (NSApp.delegate as? AppDelegate)?.controllers.contains { $0.allOpenDocuments().contains { $0 === doc } } ?? false
             WaitRegistry.shared.documentMayHaveClosed(doc, stillOpen: stillOpen)
-            if Settings.shared.quitWhenLastWindowCloses && self.groups.allSatisfy({ $0.tabs.isEmpty }) {
+            if Settings.shared.quitWhenLastWindowCloses && self.folderURL == nil && self.groups.allSatisfy({ $0.tabs.isEmpty }) {
                 completion?(true)
                 // Deferred: when a save sheet just ended it is still attached and blocks the close.
                 DispatchQueue.main.async { self.window?.performClose(nil) }
@@ -989,7 +993,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             g.select(0)
         } else if groups.count > 1 {
             setLayout(.single)
-        } else {
+        } else if folderURL == nil {
             window?.performClose(sender)
         }
     }
@@ -2325,6 +2329,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case #selector(revealInFinder(_:)), #selector(copyFilePath(_:)), #selector(copyRelativePath(_:)), #selector(revealInSidebar(_:)):
             return activeDocument?.url != nil
         case #selector(closeFolder(_:)): return folderURL != nil
+        case #selector(closeTabCommand(_:)):
+            return palette.isVisible || findInFilesPanel.isVisible || !activeGroup.tabs.isEmpty || groups.count > 1 || folderURL == nil
         case #selector(closeOtherTabs(_:)): return activeGroup.tabs.count > 1
         case #selector(closeTabsToRight(_:)): return activeGroup.selectedIndex >= 0 && activeGroup.selectedIndex < activeGroup.tabs.count - 1
         case #selector(closeAllTabs(_:)): return groups.contains { !$0.tabs.isEmpty }

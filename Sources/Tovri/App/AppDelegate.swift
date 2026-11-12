@@ -441,6 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     /// ⌘W in auxiliary windows (Settings, About) closes the window.
     @objc func closeTabCommand(_ sender: Any?) {
+        guard !(NSApp.keyWindow?.windowController is MainWindowController) else { return }
         NSApp.keyWindow?.performClose(sender)
     }
 
