@@ -79,8 +79,15 @@ protocol SidebarDelegate: AnyObject {
     func sidebar(_ sidebar: SidebarView, didMove from: URL, to: URL)
     /// The Changes list was shown and wants current files and line counts.
     func sidebarNeedsChanges(_ sidebar: SidebarView)
+    func sidebarChangesFilterDidChange(_ sidebar: SidebarView)
+    func sidebarDidShowFiles(_ sidebar: SidebarView)
     func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction)
     func sidebar(_ sidebar: SidebarView, changes: [GitRepository.ChangedFile], action: ChangeListAction)
+}
+
+extension SidebarDelegate {
+    func sidebarChangesFilterDidChange(_ sidebar: SidebarView) {}
+    func sidebarDidShowFiles(_ sidebar: SidebarView) {}
 }
 
 final class SidebarOutlineView: NSOutlineView {
@@ -115,9 +122,15 @@ final class SidebarOutlineView: NSOutlineView {
         }
     }
     var onDelete: (() -> Void)?
+    var onSlash: (() -> Void)?
     var menuProvider: ((Int) -> NSMenu?)?
 
     override func keyDown(with event: NSEvent) {
+        if let onSlash, event.charactersIgnoringModifiers == "/",
+           event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+            onSlash()
+            return
+        }
         switch event.keyCode {
         case 36, 76: onReturn?()
         case 49 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: onSpace?()
@@ -163,15 +176,27 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     private let tabs = SidebarTabs()
     /// Created the first time the Changes list is shown, and dropped when the feature is turned off.
     private var changesView: ChangesView?
+    private(set) var fetchedFilter: ChangeFilter?
     var isShowingChanges: Bool { showsTabs && tabs.selected == .changes }
+    var changesFilter: ChangeFilter { changesView?.filter ?? Settings.shared.gitChangesFilter }
     private var showsTabs: Bool { Settings.shared.gitChangesAndHistory && root != nil }
+
+    func hasChanges(covering filter: ChangeFilter) -> Bool {
+        fetchedFilter?.covers(filter) == true
+    }
 
     func setChangeCount(_ n: Int) { tabs.changeCount = n }
 
-    func setChanges(_ files: [GitRepository.ChangedFile]) {
-        // A file with staged and unstaged changes is listed twice but counts once.
-        tabs.changeCount = Set(files.map(\.path)).count
+    func setChanges(_ files: [GitRepository.ChangedFile], filter: ChangeFilter = .all, totalCount: Int? = nil) {
+        if let v = changesView, !filter.covers(v.filter) {
+            if let totalCount { tabs.changeCount = totalCount }
+            delegate?.sidebarNeedsChanges(self)
+            return
+        }
+        fetchedFilter = filter
         changesView?.setFiles(files)
+        // A file with staged and unstaged changes is listed twice but counts once.
+        tabs.changeCount = totalCount ?? Set(files.map(\.path)).count
     }
 
     func showChanges(_ on: Bool) {
@@ -191,12 +216,21 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
                 guard let self else { return }
                 self.delegate?.sidebar(self, changes: files, action: action)
             }
+            v.onFilterChange = { [weak self] _ in
+                guard let self else { return }
+                self.delegate?.sidebarChangesFilterDidChange(self)
+            }
             addSubview(v)
             changesView = v
         }
         updatePlaceholder()
         needsLayout = true
-        if tab == .changes { delegate?.sidebarNeedsChanges(self) }
+        if tab == .changes {
+            delegate?.sidebarNeedsChanges(self)
+        } else {
+            fetchedFilter = nil
+            delegate?.sidebarDidShowFiles(self)
+        }
     }
 
     override var isFlipped: Bool { true }
@@ -277,8 +311,11 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     @objc private func settingsChanged() {
         if !Settings.shared.gitChangesAndHistory, changesView != nil || tabs.selected != .files {
             tabs.selected = .files
+            fetchedFilter = nil
             changesView?.removeFromSuperview()
             changesView = nil
+        } else {
+            changesView?.syncSettings()
         }
         updatePlaceholder()
         needsLayout = true
@@ -339,6 +376,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         gitStatus = [:]
         changedDirectories = []
         ignoredPaths = []
+        fetchedFilter = nil
+        tabs.changeCount = 0
+        changesView?.setFiles([])
         if let url {
             let node = FileNode(url: url, isDirectory: true, parent: nil)
             node.loadChildren()

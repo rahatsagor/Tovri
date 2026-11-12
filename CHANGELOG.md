@@ -9,6 +9,26 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Filter and sort the Changes list.** Type in the filter box (press `/` in
+  the list to jump to it) to narrow changed files by name or folder, filter by
+  **All Changes**, **Tracked**, **Untracked**, **Staged**, **Unstaged**,
+  **Modified** or **Deleted**, and sort by **Path**, **Name**, **Status** or
+  **Lines Changed**. While filtered, section headers stage or unstage only the
+  shown files (**Stage Shown** and **Unstage Shown**).
+
+### Changed
+
+- Closing the last tab (or running **Close All Tabs**) in a window with an
+  open folder now keeps the window and Tovri open, while windows opened for
+  separate files still close when **Quit when the last tab or window closes**
+  is on.
+- Faster Git refreshes in the **Changes** list: status and changes share a
+  single `git status` pass, untracked file line counts are cached by file
+  stamp, and filtered views skip unneeded `git diff` runs and untracked file
+  reads.
+
 ## [0.6.0] - 2026-11-11
 
 ### Added

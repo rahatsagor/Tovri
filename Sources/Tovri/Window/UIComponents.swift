@@ -212,8 +212,17 @@ final class ThemedTextField: NSView {
     var leadingSymbol: String? { didSet { applyTheme(); needsLayout = true } }
     /// Optional muted label at the right edge, e.g. the palette's mode.
     var trailingText: String = "" { didSet { trailingLabel.stringValue = trailingText; needsLayout = true } }
+    /// When set, shows a clear button while the field has text.
+    var onClear: (() -> Void)? { didSet { updateClearButton() } }
     private let iconView = NSImageView()
     private let trailingLabel = NSTextField(labelWithString: "")
+    private lazy var clearButton: ToolButton = {
+        let b = ToolButton(symbol: "xmark.circle.fill", tooltip: "Clear") { [weak self] in self?.onClear?() }
+        b.symbolSize = 11
+        b.isHidden = true
+        addSubview(b)
+        return b
+    }()
 
     init(placeholder: String) {
         self.placeholder = placeholder
@@ -234,14 +243,31 @@ final class ThemedTextField: NSView {
         trailingLabel.alignment = .right
         addSubview(iconView)
         addSubview(trailingLabel)
+        NotificationCenter.default.addObserver(self, selector: #selector(fieldTextDidChange), name: NSControl.textDidChangeNotification, object: field)
         applyTheme()
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit { NotificationCenter.default.removeObserver(self) }
+
     var stringValue: String {
         get { field.stringValue }
-        set { field.stringValue = newValue }
+        set {
+            field.stringValue = newValue
+            updateClearButton()
+        }
+    }
+
+    @objc private func fieldTextDidChange() { updateClearButton() }
+
+    private func updateClearButton() {
+        let show = onClear != nil && !field.stringValue.isEmpty
+        guard show || onClear != nil else { return }
+        if clearButton.isHidden == show {
+            clearButton.isHidden = !show
+            needsLayout = true
+        }
     }
 
     func applyTheme() {
@@ -269,10 +295,14 @@ final class ThemedTextField: NSView {
             x = iconView.frame.maxX + 8
         }
         var right = bounds.width - 8
+        if onClear != nil && !clearButton.isHidden {
+            clearButton.frame = NSRect(x: bounds.width - 23, y: round((bounds.height - 20) / 2), width: 20, height: 20)
+            right = clearButton.frame.minX - 2
+        }
         trailingLabel.isHidden = trailingText.isEmpty
         if !trailingText.isEmpty {
             let w = ceil(trailingLabel.fittingSize.width)
-            trailingLabel.frame = NSRect(x: bounds.width - 12 - w, y: round((bounds.height - 15) / 2), width: w, height: 15)
+            trailingLabel.frame = NSRect(x: right - 4 - w, y: round((bounds.height - 15) / 2), width: w, height: 15)
             right = trailingLabel.frame.minX - 10
         }
         field.frame = NSRect(x: x, y: round((bounds.height - h) / 2), width: max(0, right - x), height: h)
@@ -285,7 +315,7 @@ final class FocusTextField: NSTextField {
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
         if ok {
-            DispatchQueue.main.async { self.onFocusChange?(true) }
+            DispatchQueue.main.async { [weak self] in self?.onFocusChange?(true) }
         }
         return ok
     }

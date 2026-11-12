@@ -462,4 +462,415 @@ final class GitActionsTests: XCTestCase {
         let new = patch(files.filter { $0.path == "-new.txt" })
         XCTAssertTrue(new.contains("+++ b/-new.txt") && new.contains("+hello\n"), new)
     }
+
+    // MARK: - Filtering, sorting and Git performance
+
+    func testChangesViewFiltersAndStagesOnlyShownFiles() throws {
+        let v = ChangesView()
+        v.frame = NSRect(x: 0, y: 0, width: 240, height: 500)
+        v.filter = .all
+        v.sort = .path
+        let sample: [GitRepository.ChangedFile] = [
+            .init(path: "src/staged.swift", status: .modified, added: 4, removed: 1, staged: true),
+            .init(path: "src/added.swift", status: .added, added: 10, removed: 0, staged: true),
+            .init(path: "src/edited.swift", status: .modified, added: 2, removed: 3, staged: false),
+            .init(path: "docs/Café.md", status: .untracked, added: 8, removed: 0, staged: false),
+            .init(path: "old/gone.txt", status: .deleted, added: 0, removed: 5, staged: false),
+        ]
+        v.setFiles(sample)
+        v.layoutSubtreeIfNeeded()
+        XCTAssertEqual(v.files.count, 5)
+        XCTAssertFalse(v.isFiltered)
+
+        v.filter = .tracked
+        XCTAssertTrue(v.isFiltered)
+        XCTAssertEqual(v.files.map(\.path), ["src/added.swift", "src/staged.swift", "old/gone.txt", "src/edited.swift"])
+        XCTAssertEqual(v.filteredPathCount, 4)
+
+        // Stage Shown in the unstaged section must stage only the shown tracked files, never the hidden untracked file.
+        var stagedTargets: [GitRepository.ChangedFile] = []
+        v.onListAction = { files, action in
+            if action == .stage { stagedTargets = files }
+        }
+        let unstagedHeaderRow = try XCTUnwrap((0..<v.list.numberOfRows).first { row in
+            (v.list.view(atColumn: 0, row: row, makeIfNecessary: true)?.accessibilityLabel() ?? "").hasPrefix("Changes,")
+        })
+        let headerMenu = try XCTUnwrap(v.list.menuProvider?(unstagedHeaderRow))
+        XCTAssertEqual(headerMenu.items.first?.title, "Stage Shown")
+        _ = headerMenu.items.first?.target?.perform(headerMenu.items.first?.action)
+        XCTAssertEqual(stagedTargets.map(\.path), ["old/gone.txt", "src/edited.swift"])
+
+        v.filter = .untracked
+        XCTAssertEqual(v.files.map(\.path), ["docs/Café.md"])
+
+        v.filter = .staged
+        XCTAssertEqual(v.files.map(\.path), ["src/added.swift", "src/staged.swift"])
+
+        v.filter = .unstaged
+        XCTAssertEqual(v.files.map(\.path), ["docs/Café.md", "old/gone.txt", "src/edited.swift"])
+
+        v.filter = .modified
+        XCTAssertEqual(v.files.map(\.path), ["src/staged.swift", "src/edited.swift"])
+
+        v.filter = .deleted
+        XCTAssertEqual(v.files.map(\.path), ["old/gone.txt"])
+
+        // Multi-term ASCII and Unicode diacritic-insensitive text filtering.
+        v.filter = .all
+        v.query = "src swift"
+        XCTAssertEqual(v.files.map(\.path), ["src/added.swift", "src/staged.swift", "src/edited.swift"])
+
+        v.query = "cafe"
+        XCTAssertEqual(v.files.map(\.path), ["docs/Café.md"])
+
+        v.query = "nonexistent"
+        XCTAssertTrue(v.files.isEmpty)
+        v.query = ""
+        XCTAssertEqual(v.files.count, 5)
+
+        // Keyboard navigation between the filter field and the Changes list.
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 500),
+                           styleMask: [.titled], backing: .buffered, defer: false)
+        win.isReleasedWhenClosed = false
+        win.contentView = v
+        defer { win.close() }
+        v.focus()
+        XCTAssertTrue(win.firstResponder === v.list)
+        let slash = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                                   timestamp: 0, windowNumber: win.windowNumber, context: nil,
+                                                   characters: "/", charactersIgnoringModifiers: "/", isARepeat: false, keyCode: 44))
+        v.list.keyDown(with: slash)
+        XCTAssertNotNil(v.filterField.field.currentEditor(), "pressing / in the Changes list should focus the filter field")
+
+        v.query = "edited"
+        let editor = try XCTUnwrap(v.filterField.field.currentEditor() as? NSTextView)
+        XCTAssertTrue(v.control(v.filterField.field, textView: editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        XCTAssertEqual(v.query, "", "first Escape clears the filter query")
+        XCTAssertTrue(v.control(v.filterField.field, textView: editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        XCTAssertTrue(win.firstResponder === v.list, "second Escape returns focus to the Changes list")
+
+        v.focusFilter()
+        v.list.deselectAll(nil)
+        let editorAgain = try XCTUnwrap(v.filterField.field.currentEditor() as? NSTextView)
+        XCTAssertTrue(v.control(v.filterField.field, textView: editorAgain, doCommandBy: #selector(NSResponder.moveDown(_:))))
+        XCTAssertTrue(win.firstResponder === v.list)
+        XCTAssertFalse(v.list.selectedRowIndexes.isEmpty)
+    }
+
+    func testChangesViewSortsByPathNameStatusAndLinesChanged() throws {
+        let d = UserDefaults.standard
+        let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
+        let oldSort = d.object(forKey: Settings.Key.gitChangesSort)
+        defer {
+            d.set(oldFilter, forKey: Settings.Key.gitChangesFilter)
+            d.set(oldSort, forKey: Settings.Key.gitChangesSort)
+        }
+
+        let v = ChangesView()
+        v.filter = .all
+        v.sort = .path
+        let sample: [GitRepository.ChangedFile] = [
+            .init(path: "z_dir/alpha.swift", status: .modified, added: 2, removed: 1),
+            .init(path: "a_dir/zeta.swift", status: .untracked, added: 50, removed: 0),
+            .init(path: "m_dir/alpha.swift", status: .deleted, added: 0, removed: 10),
+            .init(path: "b_dir/asset.png", status: .modified, added: nil, removed: nil),
+        ]
+        v.setFiles(sample)
+        XCTAssertEqual(v.files.map(\.path), ["a_dir/zeta.swift", "b_dir/asset.png", "m_dir/alpha.swift", "z_dir/alpha.swift"])
+
+        // Sort by Name orders by basename first and tie-breaks identical basenames by path.
+        let sortMenu = v.makeSortMenu()
+        let byName = try XCTUnwrap(sortMenu.items.first { $0.title == "Sort by Name" })
+        _ = byName.target?.perform(byName.action, with: byName)
+        XCTAssertEqual(Settings.shared.gitChangesSort, .name)
+        XCTAssertEqual(v.files.map(\.path), ["m_dir/alpha.swift", "z_dir/alpha.swift", "b_dir/asset.png", "a_dir/zeta.swift"])
+
+        v.sort = .status
+        XCTAssertEqual(v.files.map(\.path), ["b_dir/asset.png", "z_dir/alpha.swift", "m_dir/alpha.swift", "a_dir/zeta.swift"])
+
+        v.sort = .changes
+        XCTAssertEqual(v.files.map(\.path), ["a_dir/zeta.swift", "m_dir/alpha.swift", "z_dir/alpha.swift", "b_dir/asset.png"])
+
+        // Performance gate: filtering + sorting 5,000 changed files stays fast on the main thread.
+        let large = (0..<5_000).map { i in
+            GitRepository.ChangedFile(path: "module-\(i % 25)/sub-\(i % 7)/File\(5_000 - i).swift",
+                                      status: i % 3 == 0 ? .untracked : .modified,
+                                      added: i % 50, removed: i % 13, staged: i % 5 == 0)
+        }
+        let t0 = CACurrentMediaTime()
+        v.setFiles(large)
+        for mode in ChangeSort.allCases { v.sort = mode }
+        v.filter = .tracked
+        v.query = "module-3 file"
+        let elapsedMs = (CACurrentMediaTime() - t0) * 1000
+        XCTAssertLessThan(elapsedMs, 250, "filtering and sorting 5,000 changed files took \(elapsedMs) ms")
+        XCTAssertFalse(v.files.isEmpty)
+    }
+
+    func testTrackedFilterSkipsUntrackedFilesInGitAndRefreshesFilesTabWhenSwitchedBack() throws {
+        let d = UserDefaults.standard
+        let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
+        let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
+        defer {
+            d.set(oldHistory, forKey: Settings.Key.gitChangesAndHistory)
+            d.set(oldFilter, forKey: Settings.Key.gitChangesFilter)
+            NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        }
+        d.set(true, forKey: Settings.Key.gitChangesAndHistory)
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+
+        try write("ignore.log\n*.ignored\n", ".gitignore")
+        try write("one\ntwo\n", "tracked.txt")
+        try shell("git add -A && \(commit) init")
+        try write("one\nTWO\nthree\n", "tracked.txt")
+        try write("ignored\n", "ignore.log")
+        let chunk = String(repeating: "untracked content line with realistic width\n", count: 200)
+        for i in 0..<250 { try write(chunk, "untracked/dir-\(i % 10)/u\(i).txt") }
+
+        let repo = try repo()
+        var trackedOnly: [GitRepository.ChangedFile] = []
+        let exp = expectation(description: "tracked changeList")
+        repo.changeList(filter: .tracked) { trackedOnly = $0; exp.fulfill() }
+        wait(for: [exp], timeout: 30)
+        XCTAssertEqual(trackedOnly.map(\.path), ["tracked.txt"])
+        XCTAssertEqual(trackedOnly.first?.added, 2)
+        XCTAssertEqual(trackedOnly.first?.removed, 1)
+
+        var untrackedOnly: [GitRepository.ChangedFile] = []
+        let expU = expectation(description: "untracked changeList")
+        repo.changeList(filter: .untracked) { untrackedOnly = $0; expU.fulfill() }
+        wait(for: [expU], timeout: 30)
+        XCTAssertEqual(untrackedOnly.count, 250)
+        XCTAssertEqual(untrackedOnly.first?.added, 200)
+
+        var warmAll: [GitRepository.ChangedFile] = []
+        let expWarm = expectation(description: "warm all changeList")
+        repo.changeList(filter: .all) { warmAll = $0; expWarm.fulfill() }
+        wait(for: [expWarm], timeout: 30)
+        XCTAssertEqual(warmAll.count, 251)
+
+        // Modifying an untracked file invalidates its cached DiskStamp line count immediately.
+        try write("a\nb\nc\nd\n", "untracked/dir-0/u0.txt")
+        var updatedUntracked: [GitRepository.ChangedFile] = []
+        let expU2 = expectation(description: "updated untracked changeList")
+        repo.changeList(filter: .untracked) { updatedUntracked = $0; expU2.fulfill() }
+        wait(for: [expU2], timeout: 30)
+        XCTAssertEqual(updatedUntracked.first { $0.path == "untracked/dir-0/u0.txt" }?.added, 4)
+
+        // Window integration: Tracked filter in Changes skips untracked/ignored work while active,
+        // and switching back to Files refreshes the file tree's untracked & ignored status.
+        _ = NSApplication.shared
+        let controller = MainWindowController()
+        defer {
+            for group in controller.groups { for tab in group.tabs { tab.close() } }
+            controller.window?.delegate = nil
+            controller.window?.close()
+        }
+        d.set(ChangeFilter.tracked.rawValue, forKey: Settings.Key.gitChangesFilter)
+        controller.setFolder(URL(fileURLWithPath: dir.path, isDirectory: true))
+        controller.sidebar.showChanges(true)
+        let list = try XCTUnwrap(controller.sidebar.subviews.compactMap { $0 as? ChangesView }.first)
+        spin { list.files.map(\.path) == ["tracked.txt"] }
+        XCTAssertEqual(list.filter, .tracked)
+
+        // Broadening the filter to All Changes fetches the untracked files automatically.
+        list.filter = .all
+        spin { list.files.count == 251 }
+
+        // Narrowing back to Tracked keeps the repository-wide status bar count intact while
+        // loading only tracked entries into Changes, and switching to Files refreshes ignored paths.
+        list.filter = .tracked
+        XCTAssertEqual(list.files.map(\.path), ["tracked.txt"])
+        try write("ignored later\n", "later.ignored")
+        controller.refreshGitStatus()
+        spin { list.allFiles.map(\.path) == ["tracked.txt"] }
+        XCTAssertEqual(controller.changedFileCount, 251)
+        XCTAssertEqual(controller.statusBar.values[.changes], "251 changed")
+
+        controller.sidebar.showChanges(false)
+        controller.sidebar.refreshTree()
+        controller.sidebar.layoutSubtreeIfNeeded()
+        spin {
+            let outline = controller.sidebar.outline
+            guard let row = (0..<outline.numberOfRows).first(where: { (outline.item(atRow: $0) as? FileNode)?.name == "later.ignored" }),
+                  let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: true) else { return false }
+            return cell.accessibilityLabel()?.contains("Ignored") == true
+        }
+    }
+
+    func testInFlightFilteredRefreshDoesNotClobberBroaderActiveFilter() throws {
+        let d = UserDefaults.standard
+        let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
+        let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
+        defer {
+            d.set(oldHistory, forKey: Settings.Key.gitChangesAndHistory)
+            d.set(oldFilter, forKey: Settings.Key.gitChangesFilter)
+            NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        }
+        d.set(true, forKey: Settings.Key.gitChangesAndHistory)
+        d.set(ChangeFilter.all.rawValue, forKey: Settings.Key.gitChangesFilter)
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+
+        try write("base\n", "tracked.txt")
+        try shell("git add tracked.txt && \(commit) init")
+        try write("base\nchanged\n", "tracked.txt")
+        try write("new\n", "untracked.txt")
+
+        _ = NSApplication.shared
+        let c = MainWindowController()
+        defer {
+            c.teardown()
+            c.window?.delegate = nil
+            c.window?.close()
+        }
+        c.setFolder(URL(fileURLWithPath: dir.path, isDirectory: true))
+        c.sidebar.showChanges(true)
+        let view = try XCTUnwrap(c.sidebar.subviews.compactMap { $0 as? ChangesView }.first)
+        spin { view.allFiles.count == 2 }
+        XCTAssertEqual(Set(view.files.map(\.path)), ["tracked.txt", "untracked.txt"])
+
+        // Select Tracked, create a second untracked file, start a refresh, then switch back to All
+        // Changes in the same turn before the async Tracked request can finish.
+        view.filter = .tracked
+        try write("new 2\n", "untracked2.txt")
+        c.refreshGitStatus()
+        view.filter = .all
+
+        let deadline = Date().addingTimeInterval(10)
+        while Set(view.files.map(\.path)) != ["tracked.txt", "untracked.txt", "untracked2.txt"] && Date() < deadline {
+            XCTAssertTrue(view.files.contains { $0.path == "untracked.txt" },
+                          "All Changes transiently or permanently lost untracked.txt after the in-flight Tracked request completed")
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(view.filter, .all)
+        XCTAssertEqual(Set(view.files.map(\.path)), ["tracked.txt", "untracked.txt", "untracked2.txt"])
+    }
+
+    func testStatusBarCountStaysIndependentOfChangesFilter() throws {
+        let d = UserDefaults.standard
+        let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
+        let oldStatusBar = d.object(forKey: Settings.Key.gitStatusBarChanges)
+        let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
+        defer {
+            d.set(oldHistory, forKey: Settings.Key.gitChangesAndHistory)
+            d.set(oldStatusBar, forKey: Settings.Key.gitStatusBarChanges)
+            d.set(oldFilter, forKey: Settings.Key.gitChangesFilter)
+            NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        }
+        d.set(true, forKey: Settings.Key.gitChangesAndHistory)
+        d.set(true, forKey: Settings.Key.gitStatusBarChanges)
+        d.set(ChangeFilter.all.rawValue, forKey: Settings.Key.gitChangesFilter)
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+
+        try write("base\n", "tracked.txt")
+        try shell("git add tracked.txt && \(commit) init")
+        try write("base\nchanged\n", "tracked.txt")
+        try write("new\n", "untracked.txt")
+
+        _ = NSApplication.shared
+        let c = MainWindowController()
+        defer {
+            c.teardown()
+            c.window?.delegate = nil
+            c.window?.close()
+        }
+        c.setFolder(URL(fileURLWithPath: dir.path, isDirectory: true))
+        c.sidebar.showChanges(true)
+        let view = try XCTUnwrap(c.sidebar.subviews.compactMap { $0 as? ChangesView }.first)
+        spin { view.allFiles.count == 2 && c.changedFileCount == 2 }
+        XCTAssertEqual(c.statusBar.values[.changes], "2 changed")
+
+        view.filter = .tracked
+        c.refreshGitStatus()
+        spin { view.allFiles.count == 1 }
+        XCTAssertEqual(c.changedFileCount, 2, "repository-wide changed count dropped untracked files under Tracked filter")
+        XCTAssertEqual(c.statusBar.values[.changes], "2 changed")
+
+        view.filter = .staged
+        c.refreshGitStatus()
+        spin { view.allFiles.isEmpty }
+        XCTAssertEqual(c.changedFileCount, 2, "repository-wide changed count dropped files under Staged filter")
+        XCTAssertEqual(c.statusBar.values[.changes], "2 changed")
+    }
+
+    func testFilteredViewPreservesStagingMetadataForLiveLineCounts() throws {
+        let d = UserDefaults.standard
+        let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
+        let oldGutter = d.object(forKey: Settings.Key.gitGutter)
+        let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
+        defer {
+            d.set(oldHistory, forKey: Settings.Key.gitChangesAndHistory)
+            d.set(oldGutter, forKey: Settings.Key.gitGutter)
+            d.set(oldFilter, forKey: Settings.Key.gitChangesFilter)
+            NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+        }
+        d.set(true, forKey: Settings.Key.gitChangesAndHistory)
+        d.set(true, forKey: Settings.Key.gitGutter)
+        d.set(ChangeFilter.all.rawValue, forKey: Settings.Key.gitChangesFilter)
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
+
+        try write("base\n", "tracked.txt")
+        try write("recreated-old\n", "recreated.txt")
+        try write("plain\n", "plain.txt")
+        try shell("git add tracked.txt recreated.txt plain.txt && \(commit) init")
+        // Partially staged modified file (MM): +1 staged, +1 on disk.
+        try write("base\nstaged\n", "tracked.txt")
+        try shell("git add tracked.txt && git rm -q recreated.txt")
+        try write("base\nstaged\ndisk\n", "tracked.txt")
+        // Staged deletion recreated in worktree (D?): in HEAD, staged .deleted, unstaged .untracked (1 line).
+        try write("fresh\n", "recreated.txt")
+        // Purely unstaged modified file ( M): +1 on disk.
+        try write("plain\ndisk\n", "plain.txt")
+
+        _ = NSApplication.shared
+        let c = MainWindowController()
+        defer {
+            c.teardown()
+            c.window?.delegate = nil
+            c.window?.close()
+        }
+        c.setFolder(URL(fileURLWithPath: dir.path, isDirectory: true))
+        c.sidebar.showChanges(true)
+        let view = try XCTUnwrap(c.sidebar.subviews.compactMap { $0 as? ChangesView }.first)
+        spin { view.allFiles.count == 5 }
+
+        // Open all three HEAD-backed files and add unsaved lines in the editor.
+        let trackedDoc = try XCTUnwrap(c.open(url: dir.appendingPathComponent("tracked.txt")))
+        spin { trackedDoc.hasGitBaseline }
+        try XCTUnwrap(c.activeEditor?.textView).insertText("unsaved\n", replacementRange: NSRange(location: trackedDoc.length, length: 0))
+        spin { trackedDoc.isDirty && trackedDoc.isGitDiffCurrent }
+        XCTAssertEqual(trackedDoc.gitDiff.hunks.reduce(0) { $0 + $1.newCount }, 3)
+
+        let recreatedDoc = try XCTUnwrap(c.open(url: dir.appendingPathComponent("recreated.txt")))
+        spin { recreatedDoc.hasGitBaseline }
+        try XCTUnwrap(c.activeEditor?.textView).insertText("unsaved\n", replacementRange: NSRange(location: recreatedDoc.length, length: 0))
+        spin { recreatedDoc.isDirty && recreatedDoc.isGitDiffCurrent }
+
+        let plainDoc = try XCTUnwrap(c.open(url: dir.appendingPathComponent("plain.txt")))
+        spin { plainDoc.hasGitBaseline }
+        try XCTUnwrap(c.activeEditor?.textView).insertText("unsaved\n", replacementRange: NSRange(location: plainDoc.length, length: 0))
+        spin { plainDoc.isDirty && plainDoc.isGitDiffCurrent }
+        XCTAssertEqual(plainDoc.gitDiff.hunks.reduce(0) { $0 + $1.newCount }, 2)
+
+        // Under Unstaged filter, staged rows are omitted, yet partially staged files must keep their
+        // index/disk counts while purely unstaged plain.txt receives its live +2 count.
+        view.filter = .unstaged
+        c.refreshGitStatus()
+        spin { view.allFiles.count == 3 && view.files.first(where: { $0.path == "plain.txt" })?.added == 2 }
+        XCTAssertEqual(view.files.first { $0.path == "tracked.txt" }?.added, 1,
+                       "partially staged MM file substituted HEAD-relative live counts when staged row was filtered out")
+        XCTAssertEqual(view.files.first { $0.path == "recreated.txt" }?.added, 1)
+        XCTAssertEqual(view.files.first { $0.path == "recreated.txt" }?.removed, 0,
+                       "staged deletion recreated in worktree substituted HEAD-relative removed count")
+        XCTAssertEqual(view.files.first { $0.path == "plain.txt" }?.added, 2)
+
+        // Under Untracked filter, recreated.txt's staged deletion row is omitted while its untracked
+        // row remains; it must still preserve its untracked (+1, -0) count rather than diffing HEAD.
+        view.filter = .untracked
+        c.refreshGitStatus()
+        spin { view.allFiles.count == 1 }
+        XCTAssertEqual(view.files.first?.path, "recreated.txt")
+        XCTAssertEqual(view.files.first?.added, 1)
+        XCTAssertEqual(view.files.first?.removed, 0)
+    }
 }

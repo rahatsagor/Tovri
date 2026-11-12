@@ -26,6 +26,135 @@ enum GitFileStatus: Equatable {
         case .ignored: return "Ignored"
         }
     }
+
+    var sortRank: Int {
+        switch self {
+        case .conflicted: return 0
+        case .modified: return 1
+        case .renamed: return 2
+        case .added: return 3
+        case .deleted: return 4
+        case .untracked: return 5
+        case .ignored: return 6
+        }
+    }
+}
+
+/// Which uncommitted changes the sidebar's Changes list loads and displays.
+enum ChangeFilter: String, CaseIterable {
+    case all, tracked, untracked, staged, unstaged, modified, deleted
+
+    var title: String {
+        switch self {
+        case .all: return "All Changes"
+        case .tracked: return "Tracked"
+        case .untracked: return "Untracked"
+        case .staged: return "Staged"
+        case .unstaged: return "Unstaged"
+        case .modified: return "Modified"
+        case .deleted: return "Deleted"
+        }
+    }
+
+    var emptyMessage: String {
+        switch self {
+        case .all: return "No uncommitted changes"
+        case .tracked: return "No tracked changes"
+        case .untracked: return "No untracked files"
+        case .staged: return "No staged changes"
+        case .unstaged: return "No unstaged changes"
+        case .modified: return "No modified files"
+        case .deleted: return "No deleted files"
+        }
+    }
+
+    /// When false, `git status` passes `--untracked-files=no` and skips scanning untracked folders.
+    var includesUntracked: Bool {
+        switch self {
+        case .all, .untracked, .unstaged: return true
+        case .tracked, .staged, .modified, .deleted: return false
+        }
+    }
+
+    var includesStaged: Bool {
+        switch self {
+        case .all, .tracked, .staged, .modified, .deleted: return true
+        case .untracked, .unstaged: return false
+        }
+    }
+
+    var includesTrackedUnstaged: Bool {
+        switch self {
+        case .all, .tracked, .unstaged, .modified, .deleted: return true
+        case .untracked, .staged: return false
+        }
+    }
+
+    func matches(_ file: GitRepository.ChangedFile) -> Bool {
+        switch self {
+        case .all: return true
+        case .tracked: return file.status != .untracked
+        case .untracked: return file.status == .untracked
+        case .staged: return file.staged
+        case .unstaged: return !file.staged
+        case .modified: return file.status == .modified || file.status == .renamed
+        case .deleted: return file.status == .deleted
+        }
+    }
+
+    /// Whether a change list fetched with `self` already holds every file and line count `other` needs.
+    func covers(_ other: ChangeFilter) -> Bool {
+        switch self {
+        case .all: return true
+        case .tracked: return !other.includesUntracked
+        case .unstaged: return other == .unstaged || other == .untracked
+        default: return self == other
+        }
+    }
+}
+
+/// How files are ordered within each section of the sidebar's Changes list.
+enum ChangeSort: String, CaseIterable {
+    case path, name, status, changes
+
+    var title: String {
+        switch self {
+        case .path: return "Path"
+        case .name: return "Name"
+        case .status: return "Status"
+        case .changes: return "Lines Changed"
+        }
+    }
+
+    func sorted(_ files: [GitRepository.ChangedFile]) -> [GitRepository.ChangedFile] {
+        guard files.count > 1 else { return files }
+        switch self {
+        case .path:
+            return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        case .name:
+            let keyed = files.map { f -> (name: Substring, file: GitRepository.ChangedFile) in
+                let name = f.path.lastIndex(of: "/").map { f.path[f.path.index(after: $0)...] } ?? f.path[...]
+                return (name, f)
+            }
+            return keyed.sorted { a, b in
+                let cmp = a.name.localizedStandardCompare(b.name)
+                if cmp != .orderedSame { return cmp == .orderedAscending }
+                return a.file.path.localizedStandardCompare(b.file.path) == .orderedAscending
+            }.map(\.file)
+        case .status:
+            return files.sorted { a, b in
+                if a.status.sortRank != b.status.sortRank { return a.status.sortRank < b.status.sortRank }
+                return a.path.localizedStandardCompare(b.path) == .orderedAscending
+            }
+        case .changes:
+            return files.sorted { a, b in
+                let ca = a.added.map { $0 + (a.removed ?? 0) } ?? -1
+                let cb = b.added.map { $0 + (b.removed ?? 0) } ?? -1
+                if ca != cb { return ca > cb }
+                return a.path.localizedStandardCompare(b.path) == .orderedAscending
+            }
+        }
+    }
 }
 
 enum DiffMark: UInt8 { case added, modified }
@@ -93,6 +222,15 @@ final class GitRepository {
     }
     private let filterLock = NSLock()
     private var cachedFilters: (stamp: FilterCacheStamp, expiresAt: TimeInterval, names: Set<String>)?
+
+    private struct CachedLineCount {
+        let stamp: DiskStamp
+        let count: Int?
+    }
+    private let lineCountLock = NSLock()
+    private var lineCountCache: [String: CachedLineCount] = [:]
+    /// Caps untracked file bytes read per status pass so huge unignored trees never stall Git.
+    private static let untrackedReadBudget = 64_000_000
 
     static let executable: String? = {
         let fm = FileManager.default
@@ -438,13 +576,30 @@ final class GitRepository {
         return p.terminationReason == .exit && acceptedStatuses.contains(p.terminationStatus) ? output.data : nil
     }
 
-    static let statusArguments = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]
+    static let statusArguments = statusArguments(includeUntracked: true)
+
+    static func statusArguments(includeUntracked: Bool) -> [String] {
+        ["status", "--porcelain=v1", "-z", includeUntracked ? "--untracked-files=all" : "--untracked-files=no", "--ignore-submodules=all"]
+    }
 
     func status(_ completion: @escaping ([String: GitFileStatus]) -> Void) {
         GitRepository.runAsync {
             let data = self.run(GitRepository.statusArguments)
             let result = data.map(GitRepository.parseStatus) ?? [:]
             DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    /// Reads `git status` once and, when `changesFilter` is given, builds the filtered Changes
+    /// list from the same parsed entries without spawning a second `git status` process.
+    func statusAndChanges(includeUntracked: Bool = true, changesFilter: ChangeFilter?,
+                          _ completion: @escaping ([String: GitFileStatus], [StatusEntry], [ChangedFile]?) -> Void) {
+        GitRepository.runAsync {
+            let entries = self.run(GitRepository.statusArguments(includeUntracked: includeUntracked))
+                .map(GitRepository.parseStatusEntries) ?? []
+            let status = GitRepository.status(from: entries)
+            let changes = changesFilter.map { self.changeList(entries, filter: $0) }
+            DispatchQueue.main.async { completion(status, entries, changes) }
         }
     }
 
@@ -524,10 +679,15 @@ final class GitRepository {
         return result
     }
 
-    static func parseStatus(_ data: Data) -> [String: GitFileStatus] {
+    static func status(from entries: [StatusEntry]) -> [String: GitFileStatus] {
         var result: [String: GitFileStatus] = [:]
-        for e in parseStatusEntries(data) { result[e.path] = e.status }
+        result.reserveCapacity(entries.count)
+        for e in entries { result[e.path] = e.status }
         return result
+    }
+
+    static func parseStatus(_ data: Data) -> [String: GitFileStatus] {
+        status(from: parseStatusEntries(data))
     }
 
     struct ChangedFile: Equatable {
@@ -546,13 +706,16 @@ final class GitRepository {
     func changedFiles(status known: [String: GitFileStatus]? = nil, _ completion: @escaping ([ChangedFile]) -> Void) {
         GitRepository.runAsync {
             let status = known ?? self.run(GitRepository.statusArguments).map(GitRepository.parseStatus) ?? [:]
-            let counts = status.isEmpty ? [:] : (self.run(["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
+            let hasTracked = status.contains { $0.value != .ignored && $0.value != .untracked }
+            let counts = !hasTracked ? [:] : (self.run(["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
+            var remainingBytes = GitRepository.untrackedReadBudget
             var out: [ChangedFile] = []
+            out.reserveCapacity(status.count)
             for (path, st) in status where st != .ignored {
                 var f = ChangedFile(path: path, status: st)
                 if let c = counts[path] {
                     (f.added, f.removed) = (c.added, c.removed)
-                } else if st == .untracked, let n = GitRepository.lineCount(of: self.root.appendingPathComponent(path)) {
+                } else if st == .untracked, let n = self.cachedLineCount(for: path, remainingBytes: &remainingBytes) {
                     (f.added, f.removed) = (n, 0)
                 }
                 out.append(f)
@@ -563,36 +726,52 @@ final class GitRepository {
     }
 
     /// The Changes list: each file's staged change, counted against HEAD, and its unstaged change,
-    /// counted against the staged copy. A file with both is listed twice.
-    func changeList(_ completion: @escaping ([ChangedFile]) -> Void) {
+    /// counted against the staged copy. A file with both is listed twice. When `filter` excludes
+    /// untracked, staged or unstaged changes, the corresponding Git and disk work is skipped.
+    func changeList(filter: ChangeFilter = .all, _ completion: @escaping ([ChangedFile]) -> Void) {
         GitRepository.runAsync {
-            let entries = self.run(GitRepository.statusArguments).map(GitRepository.parseStatusEntries) ?? []
-            let out = self.changeList(entries)
+            let entries = self.run(GitRepository.statusArguments(includeUntracked: filter.includesUntracked))
+                .map(GitRepository.parseStatusEntries) ?? []
+            let out = self.changeList(entries, filter: filter)
             DispatchQueue.main.async { completion(out) }
         }
     }
 
-    private func changeList(_ entries: [StatusEntry]) -> [ChangedFile] {
+    private func changeList(_ entries: [StatusEntry], filter: ChangeFilter = .all) -> [ChangedFile] {
         let diff = ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z"]
-        let stagedCounts = entries.contains { $0.staged != nil }
-            ? run(diff + ["--cached", "--"]).map(GitRepository.parseNumstat) ?? [:] : [:]
-        let unstagedCounts = entries.contains { $0.unstaged != nil && $0.unstaged != .untracked }
-            ? run(diff + ["--"]).map(GitRepository.parseNumstat) ?? [:] : [:]
+        let needsStagedDiff = filter.includesStaged && entries.contains { e in
+            guard let st = e.staged else { return false }
+            return filter.matches(ChangedFile(path: e.path, status: st, staged: true))
+        }
+        let needsUnstagedDiff = filter.includesTrackedUnstaged && entries.contains { e in
+            guard let st = e.unstaged, st != .untracked else { return false }
+            return filter.matches(ChangedFile(path: e.path, status: st))
+        }
+        let stagedCounts = needsStagedDiff ? run(diff + ["--cached", "--"]).map(GitRepository.parseNumstat) ?? [:] : [:]
+        let unstagedCounts = needsUnstagedDiff ? run(diff + ["--"]).map(GitRepository.parseNumstat) ?? [:] : [:]
+        var remainingBytes = GitRepository.untrackedReadBudget
         var out: [ChangedFile] = []
+        out.reserveCapacity(entries.count)
         for e in entries {
-            if let st = e.staged {
+            if filter.includesStaged, let st = e.staged {
                 var f = ChangedFile(path: e.path, status: st, staged: true, originalPath: e.originalPath)
-                if let c = stagedCounts[e.path] { (f.added, f.removed) = (c.added, c.removed) }
-                out.append(f)
+                if filter.matches(f) {
+                    if let c = stagedCounts[e.path] { (f.added, f.removed) = (c.added, c.removed) }
+                    out.append(f)
+                }
             }
             if let st = e.unstaged {
+                if st == .untracked && !filter.includesUntracked { continue }
+                if st != .untracked && !filter.includesTrackedUnstaged { continue }
                 var f = ChangedFile(path: e.path, status: st, originalPath: e.staged == nil ? e.originalPath : nil)
-                if let c = unstagedCounts[e.path] {
-                    (f.added, f.removed) = (c.added, c.removed)
-                } else if st == .untracked, let n = GitRepository.lineCount(of: root.appendingPathComponent(e.path)) {
-                    (f.added, f.removed) = (n, 0)
+                if filter.matches(f) {
+                    if let c = unstagedCounts[e.path] {
+                        (f.added, f.removed) = (c.added, c.removed)
+                    } else if st == .untracked, let n = cachedLineCount(for: e.path, remainingBytes: &remainingBytes) {
+                        (f.added, f.removed) = (n, 0)
+                    }
+                    out.append(f)
                 }
-                out.append(f)
             }
         }
         out.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
@@ -622,6 +801,29 @@ final class GitRepository {
         return result
     }
 
+    private func cachedLineCount(for relativePath: String, remainingBytes: inout Int) -> Int? {
+        let limit = 4_000_000
+        let url = root.appendingPathComponent(relativePath)
+        var info = stat()
+        guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size <= limit else { return nil }
+        let stamp = DiskStamp(info: info)
+        lineCountLock.lock()
+        if let hit = lineCountCache[relativePath], hit.stamp == stamp {
+            lineCountLock.unlock()
+            return hit.count
+        }
+        lineCountLock.unlock()
+        let bytes = max(0, Int(info.st_size))
+        guard remainingBytes >= bytes else { return nil }
+        remainingBytes -= max(1, bytes)
+        let count = GitRepository.lineCount(of: url)
+        lineCountLock.lock()
+        if lineCountCache.count >= 4096 { lineCountCache.removeAll(keepingCapacity: true) }
+        lineCountCache[relativePath] = CachedLineCount(stamp: stamp, count: count)
+        lineCountLock.unlock()
+        return count
+    }
+
     /// Lines in a regular file of up to 4 MB that isn't binary, following a symlink to its target.
     static func lineCount(of url: URL) -> Int? {
         let limit = 4_000_000
@@ -634,9 +836,17 @@ final class GitRepository {
         guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size <= limit else { return nil }
         let data: Data
         do { data = try file.read(upToCount: limit + 1) ?? Data() } catch { return nil }
-        guard data.count <= limit, !data.contains(0) else { return nil }
+        guard data.count <= limit else { return nil }
         guard !data.isEmpty else { return 0 }
-        let newlines = data.reduce(0) { $1 == 10 ? $0 + 1 : $0 }
+        var newlines = 0
+        let hasNull = data.withUnsafeBytes { buf -> Bool in
+            for b in buf {
+                if b == 0 { return true }
+                if b == 10 { newlines += 1 }
+            }
+            return false
+        }
+        guard !hasNull else { return nil }
         return newlines + (data.last == 10 ? 0 : 1)
     }
 

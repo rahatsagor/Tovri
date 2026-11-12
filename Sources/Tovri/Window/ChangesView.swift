@@ -95,12 +95,53 @@ final class SidebarTabs: NSView {
 
 /// The sidebar's list of files with uncommitted changes and the lines each adds and removes, in
 /// a Staged Changes section and a Changes section for what isn't staged.
-final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate {
+final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTextFieldDelegate {
     var onAction: ((GitRepository.ChangedFile, SidebarChangeAction) -> Void)?
     var onListAction: (([GitRepository.ChangedFile], ChangeListAction) -> Void)?
+    var onFilterChange: ((ChangeFilter) -> Void)?
+    private(set) var allFiles: [GitRepository.ChangedFile] = []
     private(set) var files: [GitRepository.ChangedFile] = []
+    private var stagedFiles: [GitRepository.ChangedFile] = []
+    private var unstagedFiles: [GitRepository.ChangedFile] = []
+
+    var filter: ChangeFilter = Settings.shared.gitChangesFilter {
+        didSet {
+            guard oldValue != filter else { return }
+            rebuildRows()
+            onFilterChange?(filter)
+        }
+    }
+
+    var sort: ChangeSort = Settings.shared.gitChangesSort {
+        didSet {
+            guard oldValue != sort else { return }
+            rebuildRows()
+        }
+    }
+
+    var query: String {
+        get { filterField.stringValue }
+        set {
+            guard filterField.stringValue != newValue else { return }
+            filterField.stringValue = newValue
+            rebuildRows()
+        }
+    }
+
+    var isFiltered: Bool { filter != .all || !ChangesView.queryTerms(query).isEmpty }
+
+    /// Unique changed paths matching `filter` (ignoring the quick text box).
+    var filteredPathCount: Int {
+        var seen = Set<String>()
+        for f in allFiles where filter.matches(f) { seen.insert(f.path) }
+        return seen.count
+    }
+
+    let filterField = ThemedTextField(placeholder: "Filter")
+    let filterButton = ToolButton(symbol: "line.3.horizontal.decrease.circle")
+    let sortButton = ToolButton(symbol: "arrow.up.arrow.down")
     private let scroll = OverlayScrollView(frame: .zero)
-    private let list = SidebarOutlineView()
+    let list = SidebarOutlineView()
     private let empty = NSTextField(labelWithString: "No uncommitted changes")
     private var menuFiles: [GitRepository.ChangedFile] = []
     private var menuSection: [GitRepository.ChangedFile] = []
@@ -115,11 +156,27 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         }
     }
     private var rows: [Row] = []
+    private static let toolbarHeight: CGFloat = 30
 
     override var isFlipped: Bool { true }
 
     init() {
         super.init(frame: .zero)
+        filterField.fontSize = 12
+        filterField.leadingSymbol = "magnifyingglass"
+        filterField.field.delegate = self
+        filterField.field.setAccessibilityLabel("Filter changes")
+        filterField.onClear = { [weak self] in
+            guard let self else { return }
+            self.query = ""
+            self.window?.makeFirstResponder(self.filterField.field)
+        }
+        filterButton.symbolSize = 12
+        filterButton.onClick = { [weak self] in self?.showFilterMenu() }
+        sortButton.symbolSize = 11.5
+        sortButton.onClick = { [weak self] in self?.showSortMenu() }
+        [filterField, filterButton, sortButton].forEach(addSubview)
+
         let col = NSTableColumn(identifier: .init("change"))
         col.resizingMask = .autoresizingMask
         list.addTableColumn(col)
@@ -142,6 +199,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         }
         list.onSpace = { [weak self] in self?.toggleStaged() }
         list.onDelete = { [weak self] in self?.discardSelected() }
+        list.onSlash = { [weak self] in self?.focusFilter() }
         list.menuProvider = { [weak self] row in self?.menu(row: row) }
         list.setAccessibilityLabel("Changed files")
         scroll.documentView = list
@@ -151,6 +209,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         empty.font = .systemFont(ofSize: 12)
         empty.alignment = .center
         addSubview(empty)
+        updateToolbarControls()
         applyTheme()
     }
 
@@ -158,41 +217,200 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     private static func key(_ f: GitRepository.ChangedFile) -> String { (f.staged ? "s\0" : "w\0") + f.path }
 
+    static func queryTerms(_ query: String) -> [String] {
+        query.split(whereSeparator: \.isWhitespace).map { $0.lowercased() }
+    }
+
+    static func matchesQuery(_ file: GitRepository.ChangedFile, terms: [String]) -> Bool {
+        guard !terms.isEmpty else { return true }
+        return terms.allSatisfy { term in
+            containsCaseInsensitive(file.path, lowercasedTerm: term)
+                || (file.originalPath.map { containsCaseInsensitive($0, lowercasedTerm: term) } ?? false)
+        }
+    }
+
+    /// Fast ASCII byte scan for the common case, falling back to Unicode case/diacritic folding.
+    private static func containsCaseInsensitive(_ haystack: String, lowercasedTerm needle: String) -> Bool {
+        if needle.isEmpty { return true }
+        var hasNonASCII = false
+        for b in haystack.utf8 where b >= 128 { hasNonASCII = true; break }
+        if !hasNonASCII {
+            for b in needle.utf8 where b >= 128 { hasNonASCII = true; break }
+        }
+        if hasNonASCII { return haystack.localizedStandardContains(needle) }
+        return (haystack.utf8.withContiguousStorageIfAvailable { hBuf in
+            needle.utf8.withContiguousStorageIfAvailable { nBuf in
+                let hCount = hBuf.count, nCount = nBuf.count
+                guard nCount <= hCount else { return false }
+                let first = nBuf[0]
+                let end = hCount - nCount
+                var i = 0
+                while i <= end {
+                    let b0 = hBuf[i]
+                    if (b0 >= 65 && b0 <= 90 ? b0 &+ 32 : b0) == first {
+                        var j = 1
+                        while j < nCount {
+                            let bj = hBuf[i &+ j]
+                            if (bj >= 65 && bj <= 90 ? bj &+ 32 : bj) != nBuf[j] { break }
+                            j &+= 1
+                        }
+                        if j == nCount { return true }
+                    }
+                    i &+= 1
+                }
+                return false
+            }
+        } ?? nil) ?? haystack.localizedStandardContains(needle)
+    }
+
     func setFiles(_ new: [GitRepository.ChangedFile]) {
+        allFiles = new
+        rebuildRows()
+    }
+
+    private func rebuildRows() {
         let selected = Set(selectedFiles.map(ChangesView.key))
-        files = new
+        let terms = ChangesView.queryTerms(query)
+        let matched = allFiles.filter { filter.matches($0) && ChangesView.matchesQuery($0, terms: terms) }
+        stagedFiles = sort.sorted(matched.filter(\.staged))
+        unstagedFiles = sort.sorted(matched.filter { !$0.staged })
+        files = stagedFiles + unstagedFiles
         rows = []
-        for staged in [true, false] {
-            let section = new.filter { $0.staged == staged }
-            guard !section.isEmpty else { continue }
+        rows.reserveCapacity(files.count + 2)
+        for (staged, section) in [(true, stagedFiles), (false, unstagedFiles)] where !section.isEmpty {
             rows.append(Row(staged: staged, file: nil))
             rows += section.map { Row(staged: staged, file: $0) }
         }
         list.reloadData()
         let keep = IndexSet(rows.indices.filter { rows[$0].file.map { selected.contains(ChangesView.key($0)) } ?? false })
         if !keep.isEmpty { list.selectRowIndexes(keep, byExtendingSelection: false) }
-        empty.isHidden = !files.isEmpty
+        empty.stringValue = !terms.isEmpty ? "No matching changes" : filter.emptyMessage
+        empty.isHidden = !rows.isEmpty
+        updateToolbarControls()
+    }
+
+    private func updateToolbarControls() {
+        filterButton.isOn = filter != .all
+        filterButton.toolTip = filter == .all ? "Filter Changes" : "Filter Changes (\(filter.title))"
+        sortButton.isOn = sort != .path
+        sortButton.toolTip = "Sort Changes (by \(sort.title))"
+    }
+
+    func syncSettings() {
+        let newFilter = Settings.shared.gitChangesFilter
+        let newSort = Settings.shared.gitChangesSort
+        if sort != newSort { sort = newSort }
+        if filter != newFilter { filter = newFilter }
     }
 
     func applyTheme() {
+        filterField.applyTheme()
+        filterButton.needsDisplay = true
+        sortButton.needsDisplay = true
         empty.textColor = ThemeManager.shared.active.chromeSecondary
         list.reloadData()
     }
 
     func focus() { window?.makeFirstResponder(list) }
+    func focusFilter() { window?.makeFirstResponder(filterField.field) }
 
     override func layout() {
         super.layout()
-        scroll.frame = bounds
+        let bar = ChangesView.toolbarHeight
+        sortButton.frame = NSRect(x: bounds.width - 32, y: 3, width: 22, height: 24)
+        filterButton.frame = NSRect(x: sortButton.frame.minX - 24, y: 3, width: 22, height: 24)
+        filterField.frame = NSRect(x: 10, y: 3, width: max(48, filterButton.frame.minX - 16), height: 24)
+        scroll.frame = NSRect(x: 0, y: bar + 2, width: bounds.width, height: max(0, bounds.height - bar - 2))
         list.tableColumns.first?.width = scroll.contentSize.width - 4
-        empty.frame = NSRect(x: 10, y: 24, width: bounds.width - 20, height: 18)
+        empty.frame = NSRect(x: 10, y: bar + 24, width: bounds.width - 20, height: 18)
+    }
+
+    // MARK: Filter & sort menus
+
+    func makeFilterMenu() -> NSMenu {
+        let m = NSMenu()
+        let groups: [[ChangeFilter]] = [[.all], [.tracked, .untracked], [.staged, .unstaged], [.modified, .deleted]]
+        for (gi, group) in groups.enumerated() {
+            if gi > 0 { m.addItem(.separator()) }
+            for f in group {
+                let item = m.addItem(withTitle: f.title, action: #selector(chooseFilter(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = f.rawValue
+                item.state = filter == f ? .on : .off
+            }
+        }
+        return m
+    }
+
+    func makeSortMenu() -> NSMenu {
+        let m = NSMenu()
+        for s in ChangeSort.allCases {
+            let item = m.addItem(withTitle: "Sort by \(s.title)", action: #selector(chooseSort(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = s.rawValue
+            item.state = sort == s ? .on : .off
+        }
+        return m
+    }
+
+    private func showFilterMenu() {
+        makeFilterMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: filterButton.bounds.maxY + 2), in: filterButton)
+    }
+
+    private func showSortMenu() {
+        makeSortMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: sortButton.bounds.maxY + 2), in: sortButton)
+    }
+
+    @objc private func chooseFilter(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let chosen = ChangeFilter(rawValue: raw) else { return }
+        Settings.shared.gitChangesFilter = chosen
+        filter = chosen
+    }
+
+    @objc private func chooseSort(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let chosen = ChangeSort(rawValue: raw) else { return }
+        Settings.shared.gitChangesSort = chosen
+        sort = chosen
+    }
+
+    // MARK: Filter text field
+
+    func controlTextDidChange(_ obj: Notification) {
+        rebuildRows()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        switch commandSelector {
+        case #selector(NSResponder.cancelOperation(_:)):
+            if !query.isEmpty { query = "" } else { focus() }
+            return true
+        case #selector(NSResponder.moveDown(_:)):
+            if let first = rows.firstIndex(where: { $0.file != nil }) {
+                if list.selectedRowIndexes.isEmpty {
+                    list.selectRowIndexes(IndexSet(integer: first), byExtendingSelection: false)
+                }
+                focus()
+            }
+            return true
+        case #selector(NSResponder.insertNewline(_:)):
+            if let f = selectedFiles.first ?? rows.lazy.compactMap(\.file).first {
+                onAction?(f, .open)
+            }
+            return true
+        default:
+            return false
+        }
     }
 
     private var selectedFiles: [GitRepository.ChangedFile] {
         list.selectedRowIndexes.compactMap { $0 < rows.count ? rows[$0].file : nil }
     }
 
-    private func section(staged: Bool) -> [GitRepository.ChangedFile] { files.filter { $0.staged == staged } }
+    private func section(staged: Bool) -> [GitRepository.ChangedFile] { staged ? stagedFiles : unstagedFiles }
+
+    private func sectionActionTitle(staged: Bool) -> String {
+        staged ? (isFiltered ? "Unstage Shown" : "Unstage All") : (isFiltered ? "Stage Shown" : "Stage All")
+    }
 
     @objc private func clicked() {
         let row = list.clickedRow
@@ -216,7 +434,16 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 
     private func menu(row: Int) -> NSMenu? {
-        guard row >= 0, row < rows.count else { return nil }
+        guard row >= 0, row < rows.count else {
+            let m = NSMenu()
+            let filterSub = NSMenuItem(title: "Filter", action: nil, keyEquivalent: "")
+            filterSub.submenu = makeFilterMenu()
+            m.addItem(filterSub)
+            let sortSub = NSMenuItem(title: "Sort", action: nil, keyEquivalent: "")
+            sortSub.submenu = makeSortMenu()
+            m.addItem(sortSub)
+            return m
+        }
         let r = rows[row]
         menuSection = section(staged: r.staged)
         let m = NSMenu()
@@ -225,7 +452,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
             item.target = self
         }
         guard r.file != nil else {
-            add(r.staged ? "Unstage All" : "Stage All", r.staged ? #selector(menuUnstageAll) : #selector(menuStageAll))
+            add(sectionActionTitle(staged: r.staged), r.staged ? #selector(menuUnstageAll) : #selector(menuStageAll))
             return m
         }
         // Like Finder: right-clicking outside the selection acts on that row alone.
@@ -248,7 +475,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
             add("Discard Changes…", #selector(menuDiscard), enabled: unstaged.contains { $0.status != .conflicted }, key: "\u{8}")
         }
         m.addItem(.separator())
-        add(r.staged ? "Unstage All" : "Stage All", r.staged ? #selector(menuUnstageAll) : #selector(menuStageAll))
+        add(sectionActionTitle(staged: r.staged), r.staged ? #selector(menuUnstageAll) : #selector(menuStageAll))
         m.addItem(.separator())
         add("Reveal in Finder", #selector(menuReveal), enabled: menuFiles.contains { $0.status != .deleted })
         return m
@@ -287,7 +514,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
             let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? ChangeSectionCell) ?? ChangeSectionCell()
             cell.identifier = id
             let staged = row.staged
-            cell.configure(staged: staged, count: section(staged: staged).count) { [weak self] in
+            cell.configure(staged: staged, count: section(staged: staged).count, actionTitle: sectionActionTitle(staged: staged)) { [weak self] in
                 guard let self else { return }
                 self.onListAction?(self.section(staged: staged), staged ? .unstage : .stage)
             }
@@ -316,7 +543,7 @@ private final class ChangeSectionCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(staged: Bool, count: Int, action: @escaping () -> Void) {
+    func configure(staged: Bool, count: Int, actionTitle: String, action: @escaping () -> Void) {
         let theme = ThemeManager.shared.active
         let name = staged ? "Staged Changes" : "Changes"
         let text = NSMutableAttributedString(string: name.uppercased(), attributes: [
@@ -327,7 +554,7 @@ private final class ChangeSectionCell: NSTableCellView {
         ]))
         title.attributedStringValue = text
         button.symbol = staged ? "minus" : "plus"
-        button.toolTip = staged ? "Unstage All" : "Stage All"
+        button.toolTip = actionTitle
         button.onClick = action
         setAccessibilityLabel("\(name), \(count == 1 ? "1 file" : "\(count) files")")
         needsLayout = true

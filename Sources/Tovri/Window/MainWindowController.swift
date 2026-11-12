@@ -771,8 +771,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Git
 
     private var gitStatusPending = false
+    private var pendingChangesFilter: ChangeFilter?
     /// Set when a refresh is asked for while `git status` runs, whose answer may predate the change.
     private var gitStatusRequestedAgain = false
+    /// Set when `Changes` refreshed without reading untracked or ignored files for the hidden `Files` tree.
+    private var sidebarGitNeedsFullRefresh = false
     private(set) var changedFileCount = 0
 
     /// Runs `git status` only for the features that are on: sidebar colors and the changed count.
@@ -780,8 +783,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         gitContext = nil
         let s = Settings.shared
         guard s.gitNeedsStatus, let folder = folderURL, let repo = GitRepository.find(for: folder) else {
+            sidebarGitNeedsFullRefresh = false
             sidebar.setGitStatus([:])
             sidebar.setIgnoredPaths([])
+            sidebar.setChangeCount(0)
             if changedFileCount != 0 {
                 changedFileCount = 0
                 updateStatusBar()
@@ -790,9 +795,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
         guard !gitStatusPending else { gitStatusRequestedAgain = true; return }
         gitStatusPending = true
-        repo.status { [weak self] status in
+        let showingChanges = s.gitChangesAndHistory && sidebar.isShowingChanges
+        let requestedFilter: ChangeFilter? = showingChanges ? sidebar.changesFilter : nil
+        pendingChangesFilter = requestedFilter
+        let includeUntracked = s.gitStatusBarChanges || s.gitSidebarStatus || sidebar.changesFilter.includesUntracked
+        let fetchIgnored = s.gitSidebarStatus && !showingChanges
+        sidebarGitNeedsFullRefresh = !includeUntracked || (s.gitSidebarStatus && !fetchIgnored)
+        repo.statusAndChanges(includeUntracked: includeUntracked, changesFilter: requestedFilter) { [weak self] status, entries, changes in
             guard let self else { return }
             self.gitStatusPending = false
+            self.pendingChangesFilter = nil
             if self.gitStatusRequestedAgain {
                 self.gitStatusRequestedAgain = false
                 self.refreshGitStatus()
@@ -800,31 +812,40 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             }
             let s = Settings.shared
             guard s.gitNeedsStatus, self.folderURL?.path == folder.path else { return }
-            var abs: [String: GitFileStatus] = [:]
             if s.gitSidebarStatus {
-                for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
+                if !showingChanges || includeUntracked {
+                    var abs: [String: GitFileStatus] = [:]
+                    abs.reserveCapacity(status.count)
+                    for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
+                    self.sidebar.setGitStatus(abs)
+                }
+            } else {
+                self.sidebar.setGitStatus([:])
             }
-            self.sidebar.setGitStatus(abs)
-            let changed = status.filter { $0.value != .ignored }
-            self.changedFileCount = s.gitStatusBarChanges ? changed.count : 0
+            let statusCount = status.reduce(into: 0) { if $1.value != .ignored { $0 += 1 } }
+            self.changedFileCount = s.gitStatusBarChanges ? statusCount : 0
+            self.updateStatusBar()
             if s.gitChangesAndHistory {
-                self.sidebar.setChangeCount(changed.count)
-                // Line counts cost a `git diff`, so they're only read while the list is on screen.
                 if self.sidebar.isShowingChanges {
-                    repo.changeList { [weak self] files in
-                        guard let self, Settings.shared.gitChangesAndHistory, self.folderURL?.path == folder.path else { return }
-                        self.sidebar.setChanges(self.withLiveCounts(files, root: repo.root))
+                    guard let changes, let filter = requestedFilter, filter.covers(self.sidebar.changesFilter) else {
+                        self.sidebar.setChangeCount(statusCount)
+                        self.refreshGitStatus()
+                        return
                     }
+                    let stagedPaths = Set(entries.lazy.filter { $0.staged != nil }.map(\.path))
+                    self.sidebar.setChanges(self.withLiveCounts(changes, stagedPaths: stagedPaths, root: repo.root),
+                                            filter: filter, totalCount: statusCount)
+                } else {
+                    self.sidebar.setChangeCount(statusCount)
                 }
             }
-            self.updateStatusBar()
         }
-        if s.gitSidebarStatus {
+        if fetchIgnored {
             repo.ignored { [weak self] list in
                 guard let self, Settings.shared.gitSidebarStatus, self.folderURL?.path == folder.path else { return }
                 self.sidebar.setIgnoredPaths(Set(list.map { repo.root.appendingPathComponent($0).standardizedFileURL.path }))
             }
-        } else {
+        } else if !s.gitSidebarStatus {
             sidebar.setIgnoredPaths([])
         }
     }
@@ -1866,7 +1887,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     /// Open files with unsaved edits are counted from the editor, so the numbers match what's on screen.
-    private func withLiveCounts(_ files: [GitRepository.ChangedFile], root: URL) -> [GitRepository.ChangedFile] {
+    private func withLiveCounts(_ files: [GitRepository.ChangedFile], stagedPaths: Set<String>? = nil, root: URL) -> [GitRepository.ChangedFile] {
         var live: [String: (Int, Int)] = [:]
         for d in allOpenDocuments() where d.isDirty && d.hasGitBaseline {
             guard let path = d.url?.standardizedFileURL.resolvingSymlinksInPath().path else { continue }
@@ -1875,10 +1896,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         guard !live.isEmpty else { return files }
         // The editor counts against HEAD, which is what an unstaged change is counted against only
         // when nothing of the file is staged.
-        let staged = Set(files.filter(\.staged).map(\.path))
+        let staged = stagedPaths ?? Set(files.filter(\.staged).map(\.path))
         return files.map { f in
             var f = f
-            guard !staged.contains(f.path) else { return f }
+            guard !f.staged, !staged.contains(f.path) else { return f }
             if let l = live[root.appendingPathComponent(f.path).standardizedFileURL.resolvingSymlinksInPath().path] { (f.added, f.removed) = l }
             return f
         }
@@ -1942,6 +1963,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     // MARK: Sidebar changes
 
     func sidebarNeedsChanges(_ sidebar: SidebarView) { refreshGitStatus() }
+    func sidebarChangesFilterDidChange(_ sidebar: SidebarView) {
+        guard Settings.shared.gitChangesAndHistory, sidebar.isShowingChanges else { return }
+        let active = sidebar.changesFilter
+        if gitStatusPending {
+            if pendingChangesFilter?.covers(active) != true {
+                gitStatusRequestedAgain = true
+            }
+            return
+        }
+        if !sidebar.hasChanges(covering: active) {
+            refreshGitStatus()
+        }
+    }
+    func sidebarDidShowFiles(_ sidebar: SidebarView) {
+        if sidebarGitNeedsFullRefresh { refreshGitStatus() }
+    }
 
     func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction) {
         guard let folder = folderURL, let repo = GitRepository.find(for: folder) else { return }

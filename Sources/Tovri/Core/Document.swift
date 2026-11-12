@@ -1144,15 +1144,19 @@ struct DiskStamp: Codable, Equatable {
     let inode: UInt64
     let device: Int32
 
-    /// stat(2) follows symlinks and, unlike URL resource values, is never served from a cache.
-    init?(_ url: URL) {
-        var info = stat()
-        guard stat(url.path, &info) == 0 else { return nil }
+    init(info: stat) {
         seconds = info.st_mtimespec.tv_sec
         nanoseconds = info.st_mtimespec.tv_nsec
         size = info.st_size
         inode = info.st_ino
         device = info.st_dev
+    }
+
+    /// stat(2) follows symlinks and, unlike URL resource values, is never served from a cache.
+    init?(_ url: URL) {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        self.init(info: info)
     }
 }
 

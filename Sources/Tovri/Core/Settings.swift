@@ -45,6 +45,8 @@ final class Settings {
         static let gitSidebarStatus = "gitSidebarStatus"
         static let gitStatusBarChanges = "gitStatusBarChanges"
         static let gitChangesAndHistory = "gitChangesAndHistory"
+        static let gitChangesFilter = "gitChangesFilter"
+        static let gitChangesSort = "gitChangesSort"
         static let quitWhenLastWindowCloses = "quitWhenLastWindowCloses"
         static let revealActiveFile = "revealActiveFile"
         static let markdownPreviewOnOpen = "markdownPreviewOnOpen"
@@ -97,6 +99,8 @@ final class Settings {
         Key.gitSidebarStatus: true,
         Key.gitStatusBarChanges: true,
         Key.gitChangesAndHistory: false,
+        Key.gitChangesFilter: ChangeFilter.all.rawValue,
+        Key.gitChangesSort: ChangeSort.path.rawValue,
         Key.quitWhenLastWindowCloses: false,
         Key.revealActiveFile: true,
         Key.markdownPreviewOnOpen: false,
@@ -286,6 +290,14 @@ final class Settings {
     var gitStatusBarChanges: Bool { gitEnabled && d.bool(forKey: Key.gitStatusBarChanges) }
     /// The sidebar's Changes view and File History. Off by default.
     var gitChangesAndHistory: Bool { gitEnabled && d.bool(forKey: Key.gitChangesAndHistory) }
+    var gitChangesFilter: ChangeFilter {
+        get { ChangeFilter(rawValue: d.string(forKey: Key.gitChangesFilter) ?? "") ?? .all }
+        set { d.set(newValue.rawValue, forKey: Key.gitChangesFilter) }
+    }
+    var gitChangesSort: ChangeSort {
+        get { ChangeSort(rawValue: d.string(forKey: Key.gitChangesSort) ?? "") ?? .path }
+        set { d.set(newValue.rawValue, forKey: Key.gitChangesSort) }
+    }
     /// Whether anything needs `git status`.
     var gitNeedsStatus: Bool { gitSidebarStatus || gitStatusBarChanges || gitChangesAndHistory }
     var quitWhenLastWindowCloses: Bool { d.bool(forKey: Key.quitWhenLastWindowCloses) }
