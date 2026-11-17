@@ -120,7 +120,7 @@ extension MainWindowController {
     }
 
     static func comparisonText(from data: Data, encoding: TextEncoding?) -> Result<String, ComparisonReadProblem> {
-        let decoded = TextEncoding.decode(data, preferred: encoding)
+        let decoded = TextEncoding.decode(data, preferred: encoding, preferUTF8IfValid: true)
         guard !decoded.isBinary else { return .failure(.binary) }
         return .success(LineEnding.normalize(decoded.text, rawData: nil).0)
     }
@@ -139,7 +139,7 @@ extension MainWindowController {
             guard let self, !quiet else { return }
             if d.isEmpty {
                 self.statusBar.flash("No changes compared with \(label). Edits show here as you type.")
-            } else if case .snapshot = source {
+            } else if source.canRestoreVersion {
                 self.statusBar.flash("Comparing with \(label): +\(d.added) −\(d.deleted). File → Restore This Version brings it back; ⎋ stops.")
             } else {
                 self.statusBar.flash("Comparing with \(label): +\(d.added) −\(d.deleted). Press ⎋ to stop.")
@@ -169,7 +169,7 @@ extension MainWindowController {
                 let when = relative.localizedString(for: s.modified, relativeTo: now)
                 var item = PaletteItem(title: when.prefix(1).uppercased() + when.dropFirst(),
                                        detail: MainWindowController.versionDate(s.modified)) { [weak self, weak e] in
-                    guard let self, let e else { return }
+                    guard let self, let e, e.document.url == url else { return }
                     self.compare(e, withSnapshot: s, of: url)
                 }
                 item.twoLine = true
@@ -190,7 +190,7 @@ extension MainWindowController {
             let result = LocalHistory.shared.data(of: s, for: url).map { MainWindowController.comparisonText(from: $0, encoding: encoding) }
                 ?? .failure(.unreadable)
             DispatchQueue.main.async { [weak self, weak e] in
-                guard let self, let e, e.document === doc else { return }
+                guard let self, let e, e.document === doc, e.document.url == url else { return }
                 switch result {
                 case .success(let text):
                     self.show(e, comparedWith: text, label: "the version from \(MainWindowController.versionDate(s.modified))", source: .snapshot(s))
@@ -215,7 +215,7 @@ extension MainWindowController {
     /// Replaces the document's text with the version it's compared with, as one edit that Undo
     /// takes back. Nothing is saved.
     @objc func restoreComparedVersion(_ sender: Any?) {
-        guard let e = activeEditor, case .snapshot = e.comparisonSource, let base = e.comparisonBase,
+        guard let e = activeEditor, e.comparisonSource?.canRestoreVersion == true, let base = e.comparisonBase,
               let label = e.comparisonLabel, !e.document.isReadOnly else { NSSound.beep(); return }
         guard let edit = MainWindowController.restoreEdit(from: e.document.string, to: base as NSString) else {
             statusBar.flash("The text already matches \(label)")
@@ -279,7 +279,7 @@ extension MainWindowController {
         case #selector(showLocalHistory(_:)):
             return comparable && doc?.url != nil
         case #selector(restoreComparedVersion(_:)):
-            guard case .snapshot = e?.comparisonSource else { return false }
+            guard e?.comparisonSource?.canRestoreVersion == true else { return false }
             return doc?.isReadOnly == false
         case #selector(clearLocalHistory(_:)):
             return true

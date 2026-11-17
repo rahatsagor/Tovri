@@ -448,18 +448,42 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     private(set) var inlineDiff: InlineDiff?
     var isComparing: Bool { inlineDiff != nil }
+    private var pendingTicketID = 0
+    private var pendingCompareTicket: (id: Int, version: Int)?
+    private var pendingFirstChangeTicket: (id: Int, version: Int)?
+
     /// Set when the editor should start comparing once the committed copy has loaded.
-    var pendingCompare = false {
-        didSet {
-            guard pendingCompare else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.pendingCompare = false }
+    var pendingCompare: Bool {
+        get {
+            guard let t = pendingCompareTicket else { return false }
+            if t.version != document.editVersion { pendingCompareTicket = nil; return false }
+            return true
+        }
+        set {
+            guard newValue else { pendingCompareTicket = nil; return }
+            pendingTicketID += 1
+            let id = pendingTicketID
+            pendingCompareTicket = (id, document.editVersion)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                if self?.pendingCompareTicket?.id == id { self?.pendingCompareTicket = nil }
+            }
         }
     }
     /// Set when the editor should move to the first change once the diff arrives.
-    var pendingFirstChange = false {
-        didSet {
-            guard pendingFirstChange else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.pendingFirstChange = false }
+    var pendingFirstChange: Bool {
+        get {
+            guard let t = pendingFirstChangeTicket else { return false }
+            if t.version != document.editVersion { pendingFirstChangeTicket = nil; return false }
+            return true
+        }
+        set {
+            guard newValue else { pendingFirstChangeTicket = nil; return }
+            pendingTicketID += 1
+            let id = pendingTicketID
+            pendingFirstChangeTicket = (id, document.editVersion)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                if self?.pendingFirstChangeTicket?.id == id { self?.pendingFirstChangeTicket = nil }
+            }
         }
     }
 
@@ -469,7 +493,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     func setComparing(_ on: Bool) -> Bool {
         if on {
             guard Settings.shared.gitGutter, document.hasGitBaseline else { return false }
-            if inlineDiff != nil { return true }
+            if inlineDiff != nil && comparisonBase == nil { return true }
         } else if inlineDiff == nil {
             // A comparison with an earlier commit may still be computing.
             comparisonBase = nil
@@ -543,6 +567,10 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     private func computeBaseDiff(_ completion: ((InlineDiff) -> Void)?) {
         guard let base = comparisonBase, !isClosed else { return }
+        guard document.length < 3_000_000, base.utf16.count < 12_000_000 else {
+            setComparing(false)
+            return
+        }
         baseDiffGeneration += 1
         let generation = baseDiffGeneration
         let current = document.string.copy() as! NSString
@@ -622,7 +650,17 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         let width = min(GitChangeCard.maxWidth, max(240, scrollView.textViewportWidth - 28))
         let height = card.preferredHeight(width: width)
         var y = bottom.maxY + 4
-        if y + height > bounds.height - 8 { y = top.minY - height - 4 }
+        if y + height > bounds.height - 8 {
+            let above = top.minY - height - 4
+            if above >= 8 {
+                y = above
+            } else {
+                let caret = convert(textView.caretRect(at: textView.selectedRange().location), from: textView)
+                let topSlot: CGFloat = 8
+                let bottomSlot = max(topSlot, bounds.height - height - 8)
+                y = (caret.midY - topSlot) < (bottomSlot - caret.minY) ? bottomSlot : topSlot
+            }
+        }
         card.frame = NSRect(x: scrollView.frame.minX + 4, y: max(8, y), width: width, height: height).integral
     }
 
@@ -859,7 +897,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     func cancelOperationFallback() {
         if changeCard != nil { closeChangeCard(); return }
-        if isComparing { setComparing(false) }
+        if isComparing || comparisonBase != nil { setComparing(false) }
     }
 
     func findNext(forward: Bool) {

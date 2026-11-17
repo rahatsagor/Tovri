@@ -188,8 +188,11 @@ struct LineDiff {
     }
 
     /// The following or preceding hunk, wrapping around the file.
-    func nextHunk(from line: Int, forward: Bool, lineCount: Int) -> DiffHunk? {
+    func nextHunk(from line: Int, forward: Bool, lineCount: Int, after current: DiffHunk? = nil) -> DiffHunk? {
         guard !hunks.isEmpty else { return nil }
+        if let current, let index = hunks.firstIndex(of: current) {
+            return hunks[(index + (forward ? 1 : hunks.count - 1)) % hunks.count]
+        }
         // A deletion after the last line is shown, and navigated to, on the last line.
         if forward { return hunks.first { min($0.newStart, lineCount - 1) > line } ?? hunks.first }
         let ref = hunk(at: line, lineCount: lineCount)?.newStart ?? line
@@ -219,9 +222,10 @@ final class GitRepository {
     private struct FilterCacheStamp: Equatable {
         let env: [String: String]
         let files: [DiskStamp?]
+        let headToken: String?
     }
     private let filterLock = NSLock()
-    private var cachedFilters: (stamp: FilterCacheStamp, expiresAt: TimeInterval, names: Set<String>)?
+    private var cachedFilters: (stamp: FilterCacheStamp, expiresAt: TimeInterval, names: Set<String>, hooks: Set<String>, extraFiles: [URL], conditional: Bool)?
 
     private struct CachedLineCount {
         let stamp: DiskStamp
@@ -281,44 +285,74 @@ final class GitRepository {
         return nil
     }
 
-    private var gitDir: URL {
+    private static func readSmallText(_ url: URL, limit: Int = 65_536) -> String? {
+        guard let data = try? LocalHistory.readRegularFile(url, limit: limit) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Resolves `.git` safely, validating `gitdir:` files against non-regular targets,
+    /// cross-user hijacking, and missing repository metadata directories.
+    private static func resolveGitDir(at root: URL) -> URL? {
         let dotGit = root.appendingPathComponent(".git")
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: dotGit.path, isDirectory: &isDir), !isDir.boolValue,
-           let s = try? String(contentsOf: dotGit, encoding: .utf8), s.hasPrefix("gitdir:") {
-            let path = s.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
-            return URL(fileURLWithPath: path, relativeTo: root).standardizedFileURL
-        }
-        return dotGit
+        var linkInfo = stat()
+        guard lstat(dotGit.path, &linkInfo) == 0 else { return nil }
+        var targetInfo = stat()
+        guard stat(dotGit.path, &targetInfo) == 0 else { return nil }
+        let type = targetInfo.st_mode & S_IFMT
+        if type == S_IFDIR { return dotGit }
+        guard type == S_IFREG, let s = readSmallText(dotGit), s.hasPrefix("gitdir:") else { return nil }
+        let raw = s.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        let candidate = URL(fileURLWithPath: raw, relativeTo: root).standardizedFileURL
+        var dirInfo = stat()
+        guard stat(candidate.path, &dirInfo) == 0,
+              (dirInfo.st_mode & S_IFMT) == S_IFDIR else { return nil }
+        let uid = getuid()
+        guard dirInfo.st_uid == uid || dirInfo.st_uid == 0 || dirInfo.st_uid == targetInfo.st_uid else { return nil }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: candidate.appendingPathComponent("HEAD").path),
+              fm.fileExists(atPath: candidate.appendingPathComponent("objects").path)
+                || fm.fileExists(atPath: candidate.appendingPathComponent("commondir").path) else { return nil }
+        return candidate
+    }
+
+    private var gitDir: URL {
+        GitRepository.resolveGitDir(at: root) ?? root.appendingPathComponent(".git")
     }
 
     var branch: String? {
-        guard let head = try? String(contentsOf: gitDir.appendingPathComponent("HEAD"), encoding: .utf8) else { return nil }
+        guard let head = GitRepository.readSmallText(gitDir.appendingPathComponent("HEAD")) else { return nil }
         let t = head.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.hasPrefix("ref: refs/heads/") { return String(t.dropFirst("ref: refs/heads/".count)) }
         return t.isEmpty ? nil : String(t.prefix(7))
     }
 
+    private static func isValidRefPath(_ ref: String) -> Bool {
+        guard ref.hasPrefix("refs/"), !ref.hasSuffix("/"), !ref.contains("//") else { return false }
+        return !ref.split(separator: "/").contains("..")
+    }
+
     /// Identifies the commit HEAD points at by reading .git directly, without running git. Nil when
     /// it can't be worked out cheaply; callers then treat HEAD as changed.
     var headToken: String? {
-        let dir = gitDir
-        guard let head = try? String(contentsOf: dir.appendingPathComponent("HEAD"), encoding: .utf8)
+        guard let dir = GitRepository.resolveGitDir(at: root) else { return nil }
+        guard let head = GitRepository.readSmallText(dir.appendingPathComponent("HEAD"))?
             .trimmingCharacters(in: .whitespacesAndNewlines), !head.isEmpty else { return nil }
         guard head.hasPrefix("ref: ") else { return head }
         let ref = String(head.dropFirst(5))
+        guard GitRepository.isValidRefPath(ref) else { return nil }
         // Linked worktrees keep their HEAD here but share refs with the main repository.
         var refDirs = [dir]
-        if let common = try? String(contentsOf: dir.appendingPathComponent("commondir"), encoding: .utf8)
+        if let common = GitRepository.readSmallText(dir.appendingPathComponent("commondir"))?
             .trimmingCharacters(in: .whitespacesAndNewlines), !common.isEmpty {
             refDirs.append(URL(fileURLWithPath: common, relativeTo: dir).standardizedFileURL)
         }
         for d in refDirs {
-            if let sha = try? String(contentsOf: d.appendingPathComponent(ref), encoding: .utf8)
+            if let sha = GitRepository.readSmallText(d.appendingPathComponent(ref))?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !sha.isEmpty { return head + " " + sha }
         }
         for d in refDirs {
-            guard let packed = try? String(contentsOf: d.appendingPathComponent("packed-refs"), encoding: .utf8) else { continue }
+            guard let packed = GitRepository.readSmallText(d.appendingPathComponent("packed-refs"), limit: 8_388_608) else { continue }
             for line in packed.split(separator: "\n") where line.hasSuffix(" " + ref) {
                 return head + " " + line.prefix { $0 != " " }
             }
@@ -341,6 +375,7 @@ final class GitRepository {
     static let safetySettings: [ConfigSetting] = [
         ("core.fsmonitor", "false"),
         ("core.hooksPath", "/dev/null"),
+        ("submodule.recurse", "false"),
         // Showing a signed commit runs the signature program, which the repository can name.
         ("log.showSignature", "false"),
         ("gpg.program", "false"),
@@ -382,9 +417,11 @@ final class GitRepository {
         return env
     }
 
-    private func run(_ args: [String], acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = nil) -> Data? {
-        guard let filters = configuredFilters() else { return nil }
-        return rawRun(args, GitRepository.safetySettings + GitRepository.filterSettings(names: filters),
+    private func run(_ args: [String], acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
+        guard let overrides = configuredOverrides() else { return nil }
+        return rawRun(args, GitRepository.safetySettings
+                          + GitRepository.filterSettings(names: overrides.filters)
+                          + GitRepository.hookSettings(names: overrides.hooks),
                       acceptedStatuses: acceptedStatuses, maxOutputBytes: maxOutputBytes)
     }
 
@@ -414,7 +451,7 @@ final class GitRepository {
         return urls
     }()
 
-    private func filterCacheStamp() -> FilterCacheStamp {
+    private func filterCacheStamp(extraFiles: [URL] = [], includeHead: Bool = false) -> FilterCacheStamp {
         let env = GitRepository.userEnvironment
         let dir = gitDir
         var paths = GitRepository.defaultSystemConfigPaths
@@ -429,7 +466,7 @@ final class GitRepository {
         }
         paths.append(dir.appendingPathComponent("config"))
         paths.append(dir.appendingPathComponent("config.worktree"))
-        if let common = try? String(contentsOf: dir.appendingPathComponent("commondir"), encoding: .utf8)
+        if let common = GitRepository.readSmallText(dir.appendingPathComponent("commondir"))?
             .trimmingCharacters(in: .whitespacesAndNewlines), !common.isEmpty {
             let commonDir = URL(fileURLWithPath: common, relativeTo: dir).standardizedFileURL
             paths.append(commonDir.appendingPathComponent("config"))
@@ -442,48 +479,122 @@ final class GitRepository {
                 ?? homeURL.appendingPathComponent(".config", isDirectory: true)
             paths.append(xdg.appendingPathComponent("git/config"))
         }
-        return FilterCacheStamp(env: env, files: paths.map { DiskStamp($0) })
+        var seen = Set(paths.map(\.standardizedFileURL.path))
+        for url in extraFiles {
+            let std = url.standardizedFileURL
+            if seen.insert(std.path).inserted { paths.append(std) }
+        }
+        return FilterCacheStamp(env: env, files: paths.map { DiskStamp($0) }, headToken: includeHead ? headToken : nil)
     }
 
-    /// Names of the filter drivers in the repository's and the user's config. `git config` only
-    /// reads settings, so it can safely list them. It exits with 1 when there are none; any other
-    /// failure returns nil, and no command runs. Cached only when no `include` or `includeIf`
-    /// directive is active, because included files can change without touching `.git/config`.
     private func configuredFilters() -> Set<String>? {
-        let stamp = filterCacheStamp()
+        configuredOverrides()?.filters
+    }
+
+    /// Names of filter drivers and Git 2.54+ hooks in the repository's and user's config. Also tracks
+    /// `[include]` / `[includeIf]` file origins and targets in the cache stamp so repos with included
+    /// configs stay cached until an included file changes or conditional branch context changes.
+    private func configuredOverrides() -> (filters: Set<String>, hooks: Set<String>)? {
         let now = Date.timeIntervalSinceReferenceDate
         filterLock.lock()
-        if let hit = cachedFilters, hit.stamp == stamp, now < hit.expiresAt {
-            filterLock.unlock()
-            return hit.names
+        let hit = cachedFilters
+        filterLock.unlock()
+        if let hit, now < hit.expiresAt {
+            let stamp = filterCacheStamp(extraFiles: hit.extraFiles, includeHead: hit.conditional)
+            if hit.stamp == stamp {
+                return (hit.names, hit.hooks)
+            }
+        }
+        guard let raw = rawRun(["config", "--includes", "--show-origin", "-z", "--get-regexp", "^(filter|hook|include|includeif)\\."],
+                               GitRepository.safetySettings, acceptedStatuses: [0, 1]),
+              let parsed = GitRepository.parseConfigOverrides(raw, home: GitRepository.userEnvironment["HOME"]) else { return nil }
+        filterLock.lock()
+        if parsed.uncacheable {
+            cachedFilters = nil
+        } else {
+            let stamp = filterCacheStamp(extraFiles: parsed.extraFiles, includeHead: parsed.conditional)
+            cachedFilters = (stamp, Date.timeIntervalSinceReferenceDate + 2.0,
+                             parsed.filters, parsed.hooks, parsed.extraFiles, parsed.conditional)
         }
         filterLock.unlock()
-        guard let parsed = rawRun(["config", "-z", "--get-regexp", "^(filter|include|includeif)\\."],
-                                  GitRepository.safetySettings, acceptedStatuses: [0, 1])
-            .flatMap(GitRepository.parseConfigFilters) else { return nil }
-        filterLock.lock()
-        cachedFilters = parsed.hasIncludes ? nil : (stamp, Date.timeIntervalSinceReferenceDate + 2.0, parsed.names)
-        filterLock.unlock()
-        return parsed.names
+        return (parsed.filters, parsed.hooks)
     }
 
     private static let includePrefix = Data("include.".utf8)
     private static let includeIfPrefix = Data("includeif.".utf8)
 
-    private static func parseConfigFilters(_ configOutput: Data) -> (names: Set<String>, hasIncludes: Bool)? {
-        var names = Set<String>()
-        var hasIncludes = false
-        for entry in configOutput.split(separator: 0) {
-            let keyBytes = entry.prefix { $0 != 10 }
+    private static func resolveIncludePath(_ raw: String, relativeTo originFile: URL?, home: String?) -> URL? {
+        guard !raw.isEmpty, !raw.hasPrefix("%(prefix)/") else { return nil }
+        if raw.hasPrefix("~/") || raw == "~" {
+            let base = (home?.isEmpty == false ? home! : NSHomeDirectory())
+            return URL(fileURLWithPath: base + String(raw.dropFirst())).standardizedFileURL
+        }
+        if raw.hasPrefix("/") {
+            return URL(fileURLWithPath: raw).standardizedFileURL
+        }
+        guard let originFile else { return nil }
+        return URL(fileURLWithPath: raw, relativeTo: originFile.deletingLastPathComponent()).standardizedFileURL
+    }
+
+    private struct ParsedOverrides {
+        var filters = Set<String>()
+        var hooks = Set<String>()
+        var extraFiles: [URL] = []
+        var conditional = false
+        var uncacheable = false
+    }
+
+    private static func parseConfigOverrides(_ configOutput: Data, home: String?) -> ParsedOverrides? {
+        var out = ParsedOverrides()
+        var parts = configOutput.split(separator: 0, omittingEmptySubsequences: false)
+        if parts.last?.isEmpty == true { parts.removeLast() }
+        guard parts.count % 2 == 0 else { return nil }
+        var seenFiles = Set<String>()
+        func track(_ url: URL) {
+            let std = url.standardizedFileURL
+            if seenFiles.insert(std.path).inserted { out.extraFiles.append(std) }
+        }
+        var i = 0
+        while i + 1 < parts.count {
+            let originBytes = parts[i]
+            let entry = parts[i + 1]
+            i += 2
+            guard let origin = String(bytes: originBytes, encoding: .utf8) else { return nil }
+            var originFile: URL?
+            if origin.hasPrefix("file:") {
+                let u = URL(fileURLWithPath: String(origin.dropFirst(5)))
+                originFile = u
+                track(u)
+            } else if !origin.hasPrefix("command line:") {
+                out.uncacheable = true
+            }
+            let keyBytes: Data.SubSequence
+            let valBytes: Data.SubSequence?
+            if let nl = entry.firstIndex(of: 10) {
+                keyBytes = entry[..<nl]
+                valBytes = entry[entry.index(after: nl)...]
+            } else {
+                keyBytes = entry
+                valBytes = nil
+            }
             if keyBytes.starts(with: includePrefix) || keyBytes.starts(with: includeIfPrefix) {
-                hasIncludes = true
+                if keyBytes.starts(with: includeIfPrefix) { out.conditional = true }
+                if let valBytes, let path = String(bytes: valBytes, encoding: .utf8),
+                   let resolved = resolveIncludePath(path, relativeTo: originFile, home: home) {
+                    track(resolved)
+                } else {
+                    out.uncacheable = true
+                }
                 continue
             }
             guard let key = String(bytes: keyBytes, encoding: .utf8) else { return nil }
-            guard key.hasPrefix("filter."), let dot = key.lastIndex(of: "."), dot >= key.index(key.startIndex, offsetBy: 7) else { continue }
-            names.insert(String(key[key.index(key.startIndex, offsetBy: 7)..<dot]))
+            if key.hasPrefix("filter."), let dot = key.lastIndex(of: "."), dot >= key.index(key.startIndex, offsetBy: 7) {
+                out.filters.insert(String(key[key.index(key.startIndex, offsetBy: 7)..<dot]))
+            } else if key.hasPrefix("hook."), let dot = key.lastIndex(of: "."), dot >= key.index(key.startIndex, offsetBy: 5) {
+                out.hooks.insert(String(key[key.index(key.startIndex, offsetBy: 5)..<dot]))
+            }
         }
-        return (names, hasIncludes)
+        return out
     }
 
     /// Filter names in `git config -z --get-regexp ^filter\.` output. Each entry is the key, a
@@ -511,12 +622,22 @@ final class GitRepository {
         }
     }
 
+    static func hookSettings(names: Set<String>) -> [ConfigSetting] {
+        names.sorted().flatMap { name in
+            [("hook.\(name).enabled", "false"),
+             ("hook.\(name).event", ""),
+             ("hook.\(name).command", "")]
+        }
+    }
+
     private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0],
-                        maxOutputBytes: Int? = nil) -> Data? {
-        guard let git = GitRepository.executable else { return nil }
-        // A repository's core.worktree could point git at another folder, so a restore would
-        // write files outside the one shown. The work tree is always the folder holding `.git`.
-        return GitRepository.runProcess(URL(fileURLWithPath: git), ["-C", root.path, "--work-tree=" + root.path] + args,
+                        maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
+        guard let git = GitRepository.executable,
+              let gd = GitRepository.resolveGitDir(at: root) else { return nil }
+        // A repository's core.worktree could point git at another folder, and GIT_DIR can override
+        // discovery; fix both `--git-dir` and `--work-tree` to what we validated.
+        return GitRepository.runProcess(URL(fileURLWithPath: git),
+                                        ["--git-dir=" + gd.path, "--work-tree=" + root.path, "-C", root.path] + args,
                                         environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses,
                                         maxOutputBytes: maxOutputBytes)
     }
@@ -528,10 +649,10 @@ final class GitRepository {
     /// exceeded `maxOutputBytes`, or ran past `timeout`. The output is read on another thread, so a
     /// stalled network volume, or a child process that keeps the pipe open, can't hold the caller past the timeout.
     static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout,
-                           acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = nil) -> Data? {
+                           acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
         final class Output: @unchecked Sendable {
             var data = Data()
-            var tooLarge = false
+            var failed = false
         }
         let p = Process()
         p.executableURL = executable
@@ -550,13 +671,19 @@ final class GitRepository {
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
             if let limit = maxOutputBytes {
-                let data = (try? out.fileHandleForReading.read(upToCount: limit + 1)) ?? Data()
-                if data.count > limit {
-                    output.tooLarge = true
+                do {
+                    let data = try out.fileHandleForReading.read(upToCount: limit + 1) ?? Data()
+                    if data.count > limit {
+                        output.failed = true
+                        p.terminate()
+                        try? out.fileHandleForReading.close()
+                    } else {
+                        output.data = data
+                    }
+                } catch {
+                    output.failed = true
                     p.terminate()
                     try? out.fileHandleForReading.close()
-                } else {
-                    output.data = data
                 }
             } else {
                 output.data = out.fileHandleForReading.readDataToEndOfFile()
@@ -566,13 +693,14 @@ final class GitRepository {
         }
         guard done.wait(timeout: .now() + timeout) == .success else {
             p.terminate()
+            try? out.fileHandleForReading.close()
             let pid = p.processIdentifier
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
                 if p.isRunning { kill(pid, SIGKILL) }
             }
             return nil
         }
-        if output.tooLarge { return nil }
+        if output.failed { return nil }
         return p.terminationReason == .exit && acceptedStatuses.contains(p.terminationStatus) ? output.data : nil
     }
 
@@ -707,7 +835,22 @@ final class GitRepository {
         GitRepository.runAsync {
             let status = known ?? self.run(GitRepository.statusArguments).map(GitRepository.parseStatus) ?? [:]
             let hasTracked = status.contains { $0.value != .ignored && $0.value != .untracked }
-            let counts = !hasTracked ? [:] : (self.run(["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:])
+            let counts: [String: (added: Int, removed: Int)]
+            if !hasTracked {
+                counts = [:]
+            } else if self.rawRun(["rev-parse", "--verify", "-q", "HEAD"], GitRepository.safetySettings) != nil {
+                counts = self.run(["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z", "HEAD", "--"]).map(GitRepository.parseNumstat) ?? [:]
+            } else {
+                let diffArgs = ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-z"]
+                let staged = self.run(diffArgs + ["--cached", "--"]).map(GitRepository.parseNumstat) ?? [:]
+                let unstaged = self.run(diffArgs + ["--"]).map(GitRepository.parseNumstat) ?? [:]
+                var merged = staged
+                for (path, c) in unstaged {
+                    let prev = merged[path] ?? (0, 0)
+                    merged[path] = (prev.0 + c.added, prev.1 + c.removed)
+                }
+                counts = merged
+            }
             var remainingBytes = GitRepository.untrackedReadBudget
             var out: [ChangedFile] = []
             out.reserveCapacity(status.count)
@@ -838,6 +981,16 @@ final class GitRepository {
         do { data = try file.read(upToCount: limit + 1) ?? Data() } catch { return nil }
         guard data.count <= limit else { return nil }
         guard !data.isEmpty else { return 0 }
+        if (data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF])),
+           !data.starts(with: [0xFF, 0xFE, 0x00, 0x00]) {
+            let decoded = TextEncoding.decode(data, preferred: nil)
+            guard !decoded.isBinary else { return nil }
+            let text = decoded.text
+            guard !text.isEmpty else { return 0 }
+            var n = 0
+            for u in text.utf16 where u == 10 { n += 1 }
+            return n + (text.utf16.last == 10 ? 0 : 1)
+        }
         var newlines = 0
         let hasNull = data.withUnsafeBytes { buf -> Bool in
             for b in buf {
@@ -853,6 +1006,9 @@ final class GitRepository {
     /// Tracked and untracked files under `dir` that `.gitignore` doesn't exclude, relative to
     /// `dir`, or nil if git can't list them. Runs on the calling thread.
     func unignoredFiles(in dir: URL) -> [String]? {
+        let dirReal = dir.standardizedFileURL.resolvingSymlinksInPath().path
+        let rootReal = root.standardizedFileURL.resolvingSymlinksInPath().path
+        guard dirReal == rootReal || dirReal.hasPrefix(rootReal + "/") else { return nil }
         guard let data = run(["-C", dir.path, "ls-files", "-z", "--cached", "--others", "--exclude-standard"]) else { return nil }
         var seen = Set<String>()
         var out: [String] = []
@@ -908,19 +1064,27 @@ final class GitRepository {
     /// or the user's config, such as Git LFS. Tovri switches filters off, so `git add` would store
     /// such a file without its clean step, and `git restore` would write what is stored (an LFS
     /// pointer) without its smudge step. `check-attr` only reads attribute files. Nil if git failed.
-    func filteredPaths(_ paths: [String]) -> Set<String>? {
+    func filteredPaths(_ paths: [String], includeIndex: Bool = false) -> Set<String>? {
         guard !paths.isEmpty else { return [] }
-        guard let drivers = configuredFilters() else { return nil }
+        guard let overrides = configuredOverrides() else { return nil }
+        let drivers = overrides.filters
         guard !drivers.isEmpty else { return [] }
-        let settings = GitRepository.safetySettings + GitRepository.filterSettings(names: drivers)
+        let settings = GitRepository.safetySettings
+            + GitRepository.filterSettings(names: drivers)
+            + GitRepository.hookSettings(names: overrides.hooks)
         var out = Set<String>()
-        for chunk in GitRepository.chunks(paths) {
-            guard let data = rawRun(["check-attr", "-z", "filter", "--"] + chunk, settings) else { return nil }
-            // Each answer is the path, the attribute and its value, in the order the paths were given.
-            let fields = data.split(separator: 0, omittingEmptySubsequences: false)
-            guard fields.count >= chunk.count * 3 else { return nil }
-            for (k, path) in chunk.enumerated() where drivers.contains(String(decoding: fields[k * 3 + 2], as: UTF8.self)) {
-                out.insert(path)
+        let modes: [[String]] = includeIndex
+            ? [["check-attr", "-z", "filter", "--"], ["check-attr", "--cached", "-z", "filter", "--"]]
+            : [["check-attr", "-z", "filter", "--"]]
+        for mode in modes {
+            for chunk in GitRepository.chunks(paths) {
+                guard let data = rawRun(mode + chunk, settings) else { return nil }
+                // Each answer is the path, the attribute and its value, in the order the paths were given.
+                let fields = data.split(separator: 0, omittingEmptySubsequences: false)
+                guard fields.count >= chunk.count * 3 else { return nil }
+                for (k, path) in chunk.enumerated() where drivers.contains(String(decoding: fields[k * 3 + 2], as: UTF8.self)) {
+                    out.insert(path)
+                }
             }
         }
         return out
@@ -929,15 +1093,24 @@ final class GitRepository {
     /// `git add` for the files' work-tree changes, deletions included. Runs on the calling thread.
     func stage(_ files: [ChangedFile]) -> ActionResult {
         var result = ActionResult()
-        let paths = GitRepository.unique(files.map(\.path))
-        // Staging a deletion stores no content, so no filter would run for it.
-        let deleted = Set(files.filter { $0.status == .deleted }.map(\.path))
-        guard let filtered = filteredPaths(paths.filter { !deleted.contains($0) }) else {
+        let uniqueFiles = GitRepository.unique(files, by: \.path)
+        let paths = uniqueFiles.map(\.path)
+        // Staging a genuine deletion stores no content, so no filter runs for it.
+        // Only exempt `.deleted` entries whose path no longer exists on disk.
+        let deletedMissing = Set(uniqueFiles.compactMap { f -> String? in
+            guard f.status == .deleted else { return nil }
+            var info = stat()
+            return lstat(root.appendingPathComponent(f.path).path, &info) != 0 ? f.path : nil
+        })
+        guard let filtered = filteredPaths(paths.filter { !deletedMissing.contains($0) }) else {
             result.failed = paths
             return result
         }
         result.refused = paths.filter(filtered.contains).map { ($0, .filtered) }
-        runInChunks(["add", "-A", "--"], paths.filter { !filtered.contains($0) }, into: &result)
+        let toAdd = paths.filter { !filtered.contains($0) && !deletedMissing.contains($0) }
+        let toRemove = paths.filter { deletedMissing.contains($0) }
+        if !toRemove.isEmpty { runInChunks(["rm", "--cached", "--ignore-unmatch", "-q", "--"], toRemove, into: &result) }
+        if !toAdd.isEmpty { runInChunks(["add", "-A", "--"], toAdd, into: &result) }
         return result
     }
 
@@ -946,7 +1119,8 @@ final class GitRepository {
     func unstage(_ files: [ChangedFile]) -> ActionResult {
         var result = ActionResult()
         let unique = GitRepository.unique(files, by: \.path)
-        let plain = unique.filter { $0.originalPath == nil }.map(\.path)
+        let isRename: (ChangedFile) -> Bool = { $0.status == .renamed && $0.originalPath != nil }
+        let plain = unique.filter { !isRename($0) }.map(\.path)
         for chunk in GitRepository.chunks(plain) {
             if run(["reset", "-q", "--"] + chunk) != nil {
                 result.done += chunk
@@ -956,7 +1130,7 @@ final class GitRepository {
                 }
             }
         }
-        for f in unique where f.originalPath != nil {
+        for f in unique where isRename(f) {
             // A staged rename is undone at both its new and its old path. `reset` also works
             // before the first commit, where `restore --staged` has no HEAD to restore from.
             let paths = [f.path] + (f.originalPath.map { [$0] } ?? [])
@@ -972,29 +1146,60 @@ final class GitRepository {
     func discard(_ files: [ChangedFile], trash: (URL) throws -> Void = GitRepository.moveToTrash) -> ActionResult {
         var result = ActionResult()
         var tracked: [String] = []
+        var intentAdded: [String] = []
         var untracked: [String] = []
         for f in GitRepository.unique(files, by: \.path) {
             switch f.status {
             case .conflicted: result.refused.append((f.path, .conflicted))
             case .untracked: untracked.append(f.path)
+            case .added where !f.staged: intentAdded.append(f.path)
             default: tracked.append(f.path)
             }
         }
-        if let filtered = filteredPaths(tracked) {
-            result.refused += tracked.filter(filtered.contains).map { ($0, .filtered) }
+        let checkFiltered = tracked + intentAdded
+        if let filtered = filteredPaths(checkFiltered, includeIndex: true) {
+            result.refused += checkFiltered.filter(filtered.contains).map { ($0, .filtered) }
             tracked.removeAll(where: filtered.contains)
+            intentAdded.removeAll(where: filtered.contains)
         } else {
-            result.failed += tracked
+            result.failed += checkFiltered
             tracked = []
+            intentAdded = []
         }
         if !tracked.isEmpty && !backUp(tracked, trash: trash) {
             result.refused += tracked.map { ($0, .notBackedUp) }
             tracked = []
         }
+        let rootReal = root.standardizedFileURL.resolvingSymlinksInPath().path
         for path in untracked {
+            let url = root.appendingPathComponent(path)
+            let parentReal = url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path
+            guard parentReal == rootReal || parentReal.hasPrefix(rootReal + "/") else {
+                result.refused.append((path, .notBackedUp))
+                continue
+            }
             do {
-                try trash(root.appendingPathComponent(path))
+                try trash(url)
                 result.done.append(path)
+            } catch {
+                result.refused.append((path, .notBackedUp))
+            }
+        }
+        for path in intentAdded {
+            let url = root.appendingPathComponent(path)
+            let parentReal = url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path
+            guard parentReal == rootReal || parentReal.hasPrefix(rootReal + "/") else {
+                result.refused.append((path, .notBackedUp))
+                continue
+            }
+            do {
+                var info = stat()
+                if lstat(url.path, &info) == 0 { try trash(url) }
+                if run(["rm", "-f", "--cached", "--ignore-unmatch", "-q", "--", path]) != nil {
+                    result.done.append(path)
+                } else {
+                    result.failed.append(path)
+                }
             } catch {
                 result.refused.append((path, .notBackedUp))
             }
@@ -1014,9 +1219,12 @@ final class GitRepository {
     /// have nothing to keep. False if any copy couldn't be made or the Trash refused the folder.
     private func backUp(_ paths: [String], trash: (URL) throws -> Void) -> Bool {
         let fm = FileManager.default
+        let rootReal = root.standardizedFileURL.resolvingSymlinksInPath().path
         var present: [(path: String, url: URL)] = []
         for p in paths {
             let url = root.appendingPathComponent(p)
+            let parentReal = url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path
+            guard parentReal == rootReal || parentReal.hasPrefix(rootReal + "/") else { return false }
             var info = stat()
             guard lstat(url.path, &info) == 0 else { continue }
             // Copying a FIFO or a device would block or read without end.
@@ -1046,7 +1254,15 @@ final class GitRepository {
 
     private func runInChunks(_ command: [String], _ paths: [String], into result: inout ActionResult) {
         for chunk in GitRepository.chunks(paths) {
-            if run(command + chunk) != nil { result.done += chunk } else { result.failed += chunk }
+            if run(command + chunk) != nil {
+                result.done += chunk
+            } else if chunk.count > 1 {
+                for path in chunk {
+                    if run(command + [path]) != nil { result.done.append(path) } else { result.failed.append(path) }
+                }
+            } else {
+                result.failed += chunk
+            }
         }
     }
 
@@ -1071,16 +1287,23 @@ final class GitRepository {
         GitRepository.runAsync {
             let diff = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=all"]
             var out = Data()
-            let staged = GitRepository.unique(files.filter(\.staged).flatMap { [$0.path] + ($0.originalPath.map { [$0] } ?? []) })
-            for chunk in GitRepository.chunks(staged) { out += self.run(diff + ["--cached", "--"] + chunk) ?? Data() }
+            let cap = GitRepository.maxBlobSize
+            func appendChunk(_ args: [String], accepted: Set<Int32> = [0]) {
+                guard out.count < cap, let d = self.run(args, acceptedStatuses: accepted, maxOutputBytes: cap - out.count) else { return }
+                out.append(d)
+            }
+            let staged = GitRepository.unique(files.filter(\.staged).flatMap {
+                $0.status == .renamed ? [$0.path] + ($0.originalPath.map { [$0] } ?? []) : [$0.path]
+            })
+            for chunk in GitRepository.chunks(staged) { appendChunk(diff + ["--cached", "--"] + chunk) }
             let unstaged = GitRepository.unique(files.filter { !$0.staged && $0.status != .untracked }.map(\.path))
-            for chunk in GitRepository.chunks(unstaged) { out += self.run(diff + ["--"] + chunk) ?? Data() }
+            for chunk in GitRepository.chunks(unstaged) { appendChunk(diff + ["--"] + chunk) }
             for f in GitRepository.unique(files.filter { !$0.staged && $0.status == .untracked }, by: \.path) {
                 var info = stat()
                 let type = lstat(self.root.appendingPathComponent(f.path).path, &info) == 0 ? info.st_mode & S_IFMT : 0
                 guard type == S_IFREG || type == S_IFLNK else { continue }
                 // Exits with 1 when the files differ, which a new file always does.
-                out += self.run(diff + ["--no-index", "--", "/dev/null", f.path], acceptedStatuses: [0, 1]) ?? Data()
+                appendChunk(diff + ["--no-index", "--", "/dev/null", f.path], accepted: [0, 1])
             }
             let text = String(decoding: out, as: UTF8.self)
             DispatchQueue.main.async { completion(text) }
@@ -1151,19 +1374,24 @@ final class GitRepository {
         }
     }
 
+    private struct UnifiedLine: Hashable {
+        var text: Substring
+        var noNewline: Bool
+    }
+
     /// A unified diff with `context` lines around each change, or "" when the texts match.
     static func unifiedDiff(old: String, new: String, path: String, context: Int = 3) -> String {
-        // A last line without a newline is marked so it differs from the same text with one,
-        // and is printed with git's "No newline at end of file" note.
-        let noNewline: Character = "\u{1}"
-        func lines(_ s: String) -> [Substring] {
-            var l = s.split(separator: "\n", omittingEmptySubsequences: false)
-            if l.last == "" { l.removeLast() } else if let last = l.last { l[l.count - 1] = Substring(last + String(noNewline)) }
-            return l
+        func splitLines(_ s: String) -> [UnifiedLine] {
+            var parts = s.split(separator: "\n", omittingEmptySubsequences: false)
+            let trailingNewline = parts.last == ""
+            if trailingNewline { parts.removeLast() }
+            return parts.enumerated().map { idx, text in
+                UnifiedLine(text: text, noNewline: !trailingNewline && idx == parts.count - 1)
+            }
         }
-        let o = lines(old)
-        let n = lines(new)
-        let hunks = diff(old: o, new: n).hunks
+        let o = splitLines(old)
+        let n = splitLines(new)
+        let hunks = diffElements(old: o, new: n) { String($0.text) }.hunks
         guard !hunks.isEmpty else { return "" }
         func span(_ start: Int, _ count: Int) -> String {
             count == 0 ? "\(start),0" : count == 1 ? "\(start + 1)" : "\(start + 1),\(count)"
@@ -1180,53 +1408,167 @@ final class GitRepository {
             var oldCount = 0
             var line = newFrom
             for h in hunks[i...j] {
-                while line < h.newStart { body += " \(n[line])\n"; line += 1; oldCount += 1 }
-                for l in h.oldLines { body += "-\(l)\n"; oldCount += 1 }
-                while line < h.newEnd { body += "+\(n[line])\n"; line += 1 }
+                while line < h.newStart {
+                    body += " \(n[line].text)\n"
+                    if n[line].noNewline { body += "\\ No newline at end of file\n" }
+                    line += 1; oldCount += 1
+                }
+                for oi in h.oldStart..<(h.oldStart + h.oldLines.count) {
+                    body += "-\(o[oi].text)\n"
+                    if o[oi].noNewline { body += "\\ No newline at end of file\n" }
+                    oldCount += 1
+                }
+                while line < h.newEnd {
+                    body += "+\(n[line].text)\n"
+                    if n[line].noNewline { body += "\\ No newline at end of file\n" }
+                    line += 1
+                }
             }
-            while line < newTo { body += " \(n[line])\n"; line += 1; oldCount += 1 }
-            body = body.replacingOccurrences(of: "\(noNewline)\n", with: "\n\\ No newline at end of file\n")
+            while line < newTo {
+                body += " \(n[line].text)\n"
+                if n[line].noNewline { body += "\\ No newline at end of file\n" }
+                line += 1; oldCount += 1
+            }
             out += "@@ -\(span(oldFrom, oldCount)) +\(span(newFrom, newTo - newFrom)) @@\n" + body
             i = j + 1
         }
         return out
     }
 
-    /// Line-level diff of `new` against `old`, reduced to gutter markers.
+    /// Line-level diff of `new` against `old`, reduced to gutter markers. Uses Int32 line
+    /// interning and Patience unique-line anchors so large files diff quickly without quadratic blowup.
     static func diff(old: [Substring], new: [Substring]) -> LineDiff {
+        diffElements(old: old, new: new, makeString: String.init)
+    }
+
+    private static func diffElements<T: Hashable>(old: [T], new: [T], makeString: (T) -> String) -> LineDiff {
         var prefix = 0
         while prefix < old.count && prefix < new.count && old[prefix] == new[prefix] { prefix += 1 }
         var suffix = 0
-        while suffix < old.count - prefix && suffix < new.count - prefix && old[old.count - 1 - suffix] == new[new.count - 1 - suffix] { suffix += 1 }
-        let o = old[prefix..<(old.count - suffix)]
-        let n = new[prefix..<(new.count - suffix)]
+        while suffix < old.count - prefix && suffix < new.count - prefix
+                && old[old.count - 1 - suffix] == new[new.count - 1 - suffix] { suffix += 1 }
+        let oCount = old.count - prefix - suffix
+        let nCount = new.count - prefix - suffix
         var result = LineDiff()
-        if o.isEmpty && n.isEmpty { return result }
-        let oldLines = Array(o)
-        var removed = Set<Int>()
-        var inserted = Set<Int>()
-        if o.count * n.count > 40_000_000 {
-            for k in 0..<n.count { inserted.insert(k) }
-            for k in 0..<o.count { removed.insert(k) }
-        } else {
-            for change in Array(n).difference(from: oldLines) {
-                switch change {
-                case .insert(let off, _, _): inserted.insert(off)
-                case .remove(let off, _, _): removed.insert(off)
+        if oCount == 0 && nCount == 0 { return result }
+
+        var ids: [T: Int32] = [:]
+        ids.reserveCapacity(oCount + nCount)
+        var nextID: Int32 = 0
+        func intern(_ value: T) -> Int32 {
+            if let existing = ids[value] { return existing }
+            let assigned = nextID
+            nextID += 1
+            ids[value] = assigned
+            return assigned
+        }
+        let oldIDs = (prefix..<(prefix + oCount)).map { intern(old[$0]) }
+        let newIDs = (prefix..<(prefix + nCount)).map { intern(new[$0]) }
+
+        var removed = [Bool](repeating: false, count: oCount + 1)
+        var inserted = [Bool](repeating: false, count: nCount + 1)
+
+        func solve(_ oStart: Int, _ oEnd: Int, _ nStart: Int, _ nEnd: Int) {
+            var os = oStart, oe = oEnd
+            var ns = nStart, ne = nEnd
+            while os < oe && ns < ne && oldIDs[os] == newIDs[ns] { os += 1; ns += 1 }
+            while os < oe && ns < ne && oldIDs[oe - 1] == newIDs[ne - 1] { oe -= 1; ne -= 1 }
+            if os == oe {
+                for j in ns..<ne { inserted[j] = true }
+                return
+            }
+            if ns == ne {
+                for i in os..<oe { removed[i] = true }
+                return
+            }
+
+            // Patience diff: split at lines that appear once in each slice in matching order.
+            var oldUnique: [Int32: Int] = [:]
+            oldUnique.reserveCapacity(oe - os)
+            for i in os..<oe {
+                let id = oldIDs[i]
+                oldUnique[id] = oldUnique[id] == nil ? i : -1
+            }
+            var newUnique: [Int32: Int] = [:]
+            newUnique.reserveCapacity(ne - ns)
+            for j in ns..<ne {
+                let id = newIDs[j]
+                guard let oi = oldUnique[id], oi >= 0 else { continue }
+                newUnique[id] = newUnique[id] == nil ? j : -1
+            }
+            var pairs: [(old: Int, new: Int)] = []
+            pairs.reserveCapacity(newUnique.count)
+            for j in ns..<ne {
+                let id = newIDs[j]
+                if let oi = oldUnique[id], oi >= 0, let nj = newUnique[id], nj == j {
+                    pairs.append((oi, j))
+                }
+            }
+
+            if !pairs.isEmpty {
+                var tails: [Int] = []
+                tails.reserveCapacity(pairs.count)
+                var prev = [Int](repeating: -1, count: pairs.count)
+                for idx in pairs.indices {
+                    let key = pairs[idx].old
+                    var lo = 0, hi = tails.count
+                    while lo < hi {
+                        let mid = (lo + hi) >> 1
+                        if pairs[tails[mid]].old < key { lo = mid + 1 } else { hi = mid }
+                    }
+                    if lo > 0 { prev[idx] = tails[lo - 1] }
+                    if lo == tails.count { tails.append(idx) } else { tails[lo] = idx }
+                }
+                if let last = tails.last {
+                    var anchors: [(old: Int, new: Int)] = []
+                    anchors.reserveCapacity(tails.count)
+                    var cur = last
+                    while cur >= 0 {
+                        anchors.append(pairs[cur])
+                        cur = prev[cur]
+                    }
+                    anchors.reverse()
+                    var prevO = os, prevN = ns
+                    for a in anchors {
+                        solve(prevO, a.old, prevN, a.new)
+                        prevO = a.old + 1
+                        prevN = a.new + 1
+                    }
+                    solve(prevO, oe, prevN, ne)
+                    return
+                }
+            }
+
+            let ol = oe - os
+            let nl = ne - ns
+            if ol * nl > 40_000_000 {
+                for i in os..<oe { removed[i] = true }
+                for j in ns..<ne { inserted[j] = true }
+            } else {
+                let oSlice = Array(oldIDs[os..<oe])
+                let nSlice = Array(newIDs[ns..<ne])
+                for change in nSlice.difference(from: oSlice) {
+                    switch change {
+                    case .insert(let off, _, _): inserted[ns + off] = true
+                    case .remove(let off, _, _): removed[os + off] = true
+                    }
                 }
             }
         }
+
+        solve(0, oCount, 0, nCount)
+
         var i = 0, j = 0
-        while i < o.count || j < n.count {
-            if removed.contains(i) || inserted.contains(j) {
+        while i < oCount || j < nCount {
+            if removed[i] || inserted[j] {
                 var r = 0
-                while removed.contains(i + r) { r += 1 }
+                while removed[i + r] { r += 1 }
                 var a = 0
-                while inserted.contains(j + a) { a += 1 }
+                while inserted[j + a] { a += 1 }
                 for k in 0..<a { result.marks[prefix + j + k] = k < r ? .modified : .added }
                 if a == 0 && r > 0 { result.deletions.insert(prefix + j) }
-                result.hunks.append(DiffHunk(newStart: prefix + j, newCount: a, oldStart: prefix + i,
-                                             oldLines: oldLines[i..<(i + r)].map(String.init)))
+                let oldText = (0..<r).map { makeString(old[prefix + i + $0]) }
+                result.hunks.append(DiffHunk(newStart: prefix + j, newCount: a, oldStart: prefix + i, oldLines: oldText))
                 i += r
                 j += a
             } else {

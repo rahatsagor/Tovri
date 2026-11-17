@@ -1,7 +1,7 @@
 import AppKit
 
 /// What the sidebar's Changes list asks the window to do with a file.
-enum SidebarChangeAction { case open, compare, history }
+enum SidebarChangeAction { case open(focus: Bool), compare, history }
 
 /// What the Changes list asks the window to do with the selected files.
 enum ChangeListAction { case stage, unstage, discard, patch, reveal }
@@ -103,6 +103,8 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     private(set) var files: [GitRepository.ChangedFile] = []
     private var stagedFiles: [GitRepository.ChangedFile] = []
     private var unstagedFiles: [GitRepository.ChangedFile] = []
+    private var stagedPaths: Set<String> = []
+    private var lastRoot: URL?
 
     var filter: ChangeFilter = Settings.shared.gitChangesFilter {
         didSet {
@@ -193,9 +195,10 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         list.delegate = self
         list.target = self
         list.action = #selector(clicked)
+        list.doubleAction = #selector(doubleClicked)
         list.onReturn = { [weak self] in
             guard let self, let f = self.selectedFiles.first, self.selectedFiles.count == 1 else { return }
-            self.onAction?(f, .open)
+            self.onAction?(f, .open(focus: true))
         }
         list.onSpace = { [weak self] in self?.toggleStaged() }
         list.onDelete = { [weak self] in self?.discardSelected() }
@@ -263,12 +266,35 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         } ?? nil) ?? haystack.localizedStandardContains(needle)
     }
 
-    func setFiles(_ new: [GitRepository.ChangedFile]) {
+    func setFiles(_ new: [GitRepository.ChangedFile], stagedPaths: Set<String>? = nil, root: URL? = nil) {
         allFiles = new
+        self.stagedPaths = stagedPaths ?? Set(new.filter(\.staged).map(\.path))
+        if let root { lastRoot = root }
+        rebuildRows()
+    }
+
+    /// Updates unstaged live line counts from edited buffers without re-running `git status`.
+    func updateLiveCounts(_ live: [String: (Int, Int)], root: URL) {
+        guard !allFiles.isEmpty else { return }
+        lastRoot = root
+        var changed = false
+        for i in allFiles.indices {
+            let f = allFiles[i]
+            guard !f.staged, !stagedPaths.contains(f.path) else { continue }
+            let resolved = root.appendingPathComponent(f.path).standardizedFileURL.resolvingSymlinksInPath().path
+            guard let counts = live[resolved] else { continue }
+            if allFiles[i].added != counts.0 || allFiles[i].removed != counts.1 {
+                allFiles[i].added = counts.0
+                allFiles[i].removed = counts.1
+                changed = true
+            }
+        }
+        guard changed else { return }
         rebuildRows()
     }
 
     private func rebuildRows() {
+        let prevAnchor = list.selectedRowIndexes.first
         let selected = Set(selectedFiles.map(ChangesView.key))
         let terms = ChangesView.queryTerms(query)
         let matched = allFiles.filter { filter.matches($0) && ChangesView.matchesQuery($0, terms: terms) }
@@ -282,7 +308,15 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
             rows += section.map { Row(staged: staged, file: $0) }
         }
         list.reloadData()
-        let keep = IndexSet(rows.indices.filter { rows[$0].file.map { selected.contains(ChangesView.key($0)) } ?? false })
+        var keep = IndexSet(rows.indices.filter { rows[$0].file.map { selected.contains(ChangesView.key($0)) } ?? false })
+        if keep.isEmpty, let prevAnchor, !selected.isEmpty {
+            let target = min(prevAnchor, max(0, rows.count - 1))
+            if let down = (target..<rows.count).first(where: { rows[$0].file != nil }) {
+                keep.insert(down)
+            } else if let up = (0..<target).last(where: { rows[$0].file != nil }) {
+                keep.insert(up)
+            }
+        }
         if !keep.isEmpty { list.selectRowIndexes(keep, byExtendingSelection: false) }
         empty.stringValue = !terms.isEmpty ? "No matching changes" : filter.emptyMessage
         empty.isHidden = !rows.isEmpty
@@ -394,7 +428,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
             return true
         case #selector(NSResponder.insertNewline(_:)):
             if let f = selectedFiles.first ?? rows.lazy.compactMap(\.file).first {
-                onAction?(f, .open)
+                onAction?(f, .open(focus: true))
             }
             return true
         default:
@@ -413,12 +447,21 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     }
 
     @objc private func clicked() {
+        guard NSApp.currentEvent?.clickCount != 2 else { return }
         let row = list.clickedRow
         guard row >= 0, row < rows.count, let f = rows[row].file else { return }
         // Command- and Shift-clicks change the selection without opening anything.
         let flags = NSApp.currentEvent?.modifierFlags ?? []
         guard !flags.contains(.command), !flags.contains(.shift) else { return }
-        onAction?(f, .open)
+        onAction?(f, .open(focus: false))
+    }
+
+    @objc private func doubleClicked() {
+        let row = list.clickedRow
+        guard row >= 0, row < rows.count, let f = rows[row].file else { return }
+        let flags = NSApp.currentEvent?.modifierFlags ?? []
+        guard !flags.contains(.command), !flags.contains(.shift) else { return }
+        onAction?(f, .open(focus: true))
     }
 
     /// Space stages the selected files, or unstages them when they are all staged.
@@ -463,7 +506,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         if n == 1, let f = menuFiles.first {
             let deleted = f.status == .deleted
             add("Open", #selector(menuOpen), enabled: !deleted)
-            add("Compare with Last Commit", #selector(menuCompare), enabled: !deleted)
+            add("Compare with Last Commit", #selector(menuCompare), enabled: !deleted && f.status != .untracked && !(f.staged && f.status == .added))
             add("File History…", #selector(menuHistory), enabled: !deleted && f.status != .untracked && !(f.staged && f.status == .added))
         }
         add("Open Changes as Patch", #selector(menuPatch))
@@ -481,7 +524,7 @@ final class ChangesView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         return m
     }
 
-    @objc private func menuOpen() { menuFiles.first.map { onAction?($0, .open) } }
+    @objc private func menuOpen() { menuFiles.first.map { onAction?($0, .open(focus: true)) } }
     @objc private func menuCompare() { menuFiles.first.map { onAction?($0, .compare) } }
     @objc private func menuHistory() { menuFiles.first.map { onAction?($0, .history) } }
     @objc private func menuPatch() { onListAction?(menuFiles, .patch) }

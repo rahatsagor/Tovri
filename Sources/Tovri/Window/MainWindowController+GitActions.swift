@@ -72,8 +72,22 @@ extension MainWindowController {
     }
 
     private func finishGitAction(_ r: GitRepository.ActionResult, files: [GitRepository.ChangedFile], verb: String) {
-        // Discarding rewrote files: clean documents reload, and ones with unsaved edits ask, as for
-        // any change on disk. Then the list, sidebar colors, changed count and gutters catch up.
+        if verb == "discard", let folder = folderURL, let repo = GitRepository.find(for: folder) {
+            let doneURLs = Set(r.done.map { repo.root.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath().path })
+            if !doneURLs.isEmpty {
+                for doc in allOpenDocuments() {
+                    guard let url = doc.url,
+                          doneURLs.contains(url.standardizedFileURL.resolvingSymlinksInPath().path) else { continue }
+                    if FileManager.default.fileExists(atPath: url.path) {
+                        _ = reloadPreservingViews(doc)
+                    } else {
+                        doc.markDeletedOnDisk()
+                    }
+                }
+                groups.forEach { $0.refreshTabBar() }
+            }
+        }
+        // Check any other external disk changes, then catch up the sidebar, changed count and gutters.
         checkExternalChanges()
         refreshGitStatus()
         if Settings.shared.gitGutter { allOpenDocuments().forEach { $0.refreshGitBaseline() } }

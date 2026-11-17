@@ -1020,9 +1020,11 @@ final class Document: NSObject, NSTextStorageDelegate {
             scheduleGitDiff(delay: 0)
             return
         }
+        gitGeneration += 1
+        let gen = gitGeneration
         repo.headContents(of: url, maxBytes: 12_000_000) { [weak self] data in
-            guard let self, self.url == url, Settings.shared.gitGutter else { return }
-            let decoded = data.map { TextEncoding.decode($0, preferred: enc) }
+            guard let self, self.gitGeneration == gen, self.url == url, self.encoding == enc, Settings.shared.gitGutter else { return }
+            let decoded = data.map { TextEncoding.decode($0, preferred: enc, preferUTF8IfValid: true) }
             guard let decoded, !decoded.isBinary, decoded.text.utf16.count < 3_000_000 else { self.clearGitBaseline(); return }
             self.gitBaseline = LineEnding.normalize(decoded.text, rawData: nil).0
             self.gitBaselineSource = source

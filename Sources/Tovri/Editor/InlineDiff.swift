@@ -42,6 +42,15 @@ enum ComparisonSource: Equatable {
 
     /// Comparing with commits is a Git feature and follows Settings → Git; the others always work.
     var usesGit: Bool { self == .commit }
+
+    /// Clipboard comparisons are excluded from "Restore This Version" so users aren't confused
+    /// restoring transient clipboard text when expecting a file/commit snapshot.
+    var canRestoreVersion: Bool {
+        switch self {
+        case .commit, .saved, .file, .snapshot: return true
+        case .clipboard: return false
+        }
+    }
 }
 
 /// A comparison shown in the editor itself (with the last commit, or any other text): lines
@@ -79,13 +88,14 @@ final class InlineDiff {
 
     /// Keeps removed lines next to the text they belong to while an edit adds or removes lines,
     /// until the diff is recomputed. Returns false when nothing moved.
-    func applyEdit(firstLine a: Int, removed r: Int, inserted k: Int) -> Bool {
+    func applyEdit(firstLine a: Int, removed r: Int, inserted k: Int, lineCount: Int? = nil) -> Bool {
         let delta = k - r
         guard delta != 0 else { return false }
         var above: [Int: Int] = [:]
         var lines: [Int: [String]] = [:]
         if let t = removed[InlineDiff.trailingKey] { lines[InlineDiff.trailingKey] = t }
-        for (line, n) in gaps.above {
+        for line in gaps.above.keys.sorted() {
+            let n = gaps.above[line] ?? 0
             let to = line > a + r ? line + delta : (line > a ? a + 1 : line)
             above[to, default: 0] += n
             lines[to, default: []] += removed[line] ?? []

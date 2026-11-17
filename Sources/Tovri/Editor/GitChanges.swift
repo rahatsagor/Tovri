@@ -12,9 +12,9 @@ extension EditorView {
 
     /// Moves to the change after or before `line` (the caret's line when nil) and shows what it replaced.
     @discardableResult
-    func gotoChange(forward: Bool, from line: Int? = nil, showCard: Bool = true) -> Bool {
+    func gotoChange(forward: Bool, from line: Int? = nil, after current: DiffHunk? = nil, showCard: Bool = true) -> Bool {
         let line = line ?? document.lines.line(containing: textView.selectedRange().location)
-        guard let h = lineDiff.nextHunk(from: line, forward: forward, lineCount: document.lines.count) else { return false }
+        guard let h = lineDiff.nextHunk(from: line, forward: forward, lineCount: document.lines.count, after: current ?? changeCard?.hunk) else { return false }
         goTo(line: min(h.newStart, document.lines.count - 1) + 1)
         if showCard { showGitChange(h) }
         return true
@@ -226,7 +226,7 @@ final class GitChangeCard: NSView {
 
     private func go(forward: Bool) {
         guard let editor else { return }
-        editor.gotoChange(forward: forward, from: min(hunk.newStart, editor.document.lines.count - 1))
+        editor.gotoChange(forward: forward, from: min(hunk.newStart, editor.document.lines.count - 1), after: hunk)
     }
 }
 

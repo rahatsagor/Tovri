@@ -581,6 +581,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     func editorGitDiffDidChange(_ editor: EditorView) {
         group(containing: editor)?.refreshAccessories()
+        let source = editor.document
+        let patchTabs = allGroupsTabs().filter { $0.document.changesSource === source }
+        if !patchTabs.isEmpty, let diff = source.unifiedDiffAgainstHead() {
+            let text = diff.isEmpty ? "No changes since the last commit.\n" : diff
+            for tab in patchTabs where (tab.document.string as String) != text {
+                tab.document.replaceAllContent(text)
+            }
+        }
+        if Settings.shared.gitChangesAndHistory && sidebar.isShowingChanges,
+           source.isDirty && source.hasGitBaseline,
+           let url = source.url,
+           let root = folderURL.flatMap({ GitRepository.find(for: $0)?.root }) {
+            let counts = source.gitDiff.hunks.reduce((0, 0)) { ($0.0 + $1.newCount, $0.1 + $1.oldLines.count) }
+            sidebar.updateLiveChangeCounts([url.standardizedFileURL.resolvingSymlinksInPath().path: counts], root: root)
+        }
     }
 
     // MARK: Opening
@@ -791,6 +806,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     private var gitStatusRequestedAgain = false
     /// Set when `Changes` refreshed without reading untracked or ignored files for the hidden `Files` tree.
     private var sidebarGitNeedsFullRefresh = false
+    private var ignoredGeneration = 0
     private(set) var changedFileCount = 0
 
     /// Runs `git status` only for the features that are on: sidebar colors and the changed count.
@@ -799,6 +815,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let s = Settings.shared
         guard s.gitNeedsStatus, let folder = folderURL, let repo = GitRepository.find(for: folder) else {
             sidebarGitNeedsFullRefresh = false
+            ignoredGeneration += 1
             sidebar.setGitStatus([:])
             sidebar.setIgnoredPaths([])
             sidebar.setChangeCount(0)
@@ -820,44 +837,49 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             guard let self else { return }
             self.gitStatusPending = false
             self.pendingChangesFilter = nil
-            if self.gitStatusRequestedAgain {
-                self.gitStatusRequestedAgain = false
-                self.refreshGitStatus()
-                return
-            }
+            let requestedAgain = self.gitStatusRequestedAgain
+            self.gitStatusRequestedAgain = false
             let s = Settings.shared
-            guard s.gitNeedsStatus, self.folderURL?.path == folder.path else { return }
-            if s.gitSidebarStatus {
-                if !showingChanges || includeUntracked {
-                    var abs: [String: GitFileStatus] = [:]
-                    abs.reserveCapacity(status.count)
-                    for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
-                    self.sidebar.setGitStatus(abs)
-                }
-            } else {
-                self.sidebar.setGitStatus([:])
-            }
-            let statusCount = status.reduce(into: 0) { if $1.value != .ignored { $0 += 1 } }
-            self.changedFileCount = s.gitStatusBarChanges ? statusCount : 0
-            self.updateStatusBar()
-            if s.gitChangesAndHistory {
-                if self.sidebar.isShowingChanges {
-                    guard let changes, let filter = requestedFilter, filter.covers(self.sidebar.changesFilter) else {
-                        self.sidebar.setChangeCount(statusCount)
-                        self.refreshGitStatus()
-                        return
+            var needsFollowUpFilter = false
+            if s.gitNeedsStatus, self.folderURL?.path == folder.path {
+                if s.gitSidebarStatus {
+                    if !showingChanges || includeUntracked {
+                        var abs: [String: GitFileStatus] = [:]
+                        abs.reserveCapacity(status.count)
+                        for (rel, st) in status { abs[repo.root.appendingPathComponent(rel).standardizedFileURL.path] = st }
+                        self.sidebar.setGitStatus(abs)
                     }
-                    let stagedPaths = Set(entries.lazy.filter { $0.staged != nil }.map(\.path))
-                    self.sidebar.setChanges(self.withLiveCounts(changes, stagedPaths: stagedPaths, root: repo.root),
-                                            filter: filter, totalCount: statusCount)
                 } else {
-                    self.sidebar.setChangeCount(statusCount)
+                    self.sidebar.setGitStatus([:])
                 }
+                let statusCount = status.reduce(into: 0) { if $1.value != .ignored { $0 += 1 } }
+                self.changedFileCount = s.gitStatusBarChanges ? statusCount : 0
+                self.updateStatusBar()
+                if s.gitChangesAndHistory {
+                    if self.sidebar.isShowingChanges {
+                        if let changes, let filter = requestedFilter, filter.covers(self.sidebar.changesFilter) {
+                            let stagedPaths = Set(entries.lazy.filter { $0.staged != nil }.map(\.path))
+                            self.sidebar.setChanges(self.withLiveCounts(changes, stagedPaths: stagedPaths, root: repo.root),
+                                                    filter: filter, stagedPaths: stagedPaths, root: repo.root, totalCount: statusCount)
+                        } else {
+                            self.sidebar.setChangeCount(statusCount)
+                            needsFollowUpFilter = true
+                        }
+                    } else {
+                        self.sidebar.setChangeCount(statusCount)
+                    }
+                }
+            }
+            if requestedAgain || needsFollowUpFilter {
+                self.refreshGitStatus()
             }
         }
+        ignoredGeneration += 1
+        let igGen = ignoredGeneration
         if fetchIgnored {
             repo.ignored { [weak self] list in
-                guard let self, Settings.shared.gitSidebarStatus, self.folderURL?.path == folder.path else { return }
+                guard let self, self.ignoredGeneration == igGen,
+                      Settings.shared.gitSidebarStatus, self.folderURL?.path == folder.path else { return }
                 self.sidebar.setIgnoredPaths(Set(list.map { repo.root.appendingPathComponent($0).standardizedFileURL.path }))
             }
         } else if !s.gitSidebarStatus {
@@ -1297,7 +1319,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     /// A caret parked at the end of a growing file (a log, an agent's output) follows new lines.
     @discardableResult
-    private func reloadPreservingViews(_ doc: Document) -> Bool {
+    func reloadPreservingViews(_ doc: Document) -> Bool {
         let oldLength = doc.length
         let saved = editors(for: doc).map { e -> (EditorView, NSRange, CGPoint, Bool) in
             let endVisible = e.textView.visibleRect.intersects(e.textView.caretRect(at: oldLength))
@@ -1868,7 +1890,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// above the lines that replaced them, and added or changed lines tinted.
     @objc func compareWithLastCommit(_ sender: Any?) {
         guard let e = activeEditor, !e.document.isTransient else { NSSound.beep(); return }
-        if e.isComparing { e.setComparing(false); return }
+        if e.isComparing && e.comparisonSource == nil { e.setComparing(false); return }
         guard Settings.shared.gitGutter, e.document.hasGitBaseline, e.setComparing(true), let d = e.inlineDiff else {
             flashNoChanges(e.document)
             return
@@ -1976,7 +1998,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     private func showHistory(of url: URL, in editor: EditorView) {
         guard let repo = GitRepository.find(for: url) else { statusBar.flash("“\(url.lastPathComponent)” isn’t in a Git repository"); return }
         repo.history(of: url) { [weak self, weak editor] commits in
-            guard let self, let editor, Settings.shared.gitChangesAndHistory else { return }
+            guard let self, let editor, editor.document.url == url, Settings.shared.gitChangesAndHistory else { return }
             guard !commits.isEmpty else { self.statusBar.flash("“\(url.lastPathComponent)” has no commits yet"); return }
             let theme = ThemeManager.shared.active
             let when = RelativeDateTimeFormatter()
@@ -1985,7 +2007,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             let items = commits.map { c -> PaletteItem in
                 var item = PaletteItem(title: c.subject.isEmpty ? "(no message)" : c.subject,
                                        detail: "\(c.author) · \(when.localizedString(for: c.date, relativeTo: now))") { [weak self, weak editor] in
-                    guard let self, let editor else { return }
+                    guard let self, let editor, editor.document.url == url else { return }
                     self.compare(editor, with: c, in: repo)
                 }
                 item.twoLine = true
@@ -2004,9 +2026,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         guard Settings.shared.gitChangesAndHistory else { return }
         let doc = editor.document
         repo.contents(of: c.path, at: c.sha) { [weak self, weak editor] data in
-            guard let self, let editor, Settings.shared.gitChangesAndHistory else { return }
+            guard let self, let editor, editor.document === doc, Settings.shared.gitChangesAndHistory else { return }
             guard let data else { self.statusBar.flash("Couldn’t read the file at \(c.shortSHA)"); return }
-            let decoded = TextEncoding.decode(data, preferred: doc.encoding)
+            let decoded = TextEncoding.decode(data, preferred: doc.encoding, preferUTF8IfValid: true)
             guard !decoded.isBinary else { self.statusBar.flash("The file at \(c.shortSHA) isn’t text"); return }
             let base = LineEnding.normalize(decoded.text, rawData: nil).0
             editor.compare(withBase: base, label: "\(c.shortSHA) “\(c.subject)”") { [weak self] d in
@@ -2040,8 +2062,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         guard let folder = folderURL, let repo = GitRepository.find(for: folder) else { return }
         let url = repo.root.appendingPathComponent(change.path)
         switch action {
-        case .open:
-            openChangedFile(url, status: change.status)
+        case .open(let focus):
+            openChangedFile(url, status: change.status, focus: focus)
         case .compare:
             guard change.status != .deleted, let doc = open(url: url), let e = activeEditor, e.document === doc else { return }
             if doc.hasGitBaseline { compareWithLastCommit(nil) } else { e.pendingCompare = true }
@@ -2070,9 +2092,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         return out
     }
 
-    private func openChangedFile(_ url: URL, status: GitFileStatus) {
+    private func openChangedFile(_ url: URL, status: GitFileStatus, focus: Bool = true) {
         guard status != .deleted else { statusBar.flash("“\(url.lastPathComponent)” was deleted"); return }
-        guard let doc = open(url: url), let e = activeEditor, e.document === doc else { return }
+        guard let doc = open(url: url, focus: focus), let e = activeEditor, e.document === doc else { return }
         if doc.gitDiff.hunks.isEmpty || !doc.isGitDiffCurrent {
             e.pendingFirstChange = true
         } else {
@@ -2438,8 +2460,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case #selector(saveAllDocuments(_:)): return hasDirtyDocuments
         case #selector(revertChange(_:)): return activeEditor?.gitHunkAtCaret != nil
         case #selector(compareWithLastCommit(_:)):
-            menuItem.state = activeEditor?.isComparing == true ? .on : .off
-            return s.gitGutter && activeEditor != nil
+            menuItem.state = (activeEditor?.isComparing == true && activeEditor?.comparisonSource == nil) ? .on : .off
+            return s.gitGutter && activeDocument?.isTransient == false
         case #selector(nextChange(_:)), #selector(previousChange(_:)):
             return activeEditor.map { s.gitGutter || $0.comparisonLabel != nil } ?? false
         case #selector(showChangesAsPatch(_:)):

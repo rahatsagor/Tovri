@@ -187,16 +187,21 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     func setChangeCount(_ n: Int) { tabs.changeCount = n }
 
-    func setChanges(_ files: [GitRepository.ChangedFile], filter: ChangeFilter = .all, totalCount: Int? = nil) {
+    func setChanges(_ files: [GitRepository.ChangedFile], filter: ChangeFilter = .all, stagedPaths: Set<String>? = nil,
+                    root: URL? = nil, totalCount: Int? = nil) {
         if let v = changesView, !filter.covers(v.filter) {
             if let totalCount { tabs.changeCount = totalCount }
             delegate?.sidebarNeedsChanges(self)
             return
         }
         fetchedFilter = filter
-        changesView?.setFiles(files)
+        changesView?.setFiles(files, stagedPaths: stagedPaths, root: root)
         // A file with staged and unstaged changes is listed twice but counts once.
         tabs.changeCount = totalCount ?? Set(files.map(\.path)).count
+    }
+
+    func updateLiveChangeCounts(_ live: [String: (Int, Int)], root: URL) {
+        changesView?.updateLiveCounts(live, root: root)
     }
 
     func showChanges(_ on: Bool) {
