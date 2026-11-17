@@ -19,8 +19,11 @@ extension MainWindowController: QLPreviewPanelDataSource {
 
     private static func isZipOrPackage(_ url: URL) -> Bool {
         if NSWorkspace.shared.isFilePackage(atPath: url.path) { return true }
-        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? h.close() }
+        let fd = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return false }
         return (try? h.read(upToCount: 4)) == Data([0x50, 0x4B, 0x03, 0x04])
     }
 

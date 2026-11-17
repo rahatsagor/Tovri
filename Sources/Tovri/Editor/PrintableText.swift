@@ -15,18 +15,23 @@ enum PrintableText {
         let text = doc.string
         let attr = NSMutableAttributedString(string: text as String, attributes: [.font: font, .foregroundColor: theme.foreground, .paragraphStyle: para])
         let syntax = doc.syntax
-        if !syntax.isPlain && text.length < 8_000_000 {
+        if !syntax.isPlain && text.length > 0 && text.length < 8_000_000 {
             let lines = doc.lines
             syntax.ensureStates(through: lines.count - 1, text: text, lines: lines)
             let colors = theme.tokenColors
             var tokens: [Token] = []
+            attr.beginEditing()
+            defer { attr.endEditing() }
             for line in 0..<lines.count {
                 let range = lines.range(of: line, textLength: text.length)
                 guard range.length > 0 else { continue }
                 syntax.tokens(line: line, text: text, lines: lines, into: &tokens)
                 for t in tokens {
                     guard let c = colors[Int(t.kind.rawValue)] else { continue }
-                    attr.addAttribute(.foregroundColor, value: c, range: NSRange(location: range.location + t.start, length: t.length))
+                    let loc = range.location + t.start
+                    guard loc >= 0, loc < text.length, t.length > 0 else { continue }
+                    attr.addAttribute(.foregroundColor, value: c,
+                                      range: NSRange(location: loc, length: min(t.length, text.length - loc)))
                 }
             }
         }

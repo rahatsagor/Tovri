@@ -137,14 +137,16 @@ final class CompletionController: NSObject, NSTableViewDataSource, NSTableViewDe
         container.frame = NSRect(origin: .zero, size: panel.frame.size)
         scroll.frame = container.bounds.insetBy(dx: 0, dy: 4)
         table.tableColumns.first?.width = width
+        if let parent = panel.parent, parent !== window { parent.removeChildWindow(panel) }
         if panel.parent == nil { window.addChildWindow(panel, ordered: .above) }
         panel.orderFront(nil)
     }
 
     func hide() {
-        guard let panel, panel.isVisible else { return }
-        panel.parent?.removeChildWindow(panel)
-        panel.orderOut(nil)
+        textView = nil
+        guard let panel else { return }
+        if let parent = panel.parent { parent.removeChildWindow(panel) }
+        if panel.isVisible { panel.orderOut(nil) }
     }
 
     func moveSelection(_ delta: Int) {

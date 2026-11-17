@@ -124,10 +124,17 @@ final class GutterView: NSView {
             var full: NSRect
             if start >= length {
                 full = lm.extraLineFragmentRect
-                if full.height == 0 { break }
-                frag = gaps ? tlm.extraTextBand : full
+                if full.height == 0 {
+                    if line == 0 && length == 0 {
+                        full = NSRect(x: 0, y: 0, width: clip.bounds.width, height: lh)
+                    } else {
+                        break
+                    }
+                }
+                frag = (gaps && lm.extraLineFragmentRect.height > 0) ? tlm.extraTextBand : full
             } else {
                 let g = lm.glyphIndexForCharacter(at: start)
+                guard lm.isValidGlyphIndex(g) else { break }
                 full = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
                 frag = gaps ? tlm.textBand(forGlyphAt: g) : full
             }
@@ -197,7 +204,9 @@ final class GutterView: NSView {
             let extra = lm.extraLineFragmentRect
             return extra.height > 0 ? extra.minY : .greatestFiniteMagnitude
         }
-        return lm.lineFragmentRect(forGlyphAt: lm.glyphIndexForCharacter(at: start), effectiveRange: nil).minY
+        let g = lm.glyphIndexForCharacter(at: start)
+        guard lm.isValidGlyphIndex(g) else { return .greatestFiniteMagnitude }
+        return lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil).minY
     }
 
     /// A ribbon with a notched end, left of the line number.

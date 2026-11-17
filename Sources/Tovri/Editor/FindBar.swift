@@ -441,7 +441,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
     private static func collect(_ re: NSRegularExpression, in text: String, ranges: [NSRange],
                                 isWordChar: ((UInt16) -> Bool)?) -> [NSRange] {
         var out: [NSRange] = []
-        for range in ranges where out.count < FindBar.maxMatches {
+        for range in ranges where range.length > 0 && out.count < FindBar.maxMatches {
             FindState.enumerateMatches(re, in: text, range: range, isWordChar: isWordChar) { m in
                 out.append(m.range)
                 return out.count < FindBar.maxMatches
@@ -558,7 +558,7 @@ final class FindBar: NSView, NSTextFieldDelegate {
         let ranges = scope.isEmpty ? [NSRange(location: 0, length: editor.document.length)] : scope
         let isWordChar = wordCharTest
         var edits: [TextEdit] = []
-        for range in ranges {
+        for range in ranges where range.length > 0 {
             FindState.enumerateMatches(re, in: text, range: range, isWordChar: isWordChar) { m in
                 edits.append(TextEdit(m.range, FindState.shared.replacementString(for: m, in: text, regex: re)))
                 return true

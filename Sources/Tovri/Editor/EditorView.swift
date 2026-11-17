@@ -87,6 +87,13 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     func close() {
         guard !isClosed else { return }
         isClosed = true
+        catchUpTarget = -1
+        recolorScheduled = false
+        baseDiffGeneration += 1
+        previewUpdateScheduled = false
+        closeChangeCard()
+        preview?.removeFromSuperview()
+        preview = nil
         NotificationCenter.default.removeObserver(self)
         CompletionController.shared.hide()
         textView.delegate = nil
@@ -218,10 +225,11 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         scrollView.tile()
         preview?.frame = NSRect(x: max(0, textWidth), y: 0, width: pw, height: bounds.height)
         topShadow.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 6)
+        let vpWidth = max(1, scrollView.textViewportWidth)
         if wordWrap {
-            textView.frame.size.width = scrollView.textViewportWidth
+            textView.frame.size.width = vpWidth
         }
-        textView.minSize = NSSize(width: scrollView.textViewportWidth, height: scrollView.contentSize.height)
+        textView.minSize = NSSize(width: vpWidth, height: max(1, scrollView.contentSize.height))
         textView.setFrameSize(textView.frame.size)
         textView.constrainScrollPosition()
         layoutFindBar()
@@ -699,7 +707,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     func selectionDidChange() {
         closeChangeCard()
-        if !folds.isEmpty { revealFolds(containing: textView.selectedRange()) }
+        if !folds.isEmpty { revealFolds(containing: textView.allSelections) }
         gutter.needsDisplay = true
         textView.updateBracketMatch()
         textView.updateOccurrences()
@@ -798,7 +806,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         let lines = document.lines
         let l = min(max(0, line &- 1), lines.count - 1)
         let r = lines.range(of: l, textLength: document.length)
-        let loc = r.location + min(max(0, column), r.length)
+        let loc = textView.snappedRange(NSRange(location: r.location + min(max(0, column), r.length), length: 0)).location
         revealFolds(containing: NSRange(location: loc, length: 0))
         textView.setAllSelections([NSRange(location: loc, length: 0)], scroll: false)
         scrollToCenter(NSRange(location: loc, length: 0))
@@ -849,7 +857,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func focus() {
-        window?.makeFirstResponder(textView)
+        if previewMode == .full, let preview { preview.focus() } else { window?.makeFirstResponder(textView) }
     }
 
     // MARK: Find
@@ -934,7 +942,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
             if from <= len { found = first(in: NSRange(location: from, length: len - from)) }
             if found == nil { found = first(in: NSRange(location: 0, length: len)) }
         } else {
-            found = last(in: NSRange(location: 0, length: sel.location), before: sel.location)
+            found = last(in: NSRange(location: 0, length: len), before: sel.location)
             if found == nil { found = last(in: NSRange(location: 0, length: len), before: Int.max) }
         }
         if let r = found, r.location != NSNotFound { select(r) } else { NSSound.beep() }

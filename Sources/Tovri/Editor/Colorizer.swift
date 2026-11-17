@@ -61,8 +61,10 @@ final class Colorizer {
                 syntax.tokens(line: line, text: text, lines: lines, into: &tokens)
                 for t in tokens {
                     guard let c = colors[Int(t.kind.rawValue)] else { continue }
+                    let loc = range.location + t.start
+                    guard loc >= 0, loc < length, t.length > 0 else { continue }
                     lm.addTemporaryAttribute(.foregroundColor, value: c,
-                                             forCharacterRange: NSRange(location: range.location + t.start, length: t.length))
+                                             forCharacterRange: NSRange(location: loc, length: min(t.length, length - loc)))
                 }
             }
             colored.insert(line)
@@ -85,7 +87,10 @@ final class Colorizer {
             lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
             for t in tokens {
                 guard let col = colors[Int(t.kind.rawValue)] else { continue }
-                lm.addTemporaryAttribute(.foregroundColor, value: col, forCharacterRange: NSRange(location: range.location + t.start, length: t.length))
+                let loc = range.location + t.start
+                guard loc >= 0, loc < length, t.length > 0 else { continue }
+                lm.addTemporaryAttribute(.foregroundColor, value: col,
+                                         forCharacterRange: NSRange(location: loc, length: min(t.length, length - loc)))
             }
         }
     }

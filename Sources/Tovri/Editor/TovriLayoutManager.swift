@@ -13,13 +13,17 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
     /// Folded character ranges, sorted and non-overlapping. Each starts at the newline ending a
     /// visible line; that newline renders as the "⋯" placeholder and the rest is hidden.
     private(set) var folds: [NSRange] = []
+    /// Post-edit ranges of folds removed silently during an edit so deferred `applyFolds`
+    /// still invalidates their previously-hidden glyphs.
+    var pendingUnfoldedRanges: [NSRange] = []
 
     func setFoldsStorage(_ ranges: [NSRange]) { folds = ranges }
 
     func setFolds(_ ranges: [NSRange]) {
         let old = folds
         folds = ranges.sorted { $0.location < $1.location }
-        var dirty = old + folds
+        var dirty = old + folds + pendingUnfoldedRanges
+        pendingUnfoldedRanges.removeAll()
         dirty.sort { $0.location < $1.location }
         guard let storage = textStorage else { return }
         let len = storage.length
@@ -97,7 +101,9 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
             let char = characterIndexForGlyph(at: glyphRange.location)
             let line = lines.line(containing: char)
             let above = lines.start(of: line) == char ? gaps.above[line] ?? 0 : 0
-            let below = gaps.trailing > 0 && line == lines.count - 1 && NSMaxRange(glyphRange) >= numberOfGlyphs ? gaps.trailing : 0
+            let isLastCharInText = line == lines.count - 1
+                && NSMaxRange(characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)) >= (textStorage?.length ?? 0)
+            let below = gaps.trailing > 0 && isLastCharInText ? gaps.trailing : 0
             if above + below > 0 {
                 let a = CGFloat(above) * lineHeight
                 lineFragmentRect.pointee.size.height += a + CGFloat(below) * lineHeight
@@ -146,11 +152,10 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
 
     /// The text row of a line fragment, without the gaps opened above or below it.
     func textBand(forGlyphAt g: Int) -> NSRect {
-        guard numberOfGlyphs > 0 else { return NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
-        let safeGlyph = min(max(0, g), numberOfGlyphs - 1)
-        let frag = lineFragmentRect(forGlyphAt: safeGlyph, effectiveRange: nil)
+        guard g >= 0, isValidGlyphIndex(g) else { return NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
+        let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
         guard gaps != nil else { return frag }
-        let used = lineFragmentUsedRect(forGlyphAt: safeGlyph, effectiveRange: nil)
+        let used = lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil)
         return NSRect(x: frag.minX, y: used.minY, width: frag.width, height: min(lineHeight, frag.height))
     }
 
@@ -166,8 +171,9 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
     /// Shrinks a highlight that lies within one line fragment to that fragment's text row.
     /// Taller highlights span several lines and keep the gaps between them.
     func trimmedToText(_ r: NSRect, origin o: NSPoint) -> NSRect {
-        guard gaps != nil, let tc = textContainers.first, numberOfGlyphs > 0 else { return r }
+        guard gaps != nil, let tc = textContainers.first, isValidGlyphIndex(0) else { return r }
         let g = glyphIndex(for: NSPoint(x: max(0, r.minX - o.x), y: r.midY - o.y), in: tc)
+        guard isValidGlyphIndex(g) else { return r }
         let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil).offsetBy(dx: o.x, dy: o.y)
         guard frag.height > lineHeight + 0.5, r.minY >= frag.minY - 0.5, r.maxY <= frag.maxY + 0.5 else { return r }
         let band = textBand(forGlyphAt: g).offsetBy(dx: o.x, dy: o.y)
@@ -250,6 +256,7 @@ final class TovriLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
     func invisibleDrawPosition(forCharacterAt charIndex: Int, at origin: NSPoint = .zero) -> NSPoint? {
         if !folds.isEmpty, fold(at: charIndex) != nil { return nil }
         let g = glyphIndexForCharacter(at: charIndex)
+        guard isValidGlyphIndex(g) else { return nil }
         let frag = lineFragmentRect(forGlyphAt: g, effectiveRange: nil, withoutAdditionalLayout: true)
         let top = gaps == nil ? frag.minY : lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil, withoutAdditionalLayout: true).minY
         let loc = location(forGlyphAt: g)

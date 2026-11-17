@@ -52,6 +52,8 @@ final class EditorTextView: NSTextView {
     private var multiGoalX: [NSRange: CGFloat] = [:]
 
     static let fullLinePasteboardType = NSPasteboard.PasteboardType("app.tovri.fullline")
+    /// Pasteboard used by editor copy, cut, and paste; tests can swap in a private pasteboard.
+    static var pasteboard: NSPasteboard = .general
 
     var tovriLayoutManager: TovriLayoutManager { layoutManager as! TovriLayoutManager }
     var lineHeight: CGFloat { tovriLayoutManager.lineHeight }
@@ -216,19 +218,31 @@ final class EditorTextView: NSTextView {
         var frag: NSRect
         var x: CGFloat
         let tlm = tovriLayoutManager
-        let glyphCount = lm.numberOfGlyphs
-        if len == 0 || glyphCount == 0 || (loc >= len && text.character(at: len - 1) == 10) {
+        if len == 0 || (loc >= len && text.character(at: len - 1) == 10) {
             frag = tlm.extraTextBand
             if frag.height == 0 { frag = NSRect(x: 0, y: 0, width: 0, height: lineHeight) }
             x = frag.minX + tc.lineFragmentPadding
         } else if loc >= len {
-            let g = min(lm.glyphIndexForCharacter(at: len - 1), glyphCount - 1)
-            frag = tlm.textBand(forGlyphAt: g)
-            x = lm.boundingRect(forGlyphRange: NSRange(location: g, length: 1), in: tc).maxX
+            let charLoc = len - 1
+            lm.ensureLayout(forCharacterRange: NSRange(location: charLoc, length: 1))
+            let g = lm.glyphIndexForCharacter(at: charLoc)
+            if lm.isValidGlyphIndex(g) {
+                frag = tlm.textBand(forGlyphAt: g)
+                x = lm.boundingRect(forGlyphRange: NSRange(location: g, length: 1), in: tc).maxX
+            } else {
+                frag = NSRect(x: 0, y: 0, width: 0, height: lineHeight)
+                x = tc.lineFragmentPadding
+            }
         } else {
-            let g = min(lm.glyphIndexForCharacter(at: loc), glyphCount - 1)
-            frag = tlm.textBand(forGlyphAt: g)
-            x = frag.minX + lm.location(forGlyphAt: g).x
+            lm.ensureLayout(forCharacterRange: NSRange(location: loc, length: 1))
+            let g = lm.glyphIndexForCharacter(at: loc)
+            if lm.isValidGlyphIndex(g) {
+                frag = tlm.textBand(forGlyphAt: g)
+                x = frag.minX + lm.location(forGlyphAt: g).x
+            } else {
+                frag = NSRect(x: 0, y: 0, width: 0, height: lineHeight)
+                x = tc.lineFragmentPadding
+            }
         }
         let o = textContainerOrigin
         return NSRect(x: floor(x + o.x), y: frag.minY + o.y, width: 2, height: frag.height)
@@ -545,17 +559,33 @@ final class EditorTextView: NSTextView {
         return out
     }
 
-    func setAllSelections(_ ranges: [NSRange], primaryLocation: Int? = nil, scroll: Bool = true) {
+    /// Snaps `r`'s endpoints off the middle of UTF-16 surrogate pairs.
+    func snappedRange(_ r: NSRange) -> NSRange {
         let len = document.length
-        let clamped = ranges.map { r -> NSRange in
-            let loc = min(max(0, r.location), len)
-            return NSRange(location: loc, length: min(r.length, len - loc))
+        let rawLoc = min(max(0, r.location), len)
+        let rawEnd = min(max(rawLoc, NSMaxRange(r)), len)
+        func snap(_ idx: Int) -> Int {
+            guard idx > 0 && idx < len else { return idx }
+            if UTF16.isTrailSurrogate(text.character(at: idx)) && UTF16.isLeadSurrogate(text.character(at: idx - 1)) {
+                return idx - 1
+            }
+            return idx
         }
+        let loc = snap(rawLoc)
+        let end = snap(rawEnd)
+        return NSRange(location: loc, length: max(0, end - loc))
+    }
+
+    func setAllSelections(_ ranges: [NSRange], primaryLocation: Int? = nil, scroll: Bool = true) {
+        let clamped = ranges.map(snappedRange)
         let merged = EditorTextView.normalize(clamped)
         guard !merged.isEmpty else { return }
         var pi = merged.count - 1
-        if let p = primaryLocation, let idx = merged.firstIndex(where: { NSLocationInRange(p, $0) || $0.location == p || NSMaxRange($0) == p }) {
-            pi = idx
+        if let p = primaryLocation {
+            let sp = snappedRange(NSRange(location: p, length: 0)).location
+            if let idx = merged.firstIndex(where: { NSLocationInRange(sp, $0) || $0.location == sp || NSMaxRange($0) == sp }) {
+                pi = idx
+            }
         }
         isSettingMulti = true
         setSelectedRange(merged[pi])
@@ -576,11 +606,7 @@ final class EditorTextView: NSTextView {
 
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
         if !isSettingMulti && !stillSelecting && ranges.count > 1 {
-            let rs = ranges.map { $0.rangeValue }
-            isSettingMulti = true
-            super.setSelectedRanges([NSValue(range: rs[rs.count - 1])], affinity: affinity, stillSelecting: false)
-            extraSelections = Array(rs.dropLast())
-            isSettingMulti = false
+            setAllSelections(ranges.map(\.rangeValue), scroll: false)
             return
         }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
@@ -838,6 +864,7 @@ final class EditorTextView: NSTextView {
     }
 
     private func insertTextImpl(_ insertString: Any, replacementRange: NSRange) {
+        guard isEditable, !document.isReadOnly else { return }
         let str = (insertString as? String) ?? (insertString as? NSAttributedString)?.string ?? ""
         if hasMarkedText() && !extraSelections.isEmpty {
             commitMarkedTextAtAllCarets(insertString, str, replacementRange: replacementRange)
@@ -930,12 +957,23 @@ final class EditorTextView: NSTextView {
             super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
             return
         }
+        guard isEditable, !document.isReadOnly else { return }
         let before = document.length
-        let at = hasMarkedText() ? markedRange().location : self.selectedRange().location
+        let baseAt = hasMarkedText() ? markedRange().location : self.selectedRange().location
+        let at = replacementRange.location != NSNotFound ? min(baseAt, replacementRange.location) : baseAt
         isSettingMulti = true
         super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
         isSettingMulti = false
         shiftExtraSelections(after: at, by: document.length - before)
+    }
+
+    override func unmarkText() {
+        let hadMarked = hasMarkedText()
+        let marked = hadMarked ? markedRange() : NSRange(location: NSNotFound, length: 0)
+        super.unmarkText()
+        guard hadMarked, marked.location != NSNotFound, marked.length > 0,
+              NSMaxRange(marked) <= document.length, !extraSelections.isEmpty else { return }
+        replicateMarkedCommit(text.substring(with: marked))
     }
 
     private func shiftExtraSelections(after loc: Int, by delta: Int) {
@@ -947,17 +985,23 @@ final class EditorTextView: NSTextView {
 
     private func commitMarkedTextAtAllCarets(_ insertString: Any, _ str: String, replacementRange: NSRange) {
         let marked = markedRange()
+        let anchor = marked.location != NSNotFound ? marked.location : selectedRange().location
         let before = document.length
         isSettingMulti = true
         super.insertText(insertString, replacementRange: replacementRange)
         isSettingMulti = false
-        shiftExtraSelections(after: marked.location, by: document.length - before)
-        guard !str.isEmpty, !extraSelections.isEmpty else { return }
+        shiftExtraSelections(after: anchor, by: document.length - before)
+        replicateMarkedCommit(str)
+    }
+
+    private func replicateMarkedCommit(_ str: String) {
+        guard !extraSelections.isEmpty else { return }
+        let extras = EditorTextView.normalize(extraSelections)
+        guard !str.isEmpty || extras.contains(where: { $0.length > 0 }) else { return }
         let primary = selectedRange()
         let n = str.utf16.count
         var sels: [NSRange] = []
         var delta = 0
-        let extras = EditorTextView.normalize(extraSelections)
         var primaryPlaced = false
         for r in extras {
             if !primaryPlaced && primary.location < r.location {
@@ -1314,11 +1358,14 @@ final class EditorTextView: NSTextView {
         let r = lineRange(at: caret)
         var start = r.location
         if let lm = layoutManager, textContainer?.widthTracksTextView == true, caret < document.length {
-            var fragGlyphs = NSRange()
-            _ = lm.lineFragmentRect(forGlyphAt: lm.glyphIndexForCharacter(at: caret), effectiveRange: &fragGlyphs)
-            let fragStart = lm.characterIndexForGlyph(at: fragGlyphs.location)
-            if fragStart > r.location {
-                start = fragStart
+            let g = lm.glyphIndexForCharacter(at: caret)
+            if lm.isValidGlyphIndex(g) {
+                var fragGlyphs = NSRange()
+                _ = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: &fragGlyphs)
+                let fragStart = lm.characterIndexForGlyph(at: fragGlyphs.location)
+                if fragStart > r.location {
+                    start = fragStart
+                }
             }
         }
         var firstNonWS = start
@@ -1504,14 +1551,16 @@ final class EditorTextView: NSTextView {
         }
         if flags == .command {
             let point = convert(event.locationInWindow, from: nil)
-            let idx = characterIndexForInsertion(at: point)
+            let rawIdx = characterIndexForInsertion(at: point)
+            let idx = snappedRange(NSRange(location: rawIdx, length: 0)).location
+            let target = event.clickCount == 2 ? (wordRange(at: idx) ?? NSRange(location: idx, length: 0)) : NSRange(location: idx, length: 0)
             var sels = allSelections
-            if sels.count > 1, let existing = sels.firstIndex(where: { $0.location == idx && $0.length == 0 }) {
+            if sels.count > 1, let existing = sels.firstIndex(where: { $0 == target }) {
                 sels.remove(at: existing)
                 setAllSelections(sels, scroll: false)
             } else {
-                sels.append(NSRange(location: idx, length: 0))
-                setAllSelections(sels, primaryLocation: idx, scroll: false)
+                sels.append(target)
+                setAllSelections(sels, primaryLocation: target.location, scroll: false)
             }
             return
         }
@@ -1535,11 +1584,23 @@ final class EditorTextView: NSTextView {
 
     override func copy(_ sender: Any?) {
         let sels = allSelections
-        let pb = NSPasteboard.general
+        let pb = EditorTextView.pasteboard
         if sels.count == 1 && sels[0].length == 0 {
             let r = visualLineBlock(sels[0])
             var s = text.substring(with: r)
             if !s.hasSuffix("\n") { s += "\n" }
+            pb.declareTypes([.string, EditorTextView.fullLinePasteboardType], owner: nil)
+            pb.setString(s, forType: .string)
+            pb.setString("1", forType: EditorTextView.fullLinePasteboardType)
+            return
+        }
+        if sels.count > 1 && sels.allSatisfy({ $0.length == 0 }) {
+            let blocks = selectedLineBlocks()
+            let s = blocks.map { b -> String in
+                var line = text.substring(with: b)
+                if line.hasSuffix("\n") { line.removeLast() }
+                return line
+            }.joined(separator: "\n") + "\n"
             pb.declareTypes([.string, EditorTextView.fullLinePasteboardType], owner: nil)
             pb.setString(s, forType: .string)
             pb.setString("1", forType: EditorTextView.fullLinePasteboardType)
@@ -1551,10 +1612,17 @@ final class EditorTextView: NSTextView {
             pb.setString(s, forType: .string)
             return
         }
+        let selected = selectedRange()
+        if selected.length > 0 && pb !== NSPasteboard.general {
+            pb.declareTypes([.string], owner: nil)
+            pb.setString(text.substring(with: selected), forType: .string)
+            return
+        }
         super.copy(sender)
     }
 
     override func cut(_ sender: Any?) {
+        guard isEditable, !document.isReadOnly else { return }
         let sels = allSelections
         if sels.count == 1 && sels[0].length == 0 {
             copy(sender)
@@ -1562,21 +1630,36 @@ final class EditorTextView: NSTextView {
             performEdits([TextEdit(r, "", selection: NSRange(location: 0, length: 0))], actionName: "Cut")
             return
         }
+        if sels.count > 1 && sels.allSatisfy({ $0.length == 0 }) {
+            copy(sender)
+            performEdits(selectedLineBlocks().map { TextEdit($0, "", selection: NSRange(location: 0, length: 0)) }, actionName: "Cut")
+            return
+        }
         if sels.count > 1 {
             copy(sender)
             performEdits(sels.map { TextEdit($0, "") }, actionName: "Cut")
+            return
+        }
+        let selected = selectedRange()
+        if selected.length > 0 && EditorTextView.pasteboard !== NSPasteboard.general {
+            copy(sender)
+            performEdits([TextEdit(selected, "")], actionName: "Cut")
             return
         }
         super.cut(sender)
     }
 
     override func paste(_ sender: Any?) {
-        let pb = NSPasteboard.general
-        guard let s = pb.string(forType: .string) else { super.paste(sender); return }
+        let pb = EditorTextView.pasteboard
+        guard let s = pb.string(forType: .string) else {
+            if pb === NSPasteboard.general { super.paste(sender) }
+            return
+        }
         insertPastedText(s, fullLine: pb.string(forType: EditorTextView.fullLinePasteboardType) != nil)
     }
 
     func insertPastedText(_ source: String, fullLine: Bool = false) {
+        guard isEditable, !document.isReadOnly else { return }
         let s = LineEnding.normalize(source, rawData: nil).0
         let sels = allSelections
         if fullLine && sels.allSatisfy({ $0.length == 0 }) {

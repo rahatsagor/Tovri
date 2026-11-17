@@ -22,7 +22,10 @@ struct MarkdownRenderer {
     }
 
     mutating func render(_ text: String) -> String {
-        var lines = text.components(separatedBy: "\n")
+        let sanitized = text.unicodeScalars.contains { $0.value >= 1 && $0.value <= 3 }
+            ? String(text.unicodeScalars.filter { $0.value < 1 || $0.value > 3 })
+            : text
+        var lines = sanitized.components(separatedBy: "\n")
         references = [:]
         footnotes = [:]
         footnoteOrder = []

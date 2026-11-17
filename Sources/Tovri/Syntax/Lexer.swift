@@ -651,42 +651,50 @@ final class CodeLexer: Lexer {
 
     /// End of the interpolation whose content starts at `from` (index of its closing character).
     @inline(never)
-    private func interpolationEnd(_ s: UnsafeBufferPointer<UInt16>, from: Int, rule: StringRule) -> Int? {
+    private func interpolationEnd(_ s: UnsafeBufferPointer<UInt16>, from: Int, rule: StringRule,
+                                  missBudget: inout Int) -> (end: Int?, sawClose: Bool) {
         let n = s.count
         let close = rule.interpolation.close
         let open = rule.interpolation.bracket
         var depth = 0
         var e = from
+        var sawClose = false
         while e < n {
             let d = s[e]
             if d == close {
-                if depth == 0 { return e }
+                sawClose = true
+                if depth == 0 { return (e, true) }
                 depth -= 1
             } else if d == open {
                 depth += 1
             } else if d == 34 || d == 39 || d == 96 {
-                e = skipString(s, e)
+                e = skipString(s, e, missBudget: &missBudget)
                 continue
             }
             e += 1
         }
-        return nil
+        missBudget -= (e - from)
+        return (nil, sawClose)
     }
 
     /// Index just past the string literal starting at `i` (nested inside an interpolation).
-    private func skipString(_ s: UnsafeBufferPointer<UInt16>, _ i: Int) -> Int {
+    private func skipString(_ s: UnsafeBufferPointer<UInt16>, _ i: Int, missBudget: inout Int) -> Int {
         let n = s.count
         for entry in rules where matchAt(s, i, entry.rule.open) {
             let r = entry.rule
             if r.isChar && !isCharLiteral(s, i, r) { return i + r.open.count }
             let nestedInterpolation = r.interpolation != .none && !interpolationNeedsPrefix
             let start = r.interpolation.start, next = r.interpolation.next
+            var noClose = false
             var e = i + r.open.count
             while e < n {
-                if nestedInterpolation && matchesInterpolation(s, e, start: start, next: next),
-                   let c = interpolationEnd(s, from: e + r.interpolation.length, rule: r) {
-                    e = c + 1
-                    continue
+                if nestedInterpolation && !noClose && missBudget > 0 && matchesInterpolation(s, e, start: start, next: next) {
+                    let res = interpolationEnd(s, from: e + r.interpolation.length, rule: r, missBudget: &missBudget)
+                    if let c = res.end {
+                        e = c + 1
+                        continue
+                    }
+                    if !res.sawClose { noClose = true }
                 }
                 if r.escape && s[e] == 92 { e += 2; continue }
                 if matchAt(s, e, r.close) { return e + r.close.count }
@@ -885,17 +893,21 @@ final class CodeLexer: Lexer {
         let backslashes = rule.escape && (!raw || rawBackslashQuotes)
         let variables = rule.variables && !raw
         let interpolationStart = rule.interpolation.start, interpolationNext = rule.interpolation.next
+        var missBudget = max(4096, n * 2)
+        var noInterpolationClose = false
         var seg = tokenStart
         var e = from
         while e < n {
             let d = s[e]
-            if interpolates && matchesInterpolation(s, e, start: interpolationStart, next: interpolationNext) {
+            if interpolates && !noInterpolationClose && missBudget > 0
+                && matchesInterpolation(s, e, start: interpolationStart, next: interpolationNext) {
                 let open = e + rule.interpolation.length
                 if interpolationNext == 0 && open < n && s[open] == d {
                     e += 2
                     continue
                 }
-                if let close = interpolationEnd(s, from: open, rule: rule) {
+                let res = interpolationEnd(s, from: open, rule: rule, missBudget: &missBudget)
+                if let close = res.end {
                     if e > seg { emit(seg, e - seg, rule.kind) }
                     emit(e, open - e, .punctuation)
                     if close > open, let base = s.baseAddress {
@@ -906,6 +918,8 @@ final class CodeLexer: Lexer {
                     e = close + 1
                     seg = e
                     continue
+                } else if !res.sawClose {
+                    noInterpolationClose = true
                 }
             }
             if variables && d < 128 && flags[Int(d)] & CodeLexer.fVar != 0 {
@@ -950,8 +964,8 @@ final class MarkupLexer: Lexer {
     private static let mCData: UInt32 = 5, mScript: UInt32 = 6, mStyle: UInt32 = 7, mDecl: UInt32 = 8
 
     private let lang: Language
-    private lazy var scriptLexer: Lexer? = lang.embeddedScript.flatMap { LanguageRegistry.shared.language(id: $0) }?.lexer
-    private lazy var styleLexer: Lexer? = lang.embeddedStyle.flatMap { LanguageRegistry.shared.language(id: $0) }?.lexer
+    private let scriptLexer: Lexer?
+    private let styleLexer: Lexer?
 
     private let commentOpen = u("<!--"), commentClose = u("-->")
     private let cdataOpen = u("<![CDATA["), cdataClose = u("]]>")
@@ -959,7 +973,12 @@ final class MarkupLexer: Lexer {
     private let scriptName = u("script"), styleName = u("style")
     private let mustacheClose = u("}}"), blockClose = u("%}"), erbClose = u("%>"), templCommentClose = u("#}")
 
-    init(language: Language) { lang = language }
+    init(language: Language) {
+        lang = language
+        let reg = LanguageRegistry.shared
+        scriptLexer = language.embeddedScript.flatMap { $0 == language.id ? nil : reg.language(id: $0)?.lexer }
+        styleLexer = language.embeddedStyle.flatMap { $0 == language.id ? nil : reg.language(id: $0)?.lexer }
+    }
 
     func lex(_ s: UnsafeBufferPointer<UInt16>, state: UInt32, emit: TokenEmit) -> UInt32 {
         let n = s.count
@@ -1104,15 +1123,18 @@ final class MarkupLexer: Lexer {
 
 final class MarkdownLexer: Lexer {
     private let lang: Language
-    private lazy var registry = LanguageRegistry.shared
-    private lazy var indexById: [ObjectIdentifier: Int] = {
-        var d: [ObjectIdentifier: Int] = [:]
-        for (i, l) in registry.all.enumerated() { d[ObjectIdentifier(l)] = i }
-        return d
-    }()
+    private let registry: LanguageRegistry
+    private let indexById: [ObjectIdentifier: Int]
     private let commentOpen = u("<!--"), commentClose = u("-->")
 
-    init(language: Language) { lang = language }
+    init(language: Language) {
+        lang = language
+        let reg = LanguageRegistry.shared
+        registry = reg
+        var d: [ObjectIdentifier: Int] = [:]
+        for (i, l) in reg.all.enumerated() { d[ObjectIdentifier(l)] = i }
+        indexById = d
+    }
 
     func lex(_ s: UnsafeBufferPointer<UInt16>, state: UInt32, emit: TokenEmit) -> UInt32 {
         let n = s.count
@@ -1227,6 +1249,8 @@ final class MarkdownLexer: Lexer {
     private func inline(_ s: UnsafeBufferPointer<UInt16>, from: Int, emit: TokenEmit) -> UInt32 {
         let n = s.count
         var i = from
+        var missBudget = max(4096, n * 2)
+        var noClosingBracket = false
         while i < n {
             let c = s[i]
             switch c {
@@ -1235,6 +1259,7 @@ final class MarkdownLexer: Lexer {
             case 96:
                 var k = i
                 while k < n && s[k] == 96 { k += 1 }
+                guard missBudget > 0 else { i = k; continue }
                 let run = k - i
                 var e = k
                 var found = -1
@@ -1246,14 +1271,14 @@ final class MarkdownLexer: Lexer {
                         e = r
                     } else { e += 1 }
                 }
-                if found > 0 { emit(i, found - i, .code); i = found } else { i = k }
+                if found > 0 { emit(i, found - i, .code); i = found } else { missBudget -= (n - k); i = k }
             case 42, 95, 126:
                 var k = i
                 while k < n && s[k] == c && k - i < 3 { k += 1 }
                 let run = k - i
                 if c == 95 && i > 0 && isWordU(s[i - 1]) { i = k; continue }
                 if c == 126 && run < 2 { i = k; continue }
-                if k >= n || isSpaceU(s[k]) { i = k; continue }
+                if k >= n || isSpaceU(s[k]) || missBudget <= 0 { i = k; continue }
                 var e = k
                 var found = -1
                 while e + run <= n {
@@ -1268,24 +1293,30 @@ final class MarkdownLexer: Lexer {
                     let kind: TokenKind = c == 126 ? .deleted : (run >= 2 ? .strong : .emphasis)
                     emit(i, found - i, kind)
                     i = found
-                } else { i = k }
+                } else { missBudget -= (n - k); i = k }
             case 33, 91:
                 let open = c == 33 ? i + 1 : i
-                guard open < n, s[open] == 91 else { i += 1; continue }
+                guard !noClosingBracket && missBudget > 0, open < n, s[open] == 91 else { i += 1; continue }
                 var e = open + 1
                 var depth = 1
+                var sawClose = false
                 while e < n {
-                    if s[e] == 91 { depth += 1 } else if s[e] == 93 { depth -= 1; if depth == 0 { break } }
+                    if s[e] == 91 { depth += 1 } else if s[e] == 93 { sawClose = true; depth -= 1; if depth == 0 { break } }
                     e += 1
                 }
-                guard e < n else { i += 1; continue }
+                guard e < n else {
+                    missBudget -= (e - open)
+                    if !sawClose { noClosingBracket = true }
+                    i += 1
+                    continue
+                }
                 emit(i, e + 1 - i, .link)
                 i = e + 1
                 if i < n && (s[i] == 40 || s[i] == 91) {
                     let close: UInt16 = s[i] == 40 ? 41 : 93
                     var k = i + 1
                     while k < n && s[k] != close { k += 1 }
-                    if k < n { emit(i, k + 1 - i, .string); i = k + 1 }
+                    if k < n { emit(i, k + 1 - i, .string); i = k + 1 } else { missBudget -= (n - i) }
                 } else if i < n && s[i] == 58 {
                     emit(i, n - i, .string)
                     i = n

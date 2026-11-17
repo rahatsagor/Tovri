@@ -96,8 +96,8 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
 
     /// URL under which files in `directory` are visible to the page.
     static func baseHref(for directory: URL?) -> String {
-        guard let dir = directory else { return "\(scheme)://file/" }
-        return resourceURL(forPath: dir.path + "/")?.absoluteString ?? "\(scheme)://file/"
+        guard let dir = directory else { return "\(scheme)://untitled/" }
+        return resourceURL(forPath: dir.path + "/")?.absoluteString ?? "\(scheme)://untitled/"
     }
 
     static func resourceURL(forPath path: String) -> URL? {
@@ -151,7 +151,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         decisionHandler(.cancel)
         switch url.scheme?.lowercased() {
         case MarkdownPreviewView.scheme?:
-            guard url.host == "file" else { return }
+            guard url.host == "file", url.path.count > 1 else { return }
             let file = URL(fileURLWithPath: url.path)
             let ext = file.pathExtension.lowercased()
             // Links in untrusted documents must never launch anything (apps, scripts, .terminal
@@ -178,7 +178,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
     }
 
     static func shell(theme t: Theme, fontSize: CGFloat, allowRemote: Bool) -> String {
-        let remote = allowRemote ? "*" : ""
+        let remote = allowRemote ? "https: http:" : ""
         let fg = css(t.foreground), muted = css(t.chromeSecondary), accent = css(t.color(.link) ?? t.accent)
         let border = css(t.chromeBorder), codeBg = css(t.fieldBackground), bg = t.translucent ? "transparent" : css(t.background)
         let heading = css(t.foreground), quote = css(t.chromeSecondary)
@@ -196,8 +196,9 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         let s = scheme
         return """
         <!doctype html><html><head><meta charset="utf-8">
+        <meta http-equiv="x-dns-prefetch-control" content="off">
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src \(remote) data: blob: \(s):; media-src \(remote) data: blob: \(s):; style-src 'unsafe-inline'; font-src data:; script-src 'nonce-\(nonce)'; form-action 'none'; frame-src 'none'; base-uri \(s):">
-        <base id="base" href="\(s)://file/">
+        <base id="base" href="\(s)://untitled/">
         <style>
         :root { color-scheme: \(t.isDark ? "dark" : "light"); --accent: \(accent); }
         html, body { background: \(bg); }
@@ -294,16 +295,22 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         html.scrolling ::-webkit-scrollbar-thumb, ::-webkit-scrollbar-thumb:hover { background-color: \(thumb); }
         ::-webkit-scrollbar-thumb:hover { background-color: \(thumbHover); }
         </style><script nonce="\(nonce)">
+        const tovriCopyTexts = new WeakMap();
         function tovriSetContent(html, base) {
           if (base) document.getElementById('base').href = base;
           const root = document.getElementById('content');
-          root.innerHTML = html;
+          const tpl = document.createElement('template');
+          tpl.innerHTML = html;
+          for (const el of tpl.content.querySelectorAll('base, meta, link')) el.remove();
+          root.replaceChildren(tpl.content);
           for (const pre of root.querySelectorAll('pre:not(.front-matter)')) {
-            if (!pre.querySelector('code')) continue;
+            const code = pre.querySelector('code');
+            if (!code) continue;
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'code-copy';
             btn.textContent = 'Copy';
+            tovriCopyTexts.set(btn, code.textContent || '');
             pre.appendChild(btn);
           }
         }
@@ -351,9 +358,8 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         document.addEventListener('click', e => {
           const copyBtn = e.target.closest && e.target.closest('button.code-copy');
           if (copyBtn) {
-            const code = copyBtn.parentElement && copyBtn.parentElement.querySelector('code');
-            if (code) {
-              const text = code.textContent || '';
+            if (e.isTrusted && tovriCopyTexts.has(copyBtn)) {
+              const text = tovriCopyTexts.get(copyBtn) || '';
               window.webkit.messageHandlers.tovri.postMessage({ copy: text });
               copyBtn.textContent = 'Copied';
               copyBtn.classList.add('copied');
@@ -364,7 +370,8 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
           const a = e.target.closest && e.target.closest('a[href^="#"]');
           if (!a) return;
           e.preventDefault();
-          const id = decodeURIComponent(a.getAttribute('href').slice(1));
+          let id = a.getAttribute('href').slice(1);
+          try { id = decodeURIComponent(id); } catch {}
           const el = document.getElementById(id) || document.getElementsByName(id)[0];
           if (el) el.scrollIntoView({ block: 'start' });
         });
@@ -464,6 +471,7 @@ private final class PreviewResourceHandler: NSObject, WKURLSchemeHandler {
                                                "mp4", "m4v", "mov", "webm", "mp3", "m4a", "wav", "ogg", "oga", "ogv"]
     static let maxSize = 64 * 1024 * 1024
     private var stopped = Set<ObjectIdentifier>()
+    private var activeTasks: [ObjectIdentifier: BlockOperation] = [:]
     private var budget = PreviewResourceBudget()
     private let reads: OperationQueue = {
         let q = OperationQueue()
@@ -472,20 +480,30 @@ private final class PreviewResourceHandler: NSObject, WKURLSchemeHandler {
         return q
     }()
 
+    deinit { reads.cancelAllOperations() }
+
     /// A new page starts with the whole budget; WebKit drops the old page's copies.
-    func startPage() { budget = PreviewResourceBudget() }
+    func startPage() {
+        reads.cancelAllOperations()
+        activeTasks.removeAll()
+        budget = PreviewResourceBudget()
+    }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url, url.host == "file" else { fail(task); return }
         let path = url.path
+        guard path.count > 1 else { fail(task); return }
         let ext = (path as NSString).pathExtension.lowercased()
         guard PreviewResourceHandler.allowed.contains(ext) else { fail(task); return }
         let id = ObjectIdentifier(task)
         let budget = self.budget
-        reads.addOperation {
+        let op = BlockOperation()
+        op.addExecutionBlock { [weak op] in
+            guard op?.isCancelled == false else { return }
             let data = PreviewResourceHandler.read(path, admittedBy: budget, as: PreviewResourceBudget.key(for: url))
             DispatchQueue.main.async {
-                guard self.stopped.remove(id) == nil else { return }
+                self.activeTasks.removeValue(forKey: id)
+                guard self.stopped.remove(id) == nil, op?.isCancelled == false else { return }
                 guard let data else { self.fail(task); return }
                 let mime = UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
                 task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: data.count, textEncodingName: nil))
@@ -493,10 +511,14 @@ private final class PreviewResourceHandler: NSObject, WKURLSchemeHandler {
                 task.didFinish()
             }
         }
+        activeTasks[id] = op
+        reads.addOperation(op)
     }
 
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
-        stopped.insert(ObjectIdentifier(task))
+        let id = ObjectIdentifier(task)
+        stopped.insert(id)
+        activeTasks.removeValue(forKey: id)?.cancel()
     }
 
     /// The file at `path` if it is a regular file of up to `maxSize` that fits in `budget`.
@@ -540,10 +562,16 @@ final class PreviewResourceBudget {
     func admit(_ key: String, size: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        if admitted[key] != nil { return true }
-        guard size <= PreviewResourceBudget.limit - total else { return false }
+        let prev = admitted[key] ?? 0
+        let delta = size - prev
+        if delta <= 0 {
+            admitted[key] = size
+            total += delta
+            return true
+        }
+        guard delta <= PreviewResourceBudget.limit - total else { return false }
         admitted[key] = size
-        total += size
+        total += delta
         return true
     }
 }

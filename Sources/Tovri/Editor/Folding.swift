@@ -139,17 +139,31 @@ extension EditorView {
 
     /// Keeps folds aligned with edits: folds after the edit shift, folds touching it open.
     func adjustFolds(editedRange: NSRange, delta: Int) {
-        guard !folds.isEmpty else { return }
         let oldEnd = editedRange.location + editedRange.length - delta
+        if !layoutManager.pendingUnfoldedRanges.isEmpty {
+            layoutManager.pendingUnfoldedRanges = layoutManager.pendingUnfoldedRanges.compactMap { u in
+                if NSMaxRange(u) <= editedRange.location { return u }
+                if u.location >= oldEnd { return NSRange(location: u.location + delta, length: u.length) }
+                let start = min(u.location, editedRange.location)
+                let end = max(NSMaxRange(u) + delta, NSMaxRange(editedRange))
+                return end > start ? NSRange(location: start, length: end - start) : nil
+            }
+        }
+        guard !folds.isEmpty else { return }
         var changed = false
         var out: [NSRange] = []
         for f in folds {
-            if NSMaxRange(f) < editedRange.location {
+            if NSMaxRange(f) <= editedRange.location {
                 out.append(f)
             } else if f.location > oldEnd {
                 out.append(NSRange(location: f.location + delta, length: f.length))
                 changed = true
             } else {
+                let start = min(f.location, editedRange.location)
+                let end = max(NSMaxRange(f) + delta, NSMaxRange(editedRange))
+                if end > start {
+                    layoutManager.pendingUnfoldedRanges.append(NSRange(location: start, length: end - start))
+                }
                 changed = true
             }
         }
@@ -166,11 +180,15 @@ extension EditorView {
 
     /// Opens any fold hiding the given range so navigation never lands in hidden text. Both ends
     /// of a fold are visible caret positions: before and after the "⋯" placeholder.
-    func revealFolds(containing range: NSRange) {
+    func revealFolds(containing range: NSRange) { revealFolds(containing: [range]) }
+
+    func revealFolds(containing ranges: [NSRange]) {
         guard !folds.isEmpty else { return }
         let hits = folds.filter { f in
-            (range.location > f.location && range.location < NSMaxRange(f)) ||
-            (NSMaxRange(range) > f.location && NSMaxRange(range) < NSMaxRange(f) && range.length > 0)
+            ranges.contains { range in
+                (range.location > f.location && range.location < NSMaxRange(f)) ||
+                (NSMaxRange(range) > f.location && NSMaxRange(range) < NSMaxRange(f) && range.length > 0)
+            }
         }
         if !hits.isEmpty { applyFolds(folds.filter { !hits.contains($0) }) }
     }

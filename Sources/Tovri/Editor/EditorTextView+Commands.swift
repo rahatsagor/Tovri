@@ -279,6 +279,7 @@ extension EditorTextView {
     }
 
     @objc func deleteLine(_ sender: Any?) {
+        guard isEditable, !document.isReadOnly else { return }
         var edits: [TextEdit] = []
         for b in selectedLineBlocks() {
             var r = b
@@ -356,13 +357,15 @@ extension EditorTextView {
     }
 
     @objc func joinLines(_ sender: Any?) {
+        guard isEditable, !document.isReadOnly else { return }
         var edits: [TextEdit] = []
+        var joinedLines = Set<Int>()
         for r in allSelections {
             let first = lines.line(containing: r.location)
             var last = lines.line(containing: NSMaxRange(r))
             if last == first { last = first + 1 }
             guard last < lines.count else { continue }
-            for l in first..<last {
+            for l in first..<last where joinedLines.insert(l).inserted {
                 let cur = lines.range(of: l, textLength: len)
                 let next = lines.range(of: l + 1, textLength: len)
                 var a = NSMaxRange(cur)
@@ -507,7 +510,8 @@ extension EditorTextView {
             if char(i) == 9 { c += document.indentWidth - c % document.indentWidth } else { c += 1 }
             i += 1
         }
-        setAllSelections(sels + [NSRange(location: i, length: 0)], primaryLocation: i)
+        let snapped = snappedRange(NSRange(location: i, length: 0)).location
+        setAllSelections(sels + [NSRange(location: snapped, length: 0)], primaryLocation: snapped)
         caretGoalColumn = col
     }
 
