@@ -61,36 +61,80 @@ final class LocalHistory {
 
     // MARK: Recording
 
-    /// Keeps the current contents of `url`, if it's a regular file, before a save replaces them
-    /// with `newData`. Returns at once; the copy is written in the background.
-    func recordBeforeOverwrite(of url: URL, with newData: Data) {
+    final class PendingSnapshot {
+        private let history: LocalHistory
+        private let path: String
+        private let modified: Date
+        private let taken: Date
+        private let newData: Data
+        private var fd: Int32
+        private let data: Data?
+        private var consumed = false
+
+        init(history: LocalHistory, path: String, modified: Date, taken: Date, newData: Data, fd: Int32, data: Data?) {
+            self.history = history
+            self.path = path
+            self.modified = modified
+            self.taken = taken
+            self.newData = newData
+            self.fd = fd
+            self.data = data
+        }
+
+        deinit { discard() }
+
+        func commit() {
+            guard !consumed else { return }
+            consumed = true
+            let limit = history.limits.maxFileSize
+            if let data {
+                history.queue.async { self.history.store(data, path: self.path, modified: self.modified, taken: self.taken, replacing: self.newData) }
+            } else if fd >= 0 {
+                let openFD = fd
+                fd = -1
+                history.queue.async {
+                    let readData = LocalHistory.read(openFD, limit: limit)
+                    close(openFD)
+                    guard let readData else { return }
+                    self.history.store(readData, path: self.path, modified: self.modified, taken: self.taken, replacing: self.newData)
+                }
+            }
+        }
+
+        func discard() {
+            guard !consumed else { return }
+            consumed = true
+            if fd >= 0 { close(fd); fd = -1 }
+        }
+    }
+
+    /// Captures an open descriptor (or bytes if hard-linked) before overwriting `url`. The caller
+    /// must invoke `commit()` after the overwrite succeeds so failed saves never leave snapshots.
+    func prepareBeforeOverwrite(of url: URL, with newData: Data) -> PendingSnapshot? {
         let path = LocalHistory.key(for: url)
         let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else { return nil }
         var info = stat()
-        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, Int(info.st_size) <= limits.maxFileSize else {
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0,
+              info.st_size <= off_t(limits.maxFileSize) else {
             close(fd)
-            return
+            return nil
         }
         let modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec) + TimeInterval(info.st_mtimespec.tv_nsec) / 1e9)
         let taken = now()
-        let limit = limits.maxFileSize
-        // A file with other hard links is overwritten in place, so its bytes are read before the
-        // save starts. Any other file is replaced by renaming a new file over it, and the open
-        // descriptor keeps the old one readable for the background copy.
         if info.st_nlink > 1 {
-            let data = LocalHistory.read(fd, limit: limit)
+            let data = LocalHistory.read(fd, limit: limits.maxFileSize)
             close(fd)
-            guard let data else { return }
-            queue.async { self.store(data, path: path, modified: modified, taken: taken, replacing: newData) }
-        } else {
-            queue.async {
-                let data = LocalHistory.read(fd, limit: limit)
-                close(fd)
-                guard let data else { return }
-                self.store(data, path: path, modified: modified, taken: taken, replacing: newData)
-            }
+            guard let data else { return nil }
+            return PendingSnapshot(history: self, path: path, modified: modified, taken: taken, newData: newData, fd: -1, data: data)
         }
+        return PendingSnapshot(history: self, path: path, modified: modified, taken: taken, newData: newData, fd: fd, data: nil)
+    }
+
+    /// Keeps the current contents of `url`, if it's a regular file, before a save replaces them
+    /// with `newData`. Returns at once; the copy is written in the background.
+    func recordBeforeOverwrite(of url: URL, with newData: Data) {
+        prepareBeforeOverwrite(of: url, with: newData)?.commit()
     }
 
     private func store(_ data: Data, path: String, modified: Date, taken: Date, replacing newData: Data) {
@@ -138,8 +182,10 @@ final class LocalHistory {
 
     /// The bytes of a kept version, or nil if it has been pruned or can't be read.
     func data(of snapshot: Snapshot, for url: URL) -> Data? {
+        guard !snapshot.name.isEmpty, !snapshot.name.contains("/"), snapshot.name != ".", snapshot.name != ".." else { return nil }
         let file = folderURL(forKey: LocalHistory.key(for: url)).appendingPathComponent(snapshot.name)
-        return try? LocalHistory.readRegularFile(file, limit: Int.max)
+        let cap = max(limits.maxFileSize, max(0, snapshot.size))
+        return try? LocalHistory.readRegularFile(file, limit: cap)
     }
 
     // MARK: Clearing and pruning
@@ -184,11 +230,23 @@ final class LocalHistory {
         guard let folders = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
         var indexes: [(folder: URL, index: Index)] = []
         for folder in folders {
-            guard var index = loadIndex(folder) else { continue }
-            let before = index.snapshots.count
-            prune(&index, in: folder)
-            if index.snapshots.count != before { try? saveIndex(index, in: folder) }
-            indexes.append((folder, index))
+            if var index = loadIndex(folder) {
+                let before = index.snapshots.count
+                prune(&index, in: folder)
+                let referenced = Set(index.snapshots.map(\.name))
+                if let entries = try? fm.contentsOfDirectory(atPath: folder.path) {
+                    for entry in entries where entry != "index.json" && !referenced.contains(entry) {
+                        try? fm.removeItem(at: folder.appendingPathComponent(entry))
+                    }
+                }
+                if index.snapshots.count != before { try? saveIndex(index, in: folder) }
+                indexes.append((folder, index))
+            } else {
+                let attrs = try? fm.attributesOfItem(atPath: folder.path)
+                if let mod = attrs?[.modificationDate] as? Date, now().timeIntervalSince(mod) >= limits.maxAge {
+                    try? fm.removeItem(at: folder)
+                }
+            }
         }
         var total = indexes.reduce(0) { $0 + $1.index.snapshots.reduce(0) { $0 + $1.size } }
         if total > limits.maxTotalSize {
@@ -278,7 +336,7 @@ final class LocalHistory {
         var info = stat()
         guard fstat(fd, &info) == 0 else { throw ReadProblem.unreadable }
         guard (info.st_mode & S_IFMT) == S_IFREG else { throw ReadProblem.notAFile }
-        guard Int(info.st_size) <= limit else { throw ReadProblem.tooLarge }
+        guard info.st_size >= 0, info.st_size <= off_t(limit) else { throw ReadProblem.tooLarge }
         guard let data = read(fd, limit: limit) else { throw ReadProblem.tooLarge }
         return data
     }

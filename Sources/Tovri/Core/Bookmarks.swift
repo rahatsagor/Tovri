@@ -58,6 +58,41 @@ final class Bookmarks {
         lines = Array(Set(lines.map(transform))).sorted()
     }
 
+    /// Adjusts `lines` through multiple disjoint sorted edits in pre-edit coordinates.
+    static func adjustedForEdits(_ lines: [Int], edits: [(range: NSRange, replacement: String)],
+                                 index: LineIndex, textLength: Int) -> [Int] {
+        guard !lines.isEmpty, !edits.isEmpty else { return lines }
+        struct Step {
+            let firstLine: Int
+            let removed: Int
+            let inserted: Int
+            let editStartsLine: Bool
+            let lastLineKeepsText: Bool
+        }
+        var steps: [Step] = []
+        steps.reserveCapacity(edits.count)
+        for e in edits {
+            let f = index.line(containing: e.range.location)
+            let endLoc = NSMaxRange(e.range)
+            let lastLine = index.line(containing: endLoc)
+            let removed = lastLine - f
+            var inserted = 0
+            for u in e.replacement.utf16 where u == 10 { inserted += 1 }
+            let editStartsLine = e.range.location == index.start(of: f)
+            let lastRange = index.range(of: lastLine, textLength: textLength)
+            let lastLineKeepsText = endLoc < NSMaxRange(lastRange)
+            steps.append(Step(firstLine: f, removed: removed, inserted: inserted,
+                              editStartsLine: editStartsLine, lastLineKeepsText: lastLineKeepsText))
+        }
+        var current = lines
+        for step in steps.reversed() {
+            current = adjusted(current, firstLine: step.firstLine, removed: step.removed, inserted: step.inserted,
+                               editStartsLine: step.editStartsLine, lastLineKeepsText: step.lastLineKeepsText)
+            if current.isEmpty { break }
+        }
+        return current
+    }
+
     /// Follows an edit, after `lines` was updated for it. `change` is what `LineIndex.update` returned.
     func adjust(editedRange: NSRange, delta: Int, change: (firstLine: Int, removed: Int, inserted: Int),
                 lines index: LineIndex, textLength: Int) {

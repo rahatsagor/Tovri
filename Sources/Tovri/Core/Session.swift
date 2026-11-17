@@ -124,9 +124,13 @@ final class SessionStore {
         // A new version must not overwrite a buffer referenced by the last committed session.
         let name = "\(doc.id.uuidString)-\(doc.editVersion).txt"
         if pendingWrites[name] != nil { return name }
+        writtenLock.lock()
+        let sameInFlight = inFlightBuffers[doc.id] == name
+        writtenLock.unlock()
+        if sameInFlight { return name }
         if doc.length > SessionStore.largeBuffer && !allowLarge {
             // Copying a huge buffer stalls typing, so between quits it is backed up less often,
-            // reusing the buffer already on disk or currently being written on `queue`.
+            // reusing the buffer currently being written on `queue` or already on disk.
             let now = Date.timeIntervalSinceReferenceDate
             let interval = max(60, Double(doc.length) / 1_000_000 * 3)
             writtenLock.lock()
@@ -134,7 +138,7 @@ final class SessionStore {
             let inFlight = inFlightBuffers[doc.id]
             if let last, now - last < interval {
                 writtenLock.unlock()
-                return available?.name ?? inFlight
+                return inFlight ?? available?.name
             }
             lastLargeWrite[doc.id] = now
             writtenLock.unlock()
@@ -154,11 +158,61 @@ final class SessionStore {
         return Document.BackupSource(id: id, version: version)
     }
 
+    /// When "Restore windows and tabs on launch" is off while hot exit is on, keeps only tabs
+    /// carrying unsaved hot-exit buffers.
+    static func hotExitOnlyWindows(from windows: [WindowSession]) -> [WindowSession] {
+        windows.compactMap { w in
+            var copy = w
+            copy.folder = nil
+            var groups: [GroupSession] = []
+            for g in w.groups {
+                let dirtyTabs = g.tabs.filter { $0.buffer != nil }
+                guard !dirtyTabs.isEmpty else { continue }
+                let oldSel = (g.selected >= 0 && g.selected < g.tabs.count) ? g.tabs[g.selected] : nil
+                let newSel = oldSel.flatMap { s in
+                    dirtyTabs.firstIndex { $0.buffer == s.buffer && $0.path == s.path && $0.untitledName == s.untitledName }
+                } ?? 0
+                groups.append(GroupSession(tabs: dirtyTabs, selected: newSel))
+            }
+            guard !groups.isEmpty else { return nil }
+            copy.groups = groups
+            copy.activeGroup = min(max(0, w.activeGroup), groups.count - 1)
+            if groups.count == 1 { copy.layout = LayoutMode.single.rawValue }
+            return copy
+        }
+    }
+
     /// Synchronous callers must check the result before discarding any open documents.
     /// Asynchronous calls report successful scheduling; failed writes are retried on the next save.
     @discardableResult
     func saveNow(synchronously: Bool) -> Result<Void, Error> {
-        guard let provider = stateProvider, Settings.shared.restoreSession || Settings.shared.hotExit else { return .success(()) }
+        let dir = bufferDirectory
+        let file = sessionFile
+        guard let provider = stateProvider else { return .success(()) }
+        guard Settings.shared.restoreSession || Settings.shared.hotExit else {
+            pendingWrites = [:]
+            writtenLock.lock()
+            generation += 1
+            let pass = generation
+            writtenLock.unlock()
+            let purge = { [self] () -> Result<Void, Error> in
+                let fm = FileManager.default
+                try? fm.removeItem(at: file)
+                let existing = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+                writtenLock.lock()
+                if generation == pass {
+                    for f in existing where ownedBuffers.contains(f) {
+                        if (try? fm.removeItem(at: dir.appendingPathComponent(f))) != nil { ownedBuffers.remove(f) }
+                    }
+                    writtenVersions.removeAll()
+                }
+                writtenLock.unlock()
+                return .success(())
+            }
+            if synchronously { return queue.sync(execute: purge) }
+            queue.async { _ = purge() }
+            return .success(())
+        }
         // Reserve this pass before reading cached buffer names. An older queued save must not
         // collect files that this snapshot may still need.
         writtenLock.lock()
@@ -166,8 +220,29 @@ final class SessionStore {
         let pass = generation
         writtenLock.unlock()
         allowLarge = synchronously
-        let session = AppSession(windows: provider())
+        var windows = provider()
         allowLarge = false
+        if !Settings.shared.restoreSession && Settings.shared.hotExit {
+            windows = SessionStore.hotExitOnlyWindows(from: windows)
+        }
+        let fm = FileManager.default
+        let pendingNames = Set(pendingWrites.keys)
+        writtenLock.lock()
+        let inFlightNames = Set(inFlightBuffers.values)
+        writtenLock.unlock()
+        for wi in windows.indices where windows[wi].closed == true {
+            for gi in windows[wi].groups.indices {
+                for ti in windows[wi].groups[gi].tabs.indices {
+                    if let buf = windows[wi].groups[gi].tabs[ti].buffer,
+                       !pendingNames.contains(buf),
+                       !inFlightNames.contains(buf),
+                       !fm.fileExists(atPath: dir.appendingPathComponent(buf).path) {
+                        windows[wi].groups[gi].tabs[ti].buffer = nil
+                    }
+                }
+            }
+        }
+        let session = AppSession(windows: windows)
         let data: Data
         do { data = try JSONEncoder().encode(session) } catch { return .failure(error) }
         let keep = Set(session.windows.flatMap { w in w.groups.flatMap { g in g.tabs.compactMap { $0.buffer } } })
@@ -176,8 +251,6 @@ final class SessionStore {
         writtenLock.lock()
         for write in writes { inFlightBuffers[write.documentID] = write.name }
         writtenLock.unlock()
-        let dir = bufferDirectory
-        let file = sessionFile
         let work = { [self] () -> Result<Void, Error> in
             let result = Result {
                 let fm = FileManager.default

@@ -261,10 +261,12 @@ enum ReplaceInFiles {
         guard let backup = batch.keep(data) else {
             return skip("Tovri couldn’t keep a copy of it for Undo Replace, so it was left alone.")
         }
-        history?.recordBeforeOverwrite(of: real, with: newData)
+        let pendingHistory = history?.prepareBeforeOverwrite(of: real, with: newData)
         do {
             try Document.writeFile(newData, replacing: real)
+            pendingHistory?.commit()
         } catch {
+            pendingHistory?.discard()
             batch.discard(backup)
             return skip(error.localizedDescription)
         }
@@ -424,9 +426,20 @@ extension Document {
             delta += length - e.range.length
         }
         undoManager.registerUndo(withTarget: self) { $0.replaceRanges(inverse) }
+        let updatedBookmarks = bookmarks.isEmpty ? [] : Bookmarks.adjustedForEdits(
+            bookmarks.lines,
+            edits: edits.map { ($0.range, $0.text) },
+            index: lines,
+            textLength: length
+        )
+        suppressBookmarkAdjust = true
         textStorage.beginEditing()
         for e in edits.reversed() { textStorage.replaceCharacters(in: e.range, with: e.text) }
         textStorage.endEditing()
+        suppressBookmarkAdjust = false
+        if !bookmarks.isEmpty || !updatedBookmarks.isEmpty {
+            setBookmarksWithoutUndo(updatedBookmarks)
+        }
     }
 
     /// Text views merge consecutive typing into one undo step; an edit made around them must not

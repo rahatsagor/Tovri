@@ -52,7 +52,7 @@ final class ProjectSymbolIndex {
             let result = self.scan(files: files, root: root, regexes: regexes)
             DispatchQueue.main.async {
                 if Perf.enabled {
-                    FileHandle.standardError.write("[perf] project symbols: \(result.count) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)) ms\n".data(using: .utf8)!)
+                    Perf.log("[perf] project symbols: \(result.count) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)) ms")
                 }
                 self.symbols = result
                 self.isReady = true

@@ -394,6 +394,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     private var gitConfiguration = MainWindowController.currentGitConfiguration
+    private var searchExcludesSnapshot = Settings.shared.searchExcludes
+    private var hiddenPatternsSnapshot = Settings.shared.hiddenPatterns
 
     private static var currentGitConfiguration: [Bool] {
         let s = Settings.shared
@@ -417,6 +419,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             if !Settings.shared.gitEnabled, palette.listTag == MainWindowController.changedFilesListTag {
                 palette.close(cancelled: true)
             }
+        }
+        let excludesNow = Settings.shared.searchExcludes
+        let hiddenNow = Settings.shared.hiddenPatterns
+        if excludesNow != searchExcludesSnapshot || hiddenNow != hiddenPatternsSnapshot {
+            searchExcludesSnapshot = excludesNow
+            hiddenPatternsSnapshot = hiddenNow
+            projectIndex?.rebuild()
         }
         updateStatusBar()
     }
@@ -473,7 +482,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     var hasDirtyDocuments: Bool { allOpenDocuments().contains { $0.isDirty } }
     var isEmptyWindow: Bool {
-        folderURL == nil && groups.allSatisfy { g in g.tabs.allSatisfy { $0.document.url == nil && !$0.document.isDirty && $0.document.length == 0 } }
+        folderURL == nil && groups.allSatisfy { g in
+            g.tabs.allSatisfy { $0.document.url == nil && !$0.document.isDirty && $0.document.length == 0 && !WaitRegistry.shared.isWaiting(on: $0.document) }
+        }
     }
 
     // MARK: Title and status
@@ -626,10 +637,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let t0 = CACurrentMediaTime()
         defer {
             if Perf.enabled {
-                DispatchQueue.main.async { FileHandle.standardError.write("[perf] open+first layout \(url.lastPathComponent) \(Int((CACurrentMediaTime() - t0) * 1000)) ms\n".data(using: .utf8)!) }
+                DispatchQueue.main.async { Perf.log("[perf] open+first layout \(url.lastPathComponent) \(Int((CACurrentMediaTime() - t0) * 1000)) ms") }
             }
         }
-        if g.tabs.count == 1, let t = g.tabs.first, t.document.url == nil, !t.document.isDirty, t.document.length == 0 {
+        if g.tabs.count == 1, let t = g.tabs.first, t.document.url == nil, !t.document.isDirty, t.document.length == 0,
+           !WaitRegistry.shared.isWaiting(on: t.document) {
             g.add(doc)
             g.removeTab(at: g.index(of: t.document) ?? 0)
         } else {
@@ -678,7 +690,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     private func replaceEmptyUntitled(with doc: Document, in g: EditorGroup) {
         activate(group: g)
-        if g.tabs.count == 1, let t = g.tabs.first, t.document.url == nil, !t.document.isDirty, t.document.length == 0 {
+        if g.tabs.count == 1, let t = g.tabs.first, t.document.url == nil, !t.document.isDirty, t.document.length == 0,
+           !WaitRegistry.shared.isWaiting(on: t.document) {
             g.add(doc)
             g.removeTab(at: g.index(of: t.document) ?? 0)
         } else {
@@ -743,15 +756,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         if let url = resolved {
             projectIndex = ProjectIndex(root: url)
             var pending = false
-            watcher = FileWatcher(path: url.path) { [weak self] paths in
+            watcher = FileWatcher(path: url.path) { [weak self] paths, recursive in
                 guard let self else { return }
-                self.sidebar.filesChanged(paths)
+                self.sidebar.filesChanged(paths, recursive: recursive)
                 if !pending {
                     pending = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                         pending = false
+                        guard let self else { return }
                         self.projectIndex?.rebuild()
                         self.refreshGitStatus()
+                        for doc in self.allOpenDocuments() where doc.fileMissing { self.handleDiskChange(doc) }
                     }
                 }
             }
@@ -1120,7 +1135,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// Writes `doc` to `target`, or to its own file when nil, after the save-time cleanups.
     func write(_ doc: Document, to target: URL?, replacingExternalChanges: Bool = false, interactive: Bool = true,
                completion: ((Bool) -> Void)? = nil) {
-        let editor = allGroupsTabs().first { $0.document === doc && $0.editor != nil }?.editor
+        let displacedDoc = target.flatMap { DocumentRegistry.shared.existing(for: $0) }
+        if let displacedDoc, displacedDoc !== doc, displacedDoc.isDirty {
+            guard interactive else {
+                statusBar.flash("“\(doc.displayName)” wasn’t saved: “\(displacedDoc.displayName)” has unsaved edits.")
+                completion?(false)
+                return
+            }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "“\(displacedDoc.displayName)” is already open with unsaved changes."
+            alert.informativeText = "Saving over it will replace the file on disk and discard the unsaved changes in that tab."
+            alert.addButton(withTitle: "Replace")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                completion?(false)
+                return
+            }
+        }
+        let editor = (activeEditor?.document === doc ? activeEditor : nil)
+            ?? allGroupsTabs().first { $0.document === doc && $0.editor != nil }?.editor
         let cleanups = doc.saveCleanups(to: target)
         let versionBeforeCleanup = doc.editVersion
         func rollbackCleanupsIfNeeded() {
@@ -1144,6 +1178,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 doc.undoManager.endUndoGrouping()
             }
             try doc.save(to: target, replacingExternalChanges: replacingExternalChanges)
+            if let displacedDoc, displacedDoc !== doc {
+                let allControllers = (NSApp.delegate as? AppDelegate)?.controllers ?? [self]
+                for c in allControllers {
+                    for g in c.groups {
+                        while let oldIdx = g.index(of: displacedDoc) {
+                            let wasSelected = g.selectedIndex == oldIdx
+                            if g.index(of: doc) == nil { g.add(doc, select: wasSelected) }
+                            if let removeAt = g.index(of: displacedDoc) { g.removeTab(at: removeAt) }
+                        }
+                    }
+                    c.updateTitle()
+                    c.updateStatusBar()
+                }
+            }
             statusBar.flash("Saved “\(doc.displayName)”")
             if target != nil { updateTitle() }
             refreshGitStatus()
@@ -1233,8 +1281,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         switch doc.checkDiskStatus() {
         case .modified:
             if !doc.isDirty {
-                reloadPreservingViews(doc)
-                statusBar.flash("Reloaded “\(doc.displayName)” (changed on disk)")
+                if reloadPreservingViews(doc) {
+                    statusBar.flash("Reloaded “\(doc.displayName)” (changed on disk)")
+                }
             } else {
                 promptForDiskChange(doc)
             }
@@ -1247,23 +1296,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     }
 
     /// A caret parked at the end of a growing file (a log, an agent's output) follows new lines.
-    private func reloadPreservingViews(_ doc: Document) {
+    @discardableResult
+    private func reloadPreservingViews(_ doc: Document) -> Bool {
         let oldLength = doc.length
         let saved = editors(for: doc).map { e -> (EditorView, NSRange, CGPoint, Bool) in
             let endVisible = e.textView.visibleRect.intersects(e.textView.caretRect(at: oldLength))
             return (e, e.textView.selectedRange(), e.scrollPosition, endVisible)
         }
-        do { try doc.reload() } catch { return }
+        do { try doc.reload() } catch { return false }
         for (e, s, p, endVisible) in saved {
             let len = doc.length
             let follow = s.length == 0 && s.location >= oldLength && len > oldLength
-            e.textView.setAllSelections([NSRange(location: follow ? len : min(s.location, len), length: 0)], scroll: false)
+            if follow {
+                e.textView.setAllSelections([NSRange(location: len, length: 0)], scroll: false)
+            } else {
+                let loc = min(s.location, len)
+                e.textView.setAllSelections([NSRange(location: loc, length: min(s.length, len - loc))], scroll: false)
+            }
             e.scrollPosition = p
-            if follow && endVisible {
+            if follow && endVisible && len > 0 {
                 e.layoutManager.ensureLayout(forCharacterRange: NSRange(location: len - 1, length: 1))
                 e.textView.scrollRangeToVisible(NSRange(location: len, length: 0))
             }
         }
+        return true
     }
 
     // MARK: Printing

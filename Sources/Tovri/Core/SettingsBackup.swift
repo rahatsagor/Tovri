@@ -48,6 +48,7 @@ struct SettingsBackup: Codable, Equatable {
 
     private static let maxStringLength = 10_000
     private static let maxKeyBindings = 2_000
+    private static let maxThemes = 200
 
     /// Captures the settings that differ from their defaults, so a file made today doesn't pin
     /// defaults a later version of Tovri improves.
@@ -88,7 +89,10 @@ struct SettingsBackup: Codable, Equatable {
             b.keyBindings[id] = shortcut
         }
         var names = Set<String>()
-        b.themes = (raw.themes ?? []).compactMap { $0.flatMap { $0.validated() } }.filter { names.insert($0.name).inserted }
+        b.themes = (raw.themes ?? []).compactMap { $0.flatMap { $0.validated() } }
+            .filter { names.insert($0.name).inserted }
+            .prefix(maxThemes)
+            .map { $0 }
         return b
     }
 

@@ -90,7 +90,10 @@ final class CompletionController: NSObject, NSTableViewDataSource, NSTableViewDe
         if prefix.utf16.count >= 2 {
             let lowerPrefix = prefix.lowercased()
             var taken = 0
-            for w in tv.document.completionWords(prefix: prefix) where taken < 3000 {
+            for w in tv.document.completionWords(prefix: prefix, onReady: { [weak self, weak tv] in
+                guard let self, let tv, self.isVisible, self.textView === tv else { return }
+                self.show(for: tv, explicit: explicit)
+            }) where taken < 3000 {
                 guard w.count > prefix.count, w.lowercased().hasPrefix(lowerPrefix) || prefix.utf16.count <= 2 else { continue }
                 if seen.insert(w).inserted { candidates.append((w, "")); taken += 1 }
             }

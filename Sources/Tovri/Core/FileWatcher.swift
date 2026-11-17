@@ -3,20 +3,46 @@ import CoreServices
 
 /// Recursive FSEvents watcher delivering changed directory paths on the main queue.
 final class FileWatcher {
-    private var stream: FSEventStreamRef?
-    private let callback: ([String]) -> Void
+    private final class Box {
+        let callback: ([String], Bool) -> Void
+        var active = true
+        init(_ callback: @escaping ([String], Bool) -> Void) { self.callback = callback }
+    }
 
-    init?(path: String, latency: TimeInterval = 0.3, callback: @escaping ([String]) -> Void) {
-        self.callback = callback
-        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
-        let cb: FSEventStreamCallback = { _, info, count, paths, _, _ in
+    private var stream: FSEventStreamRef?
+    private let box: Box
+
+    init?(path: String, latency: TimeInterval = 0.3, callback: @escaping ([String], Bool) -> Void) {
+        let box = Box(callback)
+        self.box = box
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(box).toOpaque(),
+            retain: { info in
+                guard let info else { return nil }
+                _ = Unmanaged<Box>.fromOpaque(info).retain()
+                return info
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<Box>.fromOpaque(info).release()
+            },
+            copyDescription: nil
+        )
+        let cb: FSEventStreamCallback = { _, info, count, paths, flags, _ in
             guard let info else { return }
-            let watcher = Unmanaged<FileWatcher>.fromOpaque(info).takeUnretainedValue()
+            let box = Unmanaged<Box>.fromOpaque(info).takeUnretainedValue()
+            guard box.active else { return }
             let array = unsafeBitCast(paths, to: NSArray.self)
             var result: [String] = []
             result.reserveCapacity(count)
-            for i in 0..<count { if let s = array[i] as? String { result.append(s) } }
-            watcher.callback(result)
+            var mustScanSubDirs = false
+            let rescanMask = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged)
+            for i in 0..<count {
+                if let s = array[i] as? String { result.append(s) }
+                if (flags[i] & rescanMask) != 0 { mustScanSubDirs = true }
+            }
+            box.callback(result, mustScanSubDirs)
         }
         guard let s = FSEventStreamCreate(kCFAllocatorDefault, cb, &context, [path] as CFArray,
                                           FSEventStreamEventId(kFSEventStreamEventIdSinceNow), latency,
@@ -27,11 +53,20 @@ final class FileWatcher {
     }
 
     func stop() {
+        box.active = false
         guard let s = stream else { return }
-        FSEventStreamStop(s)
-        FSEventStreamInvalidate(s)
-        FSEventStreamRelease(s)
         stream = nil
+        if Thread.isMainThread {
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+        } else {
+            DispatchQueue.main.async {
+                FSEventStreamStop(s)
+                FSEventStreamInvalidate(s)
+                FSEventStreamRelease(s)
+            }
+        }
     }
 
     deinit { stop() }
@@ -74,7 +109,7 @@ final class ProjectIndex {
                 return Entry(relativePath: rel, units: units, basenameStart: base)
             }
             DispatchQueue.main.async {
-                if Perf.enabled { FileHandle.standardError.write("[perf] project index \(root.path): \(entries.count) files\n".data(using: .utf8)!) }
+                if Perf.enabled { Perf.log("[perf] project index \(root.path): \(entries.count) files") }
                 guard gen == self.generation else { return }
                 self.entries = entries
                 self.isBuilding = false
@@ -117,10 +152,12 @@ final class ProjectIndex {
                 if list.hasPaths, let rel = relative(url), list.excludes(relativePath: rel) { en.skipDescendants() }
                 continue
             }
-            // Links to folders aren't followed, so a link back to a parent can't loop, and they aren't files.
+            // Links to folders aren't followed, so a link back to a parent can't loop, and FIFOs/sockets aren't files.
             if v?.isSymbolicLink == true {
-                var linkedDir: ObjCBool = false
-                if fm.fileExists(atPath: url.path, isDirectory: &linkedDir), linkedDir.boolValue { continue }
+                var info = stat()
+                guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { continue }
+            } else if v?.isRegularFile != true {
+                continue
             }
             guard let rel = relative(url) else { continue }
             if list.hasPaths && list.excludes(relativePath: rel) { continue }
@@ -167,8 +204,31 @@ extension URL {
     /// The path with every symlink resolved, including /tmp as /private/tmp, which
     /// `resolvingSymlinksInPath()` leaves alone. FSEvents and FileManager report paths this way.
     var realPathURL: URL {
-        guard isFileURL, let p = realpath(path, nil) else { return standardizedFileURL }
-        defer { free(p) }
-        return URL(fileURLWithPath: String(cString: p), isDirectory: hasDirectoryPath)
+        guard isFileURL else { return standardizedFileURL }
+        if let p = realpath(path, nil) {
+            defer { free(p) }
+            return URL(fileURLWithPath: String(cString: p), isDirectory: hasDirectoryPath)
+        }
+        var missing: [String] = []
+        var dir = self
+        while true {
+            let name = dir.lastPathComponent
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            missing.append(name)
+            if let p = realpath(parent.path, nil) {
+                defer { free(p) }
+                var resolved = URL(fileURLWithPath: String(cString: p), isDirectory: true)
+                for part in missing.dropFirst().reversed() {
+                    resolved = resolved.appendingPathComponent(part, isDirectory: true)
+                }
+                if let last = missing.first {
+                    resolved = resolved.appendingPathComponent(last, isDirectory: hasDirectoryPath)
+                }
+                return resolved
+            }
+            dir = parent
+        }
+        return standardizedFileURL
     }
 }

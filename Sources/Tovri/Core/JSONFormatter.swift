@@ -22,13 +22,18 @@ enum JSONFormatter {
         var depth = 0
         var inString = false
         var escaped = false
-        func newline() {
+        let n = bytes.count
+        let maxOutputBytes = max(n.saturatingMultiply(16), 256_000_000)
+        func newline() throws {
             out.append(10)
+            let pad = depth * unit.count
+            if out.count + pad > maxOutputBytes {
+                throw JSONFormatError.invalid("The JSON is nested too deeply to format.")
+            }
             for _ in 0..<depth { out.append(contentsOf: unit) }
         }
         func isSpace(_ c: UInt8) -> Bool { c == 32 || c == 9 || c == 10 || c == 13 }
         var i = 0
-        let n = bytes.count
         if n >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF { i = 3 }
         while i < n {
             let c = bytes[i]
@@ -53,10 +58,10 @@ enum JSONFormatter {
                 }
                 out.append(c)
                 depth += 1
-                if pretty { newline() }
+                if pretty { try newline() }
             case 125, 93:
                 depth -= 1
-                if pretty { newline() }
+                if pretty { try newline() }
                 out.append(c)
             case 44:
                 // JSONSerialization accepts trailing commas, but they aren't JSON.
@@ -64,7 +69,7 @@ enum JSONFormatter {
                 while j < n && isSpace(bytes[j]) { j += 1 }
                 if j < n && (bytes[j] == 125 || bytes[j] == 93) { throw JSONFormatError.invalid("Trailing comma before “\(bytes[j] == 125 ? "}" : "]")”.") }
                 out.append(c)
-                if pretty { newline() }
+                if pretty { try newline() }
             case 58:
                 out.append(c)
                 if pretty { out.append(32) }
@@ -125,7 +130,10 @@ enum JSONFormatter {
                             throw fail("“\\u” must be followed by four hex digits", at: i)
                         }
                         i += 6
-                    default: throw fail("Unknown escape “\\\(String(decoding: [e], as: UTF8.self))”", at: i)
+                    default:
+                        if e < 0x20 { throw fail("A string can’t contain a line break or control character", at: i + 1) }
+                        let end = e < 0x80 ? i + 2 : min(n, i + 2 + b[(i + 2)...].prefix { $0 & 0xC0 == 0x80 }.count)
+                        throw fail("Unknown escape “\\\(String(decoding: b[(i + 1)..<end], as: UTF8.self))”", at: i)
                     }
                     continue
                 }
@@ -208,5 +216,12 @@ enum JSONFormatter {
             }
         }
         guard expect == .end else { throw fail("The JSON ends too early", at: n) }
+    }
+}
+
+private extension Int {
+    func saturatingMultiply(_ other: Int) -> Int {
+        let (value, overflow) = multipliedReportingOverflow(by: other)
+        return overflow ? Int.max : value
     }
 }

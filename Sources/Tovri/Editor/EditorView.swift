@@ -96,9 +96,11 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     private func hasVeryLongLines() -> Bool {
-        let starts = document.lines.starts
+        let lines = document.lines
+        let count = lines.count
         var prev = 0
-        for s in starts.dropFirst() {
+        for i in 1..<count {
+            let s = lines.start(of: i)
             if s - prev > 20_000 { return true }
             prev = s
         }

@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var appearanceObservation: NSKeyValueObservation?
     private var sessionTimer: Timer?
     private var integrationObserver: AnyCancellable?
+    private weak var initialEmptyController: MainWindowController?
     /// Windows closed with the close button, oldest first, so reopening (or the next launch)
     /// brings back their tabs and unsaved buffers the way Sublime Text does.
     private var closedWindows: [WindowSession] = []
@@ -55,9 +56,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             owner?.save(doc, interactive: false)
         }
 
+        let hasOpenablePending = pendingURLs.contains { $0.isFileURL || AppDelegate.isCommandOpenURL($0) }
         if Settings.shared.restoreSession || Settings.shared.hotExit, let session = SessionStore.shared.load(), !session.windows.isEmpty {
-            for w in session.windows {
-                if AppDelegate.skipsAtLaunch(w, openingFiles: !pendingURLs.isEmpty) {
+            var windows = session.windows
+            if !Settings.shared.restoreSession { windows = SessionStore.hotExitOnlyWindows(from: windows) }
+            for w in windows {
+                if AppDelegate.skipsAtLaunch(w, openingFiles: hasOpenablePending) {
                     closedWindows.append(w)
                     continue
                 }
@@ -72,7 +76,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             openURLs(pendingURLs)
             pendingURLs = []
         }
-        if controllers.isEmpty { newWindow() }
+        if controllers.isEmpty {
+            initialEmptyController = newWindow()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.initialEmptyController = nil }
+        }
         for c in controllers where c.groups.allSatisfy({ $0.tabs.isEmpty }) && c.folderURL == nil { c.newTab(nil) }
         NSApp.activate(ignoringOtherApps: true)
 
@@ -114,9 +121,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return String(bytes: bytes, encoding: .utf8)
     }
 
-    /// Accepts only files the CLI created for this user in its temporary folder: any web page or
-    /// app can fire a tovri:// URL, but it can't plant such a file.
-    private static func cliTempFile(_ path: String, prefix: String) -> URL? {
+    private static func isCommandOpenURL(_ url: URL) -> Bool {
+        url.scheme == "tovri" && url.host == "open"
+            && URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "req" } == true
+    }
+
+    /// Accepts and reads only files the CLI created for this user in its temporary folder using one
+    /// non-following descriptor, eliminating TOCTOU races between checking and reading.
+    private static func readCLITempFile(_ path: String, prefix: String, maxBytes: Int) -> Data? {
         let file = URL(fileURLWithPath: path).standardizedFileURL
         // The CLI writes to `getconf DARWIN_USER_TEMP_DIR`, which is usually the app's own
         // temporary folder too; both are private to this user.
@@ -125,12 +137,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         if confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) > 0 { tmpDirs.append(String(cString: buffer)) }
         let allowed = Set(tmpDirs.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
         guard file.lastPathComponent.hasPrefix(prefix),
-              allowed.contains(file.deletingLastPathComponent().resolvingSymlinksInPath().path),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
-              attrs[.type] as? FileAttributeType == .typeRegular,
-              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid()
+              allowed.contains(file.deletingLastPathComponent().resolvingSymlinksInPath().path)
         else { return nil }
-        return file
+        let fd = open(file.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == getuid(),
+              info.st_size >= 0,
+              info.st_size <= off_t(maxBytes) else { return nil }
+        var data = Data(count: Int(info.st_size) + 1)
+        var filled = 0
+        while true {
+            if filled == data.count {
+                guard data.count <= maxBytes else { return nil }
+                data.count += max(1 << 14, data.count / 4)
+            }
+            let n = data.withUnsafeMutableBytes { raw in
+                pread(fd, raw.baseAddress! + filled, raw.count - filled, off_t(filled))
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if n == 0 { break }
+            filled += n
+        }
+        guard filled <= maxBytes else { return nil }
+        data.count = filled
+        unlink(file.path)
+        return data
     }
 
     /// Line and column numbers from outside are clamped so arithmetic on them can't overflow.
@@ -143,26 +181,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return (decoded.text, decoded.isBinary ? .utf8 : decoded.encoding)
     }
 
-    /// Handles `tovri://open?req=<hex path>`. The request file holds the CLI's query
-    /// (`path=<hex>&line=&col=&new=1&wait=<id>&stdin=<hex>`); any other tovri:// URL only
-    /// brings Tovri to the front.
-    private func handleCommandURL(_ url: URL) {
+    private func takeCommandQuery(from url: URL) -> [String: String]? {
         guard url.host == "open", let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let reqPath = AppDelegate.unhex(comps.queryItems?.first(where: { $0.name == "req" })?.value),
-              let reqFile = AppDelegate.cliTempFile(reqPath, prefix: "tovri-req."),
-              let body = try? String(contentsOf: reqFile, encoding: .utf8),
+              let data = AppDelegate.readCLITempFile(reqPath, prefix: "tovri-req.", maxBytes: 1_000_000),
+              let body = String(data: data, encoding: .utf8),
               let request = URLComponents(string: "tovri://open?" + body.trimmingCharacters(in: .whitespacesAndNewlines))
-        else {
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-        try? FileManager.default.removeItem(at: reqFile)
+        else { return nil }
         var q: [String: String] = [:]
         for item in request.queryItems ?? [] { q[item.name] = item.value ?? "" }
+        return q
+    }
+
+    /// Executes a pre-accepted `tovri://open` request. Reading and unlinking the request file up
+    /// front keeps a blocking modal alert on an earlier file from timing out later CLI requests.
+    private func handleCommandQuery(_ q: [String: String]) {
         let wantsNewWindow = q["new"] == "1"
         let wait = q["wait"]
         func target() -> MainWindowController {
-            if wantsNewWindow { return newWindow() }
+            if wantsNewWindow {
+                if controllers.count == 1, let cold = initialEmptyController, cold.isEmptyWindow {
+                    initialEmptyController = nil
+                    return cold
+                }
+                initialEmptyController = nil
+                return newWindow()
+            }
+            initialEmptyController = nil
             return windowForOpening()
         }
         // A waiter whose request opened no document (a folder, Quick Look, an error) is released
@@ -172,9 +217,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             if let doc { WaitRegistry.shared.register(wait, for: doc) } else { WaitRegistry.shared.release(wait) }
         }
         if let tmp = AppDelegate.unhex(q["stdin"]) {
-            guard let file = AppDelegate.cliTempFile(tmp, prefix: "tovri-stdin.") else { finish(nil); return }
-            let data = (try? Document.readFile(file)) ?? Data()
-            try? FileManager.default.removeItem(at: file)
+            guard let data = AppDelegate.readCLITempFile(tmp, prefix: "tovri-stdin.", maxBytes: 512_000_000) else {
+                finish(nil)
+                return
+            }
             let decoded = AppDelegate.decodeStandardInput(data)
             let c = target()
             finish(c.openText(decoded.text, encoding: decoded.encoding))
@@ -183,7 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return
         }
         guard let path = AppDelegate.unhex(q["path"]) else {
-            if wantsNewWindow { newWindow() }
+            if wantsNewWindow { _ = target() }
             finish(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -192,7 +238,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         var isDir: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir)
         if exists && isDir.boolValue {
-            if wantsNewWindow { newWindow(folder: fileURL) } else { openURLs([fileURL]) }
+            if wantsNewWindow {
+                if controllers.count == 1, let cold = initialEmptyController, cold.isEmptyWindow {
+                    initialEmptyController = nil
+                    for g in cold.groups { while !g.tabs.isEmpty { g.removeTab(at: 0) } }
+                    cold.setFolder(fileURL)
+                    cold.window?.makeKeyAndOrderFront(nil)
+                } else {
+                    initialEmptyController = nil
+                    newWindow(folder: fileURL)
+                }
+            } else {
+                openURLs([fileURL])
+            }
             finish(nil)
         } else {
             let c = target()
@@ -216,12 +274,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if Settings.shared.hotExit {
-            guard saveSessionBeforeExit() else { return .terminateCancel }
-            isTerminating = true
-            return .terminateNow
+        let hotExit = Settings.shared.hotExit
+        if !hotExit {
+            let unsavedClosed = closedWindows.filter(\.hasUnsavedChanges)
+            if !unsavedClosed.isEmpty {
+                closedWindows.removeAll(where: \.hasUnsavedChanges)
+                for w in unsavedClosed { _ = restoreClosed(w) }
+            }
         }
-        let dirty = AppDelegate.quitConfirmationTargets(in: controllers)
+        let allDirty = AppDelegate.quitConfirmationTargets(in: controllers)
+        let dirty = hotExit ? allDirty.filter { WaitRegistry.shared.isWaiting(on: $0.document) } : allDirty
         guard !dirty.isEmpty else {
             guard saveSessionBeforeExit() else { return .terminateCancel }
             isTerminating = true
@@ -229,6 +291,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
         func next(_ i: Int) {
             guard i < dirty.count else {
+                if hotExit {
+                    for target in dirty where target.document.isDirty {
+                        let d = target.document
+                        if let url = d.url, !d.isNewFile, FileManager.default.fileExists(atPath: url.path) {
+                            try? d.reload()
+                        } else {
+                            d.replaceAllContent("")
+                        }
+                    }
+                }
                 guard saveSessionBeforeExit() else {
                     NSApp.reply(toApplicationShouldTerminate: false)
                     return
@@ -285,7 +357,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     func applicationDidResignActive(_ notification: Notification) {
         guard Settings.shared.saveOnFocusLost else { return }
         for c in controllers {
-            for doc in c.allOpenDocuments() where doc.isDirty && doc.url != nil && !doc.isTransient { c.save(doc, interactive: false) }
+            for doc in c.allOpenDocuments() where AutoSave.canSave(doc) && !AutoSave.isComposing(doc) {
+                c.save(doc, interactive: false)
+            }
         }
     }
 
@@ -328,7 +402,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     /// Whether closing this window should skip unsaved-changes prompts (hot exit keeps them).
     func closingKeepsUnsavedChanges(_ c: MainWindowController) -> Bool {
-        Settings.shared.hotExit && controllers.count == 1 && controllers.first === c
+        guard Settings.shared.hotExit && controllers.count == 1 && controllers.first === c else { return false }
+        return !c.allOpenDocuments().contains { $0.isDirty && WaitRegistry.shared.isWaiting(on: $0) }
     }
 
     var canReopenClosedWindow: Bool { !closedWindows.isEmpty }
@@ -401,8 +476,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func openURLs(_ urls: [URL]) {
-        for url in urls where url.scheme == "tovri" { handleCommandURL(url) }
+        var queries: [[String: String]] = []
+        var sawUnrecognizedCommand = false
+        for url in urls where url.scheme == "tovri" {
+            if let q = takeCommandQuery(from: url) { queries.append(q) } else { sawUnrecognizedCommand = true }
+        }
+        if sawUnrecognizedCommand && queries.isEmpty { NSApp.activate(ignoringOtherApps: true) }
+        for q in queries { handleCommandQuery(q) }
         for url in urls where url.isFileURL {
+            initialEmptyController = nil
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {

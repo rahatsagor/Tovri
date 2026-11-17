@@ -78,6 +78,9 @@ final class Document: NSObject, NSTextStorageDelegate {
     private var cleanCheckScheduled = false
     private var isBulkLoading = false
     private var wasDirty = false
+    var suppressBookmarkAdjust = false
+    private var bookmarkRestoredInUndo = false
+    private var symbolCache: (version: Int, languageID: String, symbols: [EditorView.Symbol])?
 
     private let editors = NSHashTable<AnyObject>.weakObjects()
 
@@ -148,12 +151,19 @@ final class Document: NSObject, NSTextStorageDelegate {
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(settingsChanged), name: .settingsDidChange, object: nil)
         nc.addObserver(self, selector: #selector(themeChanged), name: .themeDidChange, object: nil)
+        nc.addObserver(self, selector: #selector(clearBookmarkUndoFlag), name: .NSUndoManagerDidUndoChange, object: undoManager)
+        nc.addObserver(self, selector: #selector(clearBookmarkUndoFlag), name: .NSUndoManagerDidRedoChange, object: undoManager)
         applyBaseAttributes()
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
         monitor?.cancel()
+        WaitRegistry.shared.documentMayHaveClosed(self, stillOpen: false)
+    }
+
+    @objc private func clearBookmarkUndoFlag() {
+        bookmarkRestoredInUndo = false
     }
 
     // MARK: Editors
@@ -228,12 +238,8 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     // MARK: Loading
 
-    private func load(from url: URL, encoding preferred: TextEncoding?) throws {
-        // Resource values describe a symlink itself rather than the file it points to.
-        let values = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey])
-        if values.isRegularFile == false { throw DocumentError.notAFile }
-        let stamp = DiskStamp(url)
-        let data = try Perf.measure("  read") { try Document.readFile(url) }
+    private func load(from url: URL, encoding preferred: TextEncoding?, incremental: Bool = false) throws {
+        let (data, stamp) = try Perf.measure("  read") { try Document.readFileWithStamp(url) }
         let decoded = Perf.measure("  decode") { TextEncoding.decode(data, preferred: preferred) }
         guard !decoded.isBinary else { throw DocumentError.binaryFile }
         let (text, ending) = Perf.measure("  line endings") { LineEnding.normalize(decoded.text, rawData: decoded.encoding == .utf8 ? data : nil) }
@@ -246,9 +252,15 @@ final class Document: NSObject, NSTextStorageDelegate {
         if !languageWasSetManually {
             language = LanguageRegistry.shared.language(forFileName: url.lastPathComponent, firstLine: firstLine)
         }
-        Perf.measure("  setContent") { setContent(text) }
-        if !indentationWasSetManually { Perf.measure("  indentation") { applyDetectedOrLanguageIndentation() } }
-        applyEditorConfig()
+        if !indentationWasSetManually {
+            Perf.measure("  indentation") { applyDetectedOrLanguageIndentation(in: text as NSString) }
+        }
+        applyEditorConfig(for: url, applyFormatToEmpty: isNewFile || text.isEmpty)
+        if incremental && textStorage.length > 0 {
+            applyIncrementalReload(text)
+        } else {
+            Perf.measure("  setContent") { setContent(text) }
+        }
         if attributesKey != appliedAttributesKey { applyBaseAttributes() }
         Perf.measure("  hash") { markClean() }
         startMonitoring()
@@ -256,6 +268,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     }
 
     private func setContent(_ text: String) {
+        appliedAttributesKey = attributesKey
         isBulkLoading = true
         textStorage.beginEditing()
         textStorage.replaceCharacters(in: NSRange(location: 0, length: textStorage.length), with: text)
@@ -266,6 +279,56 @@ final class Document: NSObject, NSTextStorageDelegate {
         bookmarks.clamp(lineCount: lines.count)
         syntax.reset(language: language, lineCount: lines.count)
         editVersion += 1
+    }
+
+    private func applyIncrementalReload(_ newText: String) {
+        let oldNS = textStorage.mutableString
+        let newNS = newText as NSString
+        let oldLen = oldNS.length
+        let newLen = newNS.length
+        let limit = min(oldLen, newLen)
+        var p = 0
+        while p < limit && oldNS.character(at: p) == newNS.character(at: p) { p += 1 }
+        if p == oldLen && p == newLen {
+            allEditors.forEach { ($0 as? EditorView)?.colorizeVisible() }
+            return
+        }
+        if p > 0 && p < oldLen && UTF16.isTrailSurrogate(oldNS.character(at: p)) { p -= 1 }
+        var s = 0
+        while s < limit - p && oldNS.character(at: oldLen - 1 - s) == newNS.character(at: newLen - 1 - s) { s += 1 }
+        if s > 0 && oldLen - s < oldLen && UTF16.isTrailSurrogate(oldNS.character(at: oldLen - s)) { s -= 1 }
+        let removedLen = oldLen - p - s
+        let insertedLen = newLen - p - s
+        guard removedLen + insertedLen < oldLen / 2 else {
+            setContent(newText)
+            allEditors.forEach { $0.documentDidReload() }
+            return
+        }
+        let replaced = NSRange(location: p, length: removedLen)
+        let inserted = newNS.substring(with: NSRange(location: p, length: insertedLen))
+        let delta = insertedLen - removedLen
+        let editedRange = NSRange(location: p, length: insertedLen)
+        isBulkLoading = true
+        textStorage.beginEditing()
+        textStorage.replaceCharacters(in: replaced, with: inserted)
+        if insertedLen > 0 {
+            textStorage.setAttributes(baseAttributes, range: editedRange)
+        }
+        textStorage.endEditing()
+        isBulkLoading = false
+        let r = lines.update(editedRange: editedRange, delta: delta, text: textStorage.mutableString)
+        lastEditLines = r
+        bookmarks.adjust(editedRange: editedRange, delta: delta, change: r, lines: lines, textLength: textStorage.length)
+        syntax.linesChanged(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted)
+        editVersion += 1
+        for e in allEditors {
+            e.documentDidEdit(range: editedRange, delta: delta)
+            if let ev = e as? EditorView {
+                ev.findBar?.documentDidReload()
+                ev.textView.sizeToFit()
+                ev.minimap.needsDisplay = true
+            }
+        }
     }
 
     /// Replaces the content programmatically (reload, find results). Clears undo history.
@@ -327,9 +390,10 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     func reload(encoding preferred: TextEncoding? = nil) throws {
         guard let url else { return }
-        try load(from: url, encoding: preferred ?? (encodingWasDetected ? nil : encoding))
+        let wasPopulated = length > 0
+        try load(from: url, encoding: preferred ?? (encodingWasDetected ? nil : encoding), incremental: wasPopulated)
         undoManager.removeAllActions()
-        allEditors.forEach { $0.documentDidReload() }
+        if !wasPopulated { allEditors.forEach { $0.documentDidReload() } }
         postStateChange(force: true)
     }
 
@@ -349,15 +413,19 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// apply to files that have no content yet, so opening a file never rewrites it.
     private func applyEditorConfig() {
         guard let url else { return }
+        applyEditorConfig(for: url, applyFormatToEmpty: isNewFile || length == 0)
+        if attributesKey != appliedAttributesKey { applyBaseAttributes() }
+    }
+
+    private func applyEditorConfig(for url: URL, applyFormatToEmpty: Bool) {
         let ec = EditorConfig.properties(for: url)
         editorConfig = ec
         guard !ec.values.isEmpty else { return }
         applyEditorConfigIndentation(ec)
-        if isNewFile || length == 0 {
+        if applyFormatToEmpty {
             if let le = ec.lineEnding { lineEnding = le }
             if let enc = ec.encoding { encoding = enc }
         }
-        if attributesKey != appliedAttributesKey { applyBaseAttributes() }
     }
 
     private func applyEditorConfigIndentation(_ ec: EditorConfig.Properties) {
@@ -387,25 +455,21 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// (Save All, saving on quit), as one undoable change, so it saves the same bytes as ⌘S.
     func applySaveCleanups(trimTrailingWhitespace trim: Bool, insertFinalNewline: Bool) {
         guard !isReadOnly else { return }
-        var edits: [(NSRange, String)] = []
+        var edits: [(range: NSRange, text: String)] = []
         if trim, let re = try? NSRegularExpression(pattern: "[ \\t]+$", options: [.anchorsMatchLines]) {
             edits = re.matches(in: string as String, range: NSRange(location: 0, length: length)).map { ($0.range, "") }
         }
-        if insertFinalNewline && length > 0 && string.character(at: length - 1) != 10 {
-            edits.append((NSRange(location: length, length: 0), "\n"))
+        if insertFinalNewline && length > 0 {
+            var effectiveEnd = length
+            if let lastTrim = edits.last, NSMaxRange(lastTrim.range) == length {
+                effectiveEnd = lastTrim.range.location
+            }
+            if effectiveEnd > 0 && string.character(at: effectiveEnd - 1) != 10 {
+                edits.append((NSRange(location: length, length: 0), "\n"))
+            }
         }
         guard !edits.isEmpty else { return }
-        undoManager.beginUndoGrouping()
-        for (range, replacement) in edits.reversed() { replaceText(in: range, with: replacement) }
-        undoManager.setActionName(trim ? "Trim Trailing Whitespace" : "Insert Final Newline")
-        undoManager.endUndoGrouping()
-    }
-
-    private func replaceText(in range: NSRange, with replacement: String) {
-        let old = string.substring(with: range)
-        let undoRange = NSRange(location: range.location, length: (replacement as NSString).length)
-        undoManager.registerUndo(withTarget: self) { $0.replaceText(in: undoRange, with: old) }
-        textStorage.replaceCharacters(in: range, with: replacement)
+        _ = applyReplaceEdits(edits, actionName: trim ? "Trim Trailing Whitespace" : "Insert Final Newline")
     }
 
     /// The indentation Settings → Editor sets for the language, as last applied.
@@ -415,9 +479,9 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// Indentation detected from the text comes first, so editing a file keeps its style; the
     /// language's setting covers new files and text without clear indentation. `.editorconfig`
     /// is applied after both and wins over them.
-    private func applyDetectedOrLanguageIndentation() {
+    private func applyDetectedOrLanguageIndentation(in source: NSString? = nil) {
         appliedLanguageIndentation = Settings.shared.indentation(forLanguage: language.id)
-        if !detectIndentation() { applyLanguageIndentation() }
+        if !detectIndentation(in: source) { applyLanguageIndentation() }
     }
 
     /// Uses the indentation Settings → Editor sets for the document's language, if any.
@@ -433,21 +497,27 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     /// Whether the text showed its indentation style.
     @discardableResult
-    private func detectIndentation() -> Bool {
+    private func detectIndentation(in source: NSString? = nil) -> Bool {
         guard Settings.shared.detectIndentation else { return false }
-        let s = textStorage.mutableString
+        let s = source ?? textStorage.mutableString
+        let totalLen = s.length
         var tabs = 0, spaces = 0
         var widths: [Int: Int] = [:]
         var prevIndent = 0
-        let limit = min(lines.count, 1000)
-        for line in 0..<limit {
-            let start = lines.start(of: line)
-            let end = line + 1 < lines.count ? lines.start(of: line + 1) - 1 : s.length
-            guard end > start else { continue }
-            let c = s.character(at: start)
+        var pos = 0
+        var line = 0
+        while pos < totalLen && line < 1000 {
+            let nl = s.range(of: "\n", options: .literal, range: NSRange(location: pos, length: totalLen - pos))
+            let end = nl.location == NSNotFound ? totalLen : nl.location
+            defer {
+                pos = nl.location == NSNotFound ? totalLen : nl.location + 1
+                line += 1
+            }
+            guard end > pos else { continue }
+            let c = s.character(at: pos)
             if c == 9 { tabs += 1; continue }
             var n = 0
-            var i = start
+            var i = pos
             while i < end && s.character(at: i) == 32 { n += 1; i += 1 }
             if i >= end { continue }
             if n > 0 { spaces += 1 }
@@ -495,7 +565,16 @@ final class Document: NSObject, NSTextStorageDelegate {
         guard editedMask.contains(.editedCharacters), !isBulkLoading else { return }
         let r = lines.update(editedRange: editedRange, delta: delta, text: textStorage.mutableString)
         lastEditLines = r
-        bookmarks.adjust(editedRange: editedRange, delta: delta, change: r, lines: lines, textLength: textStorage.length)
+        if !suppressBookmarkAdjust && !bookmarkRestoredInUndo {
+            let oldBookmarks = bookmarks.lines
+            bookmarks.adjust(editedRange: editedRange, delta: delta, change: r, lines: lines, textLength: textStorage.length)
+            if bookmarks.lines != oldBookmarks && !undoManager.isUndoing && !undoManager.isRedoing {
+                let afterBookmarks = bookmarks.lines
+                undoManager.registerUndo(withTarget: self) { doc in
+                    doc.restoreBookmarksWithUndo(oldBookmarks, next: afterBookmarks)
+                }
+            }
+        }
         syntax.linesChanged(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted)
         editVersion += 1
         dirtyFlag = true
@@ -506,6 +585,29 @@ final class Document: NSObject, NSTextStorageDelegate {
         SessionStore.shared.setNeedsSave()
         AutoSave.shared.documentDidEdit(self)
         if gitBaseline != nil { scheduleGitDiff(delay: 0.35) }
+    }
+
+    func setBookmarksWithUndo(_ new: [Int], from previous: [Int]? = nil) {
+        let old = previous ?? bookmarks.lines
+        let normalized = Array(Set(new.filter { $0 >= 0 && $0 < lines.count })).sorted()
+        guard normalized != old || bookmarks.lines != normalized else { return }
+        bookmarks.set(normalized, lineCount: lines.count)
+        undoManager.registerUndo(withTarget: self) { doc in
+            doc.restoreBookmarksWithUndo(old, next: normalized)
+        }
+    }
+
+    func setBookmarksWithoutUndo(_ new: [Int]) {
+        bookmarks.set(new, lineCount: lines.count)
+    }
+
+    private func restoreBookmarksWithUndo(_ target: [Int], next current: [Int]) {
+        bookmarkRestoredInUndo = true
+        bookmarks.set(target, lineCount: lines.count)
+        undoManager.registerUndo(withTarget: self) { doc in
+            doc.restoreBookmarksWithUndo(current, next: target)
+        }
+        NotificationCenter.default.post(name: .bookmarksDidChange, object: self)
     }
 
     private func scheduleCleanCheck() {
@@ -579,7 +681,14 @@ final class Document: NSObject, NSTextStorageDelegate {
         }
     }
 
-    func restoreUntitledName(_ name: String) { untitledName = name }
+    func restoreUntitledName(_ name: String) {
+        untitledName = name
+        if name == "Untitled" {
+            Document.untitledCounter = max(Document.untitledCounter, 1)
+        } else if name.hasPrefix("Untitled "), let n = Int(name.dropFirst("Untitled ".count)), n > 0 {
+            Document.untitledCounter = max(Document.untitledCounter, n)
+        }
+    }
 
     func markDirtyForRestoredBuffer() {
         dirtyFlag = true
@@ -590,11 +699,27 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     private var preflightEncoded: (version: Int, encoding: TextEncoding, lineEnding: LineEnding, data: Data)?
 
+    private static func resolveDestination(_ url: URL) -> URL {
+        var current = url.resolvingSymlinksInPath()
+        for _ in 0..<32 {
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+            let n = readlink(current.path, &buf, buf.count - 1)
+            guard n > 0 else { break }
+            buf[n] = 0
+            let target = String(cString: buf)
+            let next = target.hasPrefix("/")
+                ? URL(fileURLWithPath: target)
+                : URL(fileURLWithPath: target, relativeTo: current.deletingLastPathComponent())
+            current = next.standardizedFileURL.resolvingSymlinksInPath()
+        }
+        return current
+    }
+
     /// Checks whether saving to `target` (or the file's own URL when nil) would replace external
     /// changes on disk without permission or fail text encoding.
     func checkBeforeSaving(to target: URL? = nil, replacingExternalChanges: Bool = false) throws {
         guard let dest = target ?? url else { return }
-        let resolved = dest.resolvingSymlinksInPath()
+        let resolved = Document.resolveDestination(dest)
         if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved), isNewFile || current != diskStamp {
             throw DocumentError.modifiedOnDisk
         }
@@ -607,7 +732,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     func save(to target: URL? = nil, replacingExternalChanges: Bool = false) throws {
         defer { preflightEncoded = nil }
         guard let dest = target ?? url else { return }
-        let resolved = dest.resolvingSymlinksInPath()
+        let resolved = Document.resolveDestination(dest)
         if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved), isNewFile || current != diskStamp {
             throw DocumentError.modifiedOnDisk
         }
@@ -623,8 +748,14 @@ final class Document: NSObject, NSTextStorageDelegate {
             }
             return d
         }
-        LocalHistory.shared.recordBeforeOverwrite(of: resolved, with: data)
-        try Document.writeFile(data, replacing: resolved)
+        let pendingHistory = LocalHistory.shared.prepareBeforeOverwrite(of: resolved, with: data)
+        do {
+            try Document.writeFile(data, replacing: resolved)
+            pendingHistory?.commit()
+        } catch {
+            pendingHistory?.discard()
+            throw error
+        }
         let nameChanged = url != dest
         let wasUntitled = url == nil
         url = dest
@@ -703,7 +834,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         let existing = try? fm.attributesOfItem(atPath: path)
         // rename(2) only needs a writable folder, so it would replace a file the user can't write.
         if existing != nil && access(path, W_OK) != 0 {
-            throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: path])
+            throw writeError(errno, path: path)
         }
         var info = stat()
         let hasInfo = existing != nil && stat(path, &info) == 0
@@ -751,8 +882,11 @@ final class Document: NSObject, NSTextStorageDelegate {
         do { old = try readAll(fd, path: path) } catch { throw writeError(EIO, path: path) }
         // Copy-on-write volumes need room for the whole new text before the old blocks are freed.
         var fs = statfs()
-        if fstatfs(fd, &fs) == 0 && UInt64(fs.f_bavail) * UInt64(fs.f_bsize) < UInt64(data.count) {
-            throw writeError(ENOSPC, path: path)
+        if fstatfs(fd, &fs) == 0 {
+            let (avail, overflow) = UInt64(fs.f_bavail).multipliedReportingOverflow(by: UInt64(fs.f_bsize))
+            if !overflow && avail < UInt64(data.count) {
+                throw writeError(ENOSPC, path: path)
+            }
         }
         var failure = writeAll(data, to: fd)
         if failure == 0 && ftruncate(fd, off_t(data.count)) != 0 { failure = errno }
@@ -784,22 +918,38 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     /// Reads with read(2) rather than mapping the file: touching a mapped page after another
     /// program truncates the file (log rotation, for one) crashes the app with SIGBUS.
-    static func readFile(_ url: URL) throws -> Data {
-        let path = url.path
-        let fd = open(path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else { throw readError(errno, path: path) }
-        defer { close(fd) }
-        return try readAll(fd, path: path)
+    static func readFile(_ url: URL, maxBytes: Int = Int.max) throws -> Data {
+        try readFileWithStamp(url, maxBytes: maxBytes).data
     }
 
-    private static func readAll(_ fd: Int32, path: String) throws -> Data {
+    static func readFileWithStamp(_ url: URL, maxBytes: Int = Int.max) throws -> (data: Data, stamp: DiskStamp) {
+        let path = url.path
+        let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { throw readError(errno, path: path) }
+        defer { close(fd) }
         var info = stat()
         guard fstat(fd, &info) == 0 else { throw readError(errno, path: path) }
+        guard (info.st_mode & S_IFMT) == S_IFREG else { throw DocumentError.notAFile }
+        let data = try readAll(fd, info: info, path: path, maxBytes: maxBytes)
+        return (data, DiskStamp(info: info))
+    }
+
+    private static func readAll(_ fd: Int32, path: String, maxBytes: Int = Int.max) throws -> Data {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw readError(errno, path: path) }
+        return try readAll(fd, info: info, path: path, maxBytes: maxBytes)
+    }
+
+    private static func readAll(_ fd: Int32, info: stat, path: String, maxBytes: Int) throws -> Data {
+        if info.st_size > off_t(maxBytes) { throw readError(EFBIG, path: path) }
         // One spare byte lets the final read report the end without growing the buffer.
         var data = Data(count: max(Int(info.st_size), 0) + 1)
         var filled = 0
         while true {
-            if filled == data.count { data.count += max(1 << 16, data.count / 4) }
+            if filled == data.count {
+                guard data.count <= maxBytes else { throw readError(EFBIG, path: path) }
+                data.count += min(max(1 << 16, data.count / 4), max(1, maxBytes - data.count + 1))
+            }
             let n = data.withUnsafeMutableBytes { raw in
                 pread(fd, raw.baseAddress! + filled, raw.count - filled, off_t(filled))
             }
@@ -809,6 +959,7 @@ final class Document: NSObject, NSTextStorageDelegate {
             }
             if n == 0 { break }
             filled += n
+            if filled > maxBytes { throw readError(EFBIG, path: path) }
         }
         data.count = filled
         return data
@@ -905,7 +1056,11 @@ final class Document: NSObject, NSTextStorageDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.gitDiffScheduled = false
-            guard let base = self.gitBaseline, self.length < 3_000_000 else { return }
+            guard self.length < 3_000_000 else {
+                self.clearGitBaseline()
+                return
+            }
+            guard let base = self.gitBaseline else { return }
             self.gitGeneration += 1
             let gen = self.gitGeneration
             let current = self.string.copy() as! NSString
@@ -934,7 +1089,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         monitor?.cancel()
         monitor = nil
         guard let url else { return }
-        let fd = open(url.resolvingSymlinksInPath().path, O_EVTONLY)
+        let fd = open(url.resolvingSymlinksInPath().path, O_EVTONLY | O_CLOEXEC)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .delete, .rename, .extend, .attrib, .revoke], queue: .main)
         src.setEventHandler { [weak self, weak src] in
@@ -1086,28 +1241,40 @@ final class Document: NSObject, NSTextStorageDelegate {
     private var wordsVersion = -1
     private var wordsBuilding = false
     private var wordsBuiltAt: TimeInterval = 0
+    private var wordWaiters: [() -> Void] = []
 
     /// Words in the document whose first two letters (case-insensitive) match `prefix`.
-    func completionWords(prefix: String) -> [String] {
+    func completionWords(prefix: String, onReady: (() -> Void)? = nil) -> [String] {
         let now = Date.timeIntervalSinceReferenceDate
-        if wordsVersion != editVersion && !wordsBuilding && length < 4_000_000 && (now - wordsBuiltAt > 2 || cachedWords.isEmpty) {
-            wordsBuilding = true
-            wordsBuiltAt = now
-            let snapshot = textStorage.mutableString.copy() as! NSString
-            let version = editVersion
-            DispatchQueue.global(qos: .userInitiated).async {
-                var words: [String: [String]] = [:]
-                for w in Document.extractWords(snapshot) { words[String(w.lowercased().prefix(2)), default: []].append(w) }
-                for k in words.keys { words[k]?.sort { $0.utf16.count < $1.utf16.count } }
-                DispatchQueue.main.async {
-                    self.cachedWords = words
-                    self.wordsVersion = version
-                    self.wordsBuilding = false
+        if wordsVersion != editVersion && length < 4_000_000 {
+            if let onReady { wordWaiters.append(onReady) }
+            if !wordsBuilding && (now - wordsBuiltAt > 2 || cachedWords.isEmpty) {
+                wordsBuilding = true
+                wordsBuiltAt = now
+                let snapshot = textStorage.mutableString.copy() as! NSString
+                let version = editVersion
+                DispatchQueue.global(qos: .userInitiated).async {
+                    var words: [String: [String]] = [:]
+                    for w in Document.extractWords(snapshot) { words[String(w.lowercased().prefix(2)), default: []].append(w) }
+                    for k in words.keys { words[k]?.sort { $0.utf16.count < $1.utf16.count } }
+                    DispatchQueue.main.async {
+                        self.cachedWords = words
+                        self.wordsVersion = version
+                        self.wordsBuilding = false
+                        let waiters = self.wordWaiters
+                        self.wordWaiters = []
+                        waiters.forEach { $0() }
+                    }
                 }
             }
         }
         return cachedWords[String(prefix.lowercased().prefix(2))] ?? []
     }
+
+    private static let nonWordSeparators = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+        .union(.symbols)
+        .union(.controlCharacters)
 
     private static func extractWords(_ s: NSString) -> [String] {
         var set = Set<String>()
@@ -1115,17 +1282,29 @@ final class Document: NSObject, NSTextStorageDelegate {
         let buf = UnsafeMutablePointer<unichar>.allocate(capacity: n)
         defer { buf.deallocate() }
         s.getCharacters(buf, range: NSRange(location: 0, length: n))
+        func isNonASCIIWord(_ c: unichar) -> Bool {
+            if UTF16.isLeadSurrogate(c) || UTF16.isTrailSurrogate(c) { return true }
+            return Unicode.Scalar(c).map { !nonWordSeparators.contains($0) } ?? false
+        }
+        func isCompletionStart(_ c: unichar) -> Bool {
+            if c < 128 { return isAlphaU(c) || c == 95 || c == 36 }
+            return isNonASCIIWord(c)
+        }
+        func isCompletionCont(_ c: unichar) -> Bool {
+            if c < 128 { return isWordU(c) || c == 36 }
+            return isNonASCIIWord(c)
+        }
         var i = 0
         while i < n {
             let c = buf[i]
-            if isAlphaU(c) || c == 95 || c == 36 || c >= 128 {
+            if isCompletionStart(c) {
                 let start = i
-                while i < n && (isWordU(buf[i]) || buf[i] == 36) { i += 1 }
+                while i < n && isCompletionCont(buf[i]) { i += 1 }
                 if i - start >= 3 && i - start <= 64 {
                     set.insert(String(utf16CodeUnits: buf + start, count: i - start))
                 }
             } else if isDigitU(c) {
-                while i < n && isWordU(buf[i]) { i += 1 }
+                while i < n && isCompletionCont(buf[i]) { i += 1 }
             } else {
                 i += 1
             }
@@ -1344,6 +1523,7 @@ final class RecentFiles {
 
 extension Document {
     func symbols() -> [EditorView.Symbol] {
+        if let c = symbolCache, c.version == editVersion, c.languageID == language.id { return c.symbols }
         guard let re = language.symbolRegex, length < 20_000_000 else { return [] }
         let ns = string
         var out: [EditorView.Symbol] = []
@@ -1355,6 +1535,7 @@ extension Document {
             out.append(EditorView.Symbol(name: name, line: lines.line(containing: r.location), range: r))
             if out.count > 20_000 { stop.pointee = true }
         }
+        symbolCache = (editVersion, language.id, out)
         return out
     }
 }

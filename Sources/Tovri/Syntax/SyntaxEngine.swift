@@ -92,7 +92,7 @@ final class SyntaxEngine {
         guard validUpTo <= target else { return }
         let length = text.length
         let from = validUpTo
-        defer { if Perf.enabled && target - from > 1000 { FileHandle.standardError.write("[perf] states \(from)->\(validUpTo)\n".data(using: .utf8)!) } }
+        defer { if Perf.enabled && target - from > 1000 { Perf.log("[perf] states \(from)->\(validUpTo)") } }
         while validUpTo <= target {
             let prev = validUpTo - 1
             let range = lines.range(of: prev, textLength: length)

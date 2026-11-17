@@ -43,7 +43,8 @@ enum EditorConfig {
         let sections: [Section]
     }
 
-    private static var cache: [String: (date: Date?, file: ConfigFile?)] = [:]
+    private static var cache: [String: (stamp: DiskStamp?, file: ConfigFile?)] = [:]
+    private static let cacheLimit = 512
     private static let lock = NSLock()
 
     static func properties(for url: URL) -> Properties {
@@ -74,15 +75,21 @@ enum EditorConfig {
     }
 
     private static func load(_ url: URL) -> ConfigFile? {
-        let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        let stamp = DiskStamp(resolved)
         lock.lock()
-        if let hit = cache[url.path], hit.date == date { lock.unlock(); return hit.file }
+        if let hit = cache[url.path], hit.stamp == stamp { lock.unlock(); return hit.file }
         lock.unlock()
-        let file = date == nil ? nil : (try? String(contentsOf: url, encoding: .utf8)).map {
-            parse($0, directory: url.deletingLastPathComponent().standardizedFileURL.path)
+        let file: ConfigFile?
+        if stamp != nil, let data = try? LocalHistory.readRegularFile(resolved, limit: 256 * 1024),
+           let text = String(data: data, encoding: .utf8) {
+            file = parse(text, directory: url.deletingLastPathComponent().standardizedFileURL.path)
+        } else {
+            file = nil
         }
         lock.lock()
-        cache[url.path] = (date, file)
+        if cache.count >= cacheLimit { cache.removeAll(keepingCapacity: true) }
+        cache[url.path] = (stamp, file)
         lock.unlock()
         return file
     }
@@ -178,7 +185,28 @@ struct EditorConfigGlob {
                 if i + 1 < g.count && g[i + 1] == "*" {
                     i += 2
                     while i < g.count && g[i] == "*" { i += 1 }
-                    if i < g.count && g[i] == "/" { append(.folders); i += 1 } else { append(.globstar) }
+                    if i < g.count && g[i] == "/" {
+                        for k in results.indices {
+                            let atBoundary: Bool
+                            if let last = results[k].last {
+                                switch last {
+                                case .literal("/"), .folders: atBoundary = true
+                                default: atBoundary = false
+                                }
+                            } else {
+                                atBoundary = true
+                            }
+                            if atBoundary {
+                                results[k].append(.folders)
+                            } else {
+                                results[k].append(.globstar)
+                                results[k].append(.literal("/"))
+                            }
+                        }
+                        i += 1
+                    } else {
+                        append(.globstar)
+                    }
                     continue
                 }
                 append(.star)
@@ -254,13 +282,16 @@ struct EditorConfigGlob {
             if c == "]" && !first { return (.set(ranges, negated: negated), i) }
             if c == "/" { return nil }
             if c == "\\" && i + 1 < g.count { i += 1; c = g[i] }
-            if i + 2 < g.count && g[i + 1] == "-" && g[i + 2] != "]" {
-                let hi = g[i + 2]
+            i += 1
+            if i + 1 < g.count && g[i] == "-" && g[i + 1] != "]" {
+                i += 1
+                var hi = g[i]
+                if hi == "/" { return nil }
+                if hi == "\\" && i + 1 < g.count { i += 1; hi = g[i] }
+                i += 1
                 ranges.append(min(c.value, hi.value)...max(c.value, hi.value))
-                i += 3
             } else {
                 ranges.append(c.value...c.value)
-                i += 1
             }
             first = false
         }
@@ -308,10 +339,12 @@ struct EditorConfigGlob {
                 }
             case .number(let range):
                 var j = si
-                if j < s.count && s[j] == "-" { j += 1 }
+                let isNegative = j < s.count && s[j] == "-"
+                if isNegative { j += 1 }
                 var k = j
                 while k < s.count && k - j < 18 && ("0"..."9").contains(s[k]) {
                     k += 1
+                    if isNegative && k == si + 2 && s[j] == "0" { break }
                     if let n = Int(String(String.UnicodeScalarView(s[si..<k]))), range.contains(n), m(ti + 1, k) { r = true; break }
                 }
             }

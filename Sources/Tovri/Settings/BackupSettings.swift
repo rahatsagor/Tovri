@@ -48,9 +48,15 @@ enum SettingsTransfer {
             guard response == .OK, let url = panel.url else { return }
             let backup: SettingsBackup
             do {
-                let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard size <= SettingsBackup.maxFileSize else { throw SettingsBackup.Failure.tooLarge }
-                backup = try SettingsBackup.decode(Data(contentsOf: url))
+                let data: Data
+                do {
+                    data = try LocalHistory.readRegularFile(url.resolvingSymlinksInPath(), limit: SettingsBackup.maxFileSize)
+                } catch LocalHistory.ReadProblem.tooLarge {
+                    throw SettingsBackup.Failure.tooLarge
+                } catch {
+                    throw SettingsBackup.Failure.notASettingsFile
+                }
+                backup = try SettingsBackup.decode(data)
             } catch {
                 showError("Tovri couldn't import these settings.", error.localizedDescription, in: window)
                 return
@@ -86,8 +92,8 @@ enum SettingsTransfer {
             if tm.isBuiltIn(t.name) { reserved += 1; continue }
             do { try tm.store.save(t); saved += 1 } catch { failed += 1 }
         }
-        tm.reloadCustomThemes()
         backup.apply(to: defaults)
+        tm.reloadCustomThemes()
         KeyBindings.shared.reloadFromDefaults()
         var message = "Imported \(summary(backup, themes: saved))."
         if reserved > 0 { message += " Skipped \(plural(reserved, "theme")) with the name of a built-in theme." }

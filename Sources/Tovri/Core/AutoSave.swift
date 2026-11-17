@@ -57,8 +57,10 @@ final class AutoSave {
     }
 
     /// Saving mid-composition (Japanese, Chinese, accents) would write unfinished text.
-    private static func isComposing(_ doc: Document) -> Bool {
-        guard let tv = NSApp?.keyWindow?.firstResponder as? NSTextView, tv.textStorage === doc.textStorage else { return false }
-        return tv.hasMarkedText()
+    static func isComposing(_ doc: Document) -> Bool {
+        for lm in doc.textStorage.layoutManagers {
+            for tc in lm.textContainers where tc.textView?.hasMarkedText() == true { return true }
+        }
+        return false
     }
 }

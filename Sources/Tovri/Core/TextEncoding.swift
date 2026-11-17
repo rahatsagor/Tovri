@@ -45,15 +45,24 @@ enum TextEncoding: String, CaseIterable {
         var detected = true
     }
 
-    static func decode(_ data: Data, preferred: TextEncoding? = nil) -> Decoded {
+    static func decode(_ data: Data, preferred: TextEncoding? = nil, preferUTF8IfValid: Bool = false) -> Decoded {
+        let hasNullPrefix = data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress, raw.count > 0 else { return false }
+            return memchr(base, 0, min(raw.count, 8192)) != nil
+        }
         if var p = preferred {
             if p == .utf8 && data.starts(with: TextEncoding.utf8BOM.bom) { p = .utf8BOM }
             // Another program removed the BOM; saving must not put it back.
             if p == .utf8BOM && !data.starts(with: p.bom) { p = .utf8 }
             let hasBOM = !p.bom.isEmpty && data.starts(with: p.bom)
-            if !(p.isUTF16 && !hasBOM && TextEncoding.lostUTF16Marker(data)) {
+            let legacySingleByte = p == .windows1252 || p == .latin1 || p == .macRoman
+            let validUTF8Instead = preferUTF8IfValid && legacySingleByte && !hasNullPrefix && !hasBOM
+                && data.contains(where: { $0 >= 0x80 }) && TextEncoding.utf8.string(from: data) != nil
+            if !validUTF8Instead, !(p.isUTF16 && !hasBOM && TextEncoding.lostUTF16Marker(data)) {
                 let body = hasBOM ? data.dropFirst(p.bom.count) : data
-                if let s = p.string(from: body) { return Decoded(text: s, encoding: p, isBinary: false, detected: false) }
+                if let s = p.string(from: body) {
+                    return Decoded(text: s, encoding: p, isBinary: p.isUTF16 ? false : hasNullPrefix, detected: false)
+                }
             }
         }
         if data.starts(with: [0xEF, 0xBB, 0xBF]), let s = TextEncoding.utf8BOM.string(from: data.dropFirst(3)) {
@@ -65,10 +74,7 @@ enum TextEncoding: String, CaseIterable {
         if data.starts(with: [0xFE, 0xFF]), let s = String(data: data.dropFirst(2), encoding: .utf16BigEndian) {
             return Decoded(text: s, encoding: .utf16BE, isBinary: false)
         }
-        let binary = data.withUnsafeBytes { raw -> Bool in
-            guard let base = raw.baseAddress, raw.count > 0 else { return false }
-            return memchr(base, 0, min(raw.count, 8192)) != nil
-        }
+        let binary = hasNullPrefix
         if !binary, let s = TextEncoding.utf8.string(from: data) {
             return Decoded(text: s, encoding: .utf8, isBinary: false)
         }

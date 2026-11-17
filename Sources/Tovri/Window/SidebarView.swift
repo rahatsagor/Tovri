@@ -398,7 +398,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         return s
     }
 
-    func filesChanged(_ paths: [String]) {
+    func filesChanged(_ paths: [String], recursive: Bool = false) {
         var targets = Set<ObjectIdentifier>()
         var nodes: [FileNode] = []
         for p in paths {
@@ -412,7 +412,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
                 path = (path as NSString).deletingLastPathComponent
             }
         }
-        for n in nodes { refresh(node: n, recursive: false) }
+        for n in nodes { refresh(node: n, recursive: recursive) }
     }
 
     private func reloadLoadedTree(_ node: FileNode) {

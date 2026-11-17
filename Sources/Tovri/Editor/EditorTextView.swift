@@ -664,6 +664,12 @@ final class EditorTextView: NSTextView {
         // redo bring back every caret.
         let restoresCarets = oldSelections.count > 1
         if restoresCarets { registerSelectionUndo(apply: oldSelections, inverse: nil) }
+        let updatedBookmarks: [Int]? = document.bookmarks.isEmpty ? nil : Bookmarks.adjustedForEdits(
+            document.bookmarks.lines,
+            edits: filtered.map { ($0.range, $0.text) },
+            index: document.lines,
+            textLength: document.length
+        )
         let attrs = typingAttributes
         if filtered.count > 256 {
             // shouldChangeText(inRanges:) is quadratic in the number of ranges (Replace All with
@@ -681,22 +687,27 @@ final class EditorTextView: NSTextView {
             combined += text.substring(with: NSRange(location: pos, length: end - pos))
             guard shouldChangeText(in: span, replacementString: combined) else { return }
             isSettingMulti = true
+            document.suppressBookmarkAdjust = true
             storage.beginEditing()
             storage.replaceCharacters(in: span, with: NSAttributedString(string: combined, attributes: attrs))
             storage.endEditing()
+            document.suppressBookmarkAdjust = false
         } else {
             let ranges = filtered.map { NSValue(range: $0.range) }
             let strings = filtered.map { $0.text }
             guard shouldChangeText(inRanges: ranges, replacementStrings: strings) else { return }
             isSettingMulti = true
+            document.suppressBookmarkAdjust = true
             storage.beginEditing()
             for e in filtered.reversed() {
                 storage.replaceCharacters(in: e.range, with: NSAttributedString(string: e.text, attributes: attrs))
             }
             storage.endEditing()
+            document.suppressBookmarkAdjust = false
         }
         didChangeText()
         isSettingMulti = false
+        if let updatedBookmarks { document.setBookmarksWithUndo(updatedBookmarks) }
         if let name = actionName { undoManager?.setActionName(name) }
         if keepFolds, let editor, !foldsBefore.isEmpty || !addedFolds.isEmpty {
             editor.applyFolds(EditorTextView.mapFolds(foldsBefore, through: logicalEdits) + addedFolds)

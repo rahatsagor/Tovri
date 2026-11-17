@@ -346,9 +346,11 @@ extension EditorTextView {
             }
         }
         let version = document.editVersion
+        let oldBookmarks = document.bookmarks.lines
         performEdits(edits, selection: .custom(sels), actionName: up ? "Move Line Up" : "Move Line Down", keepFolds: true, addedFolds: movedFolds)
         if !lineMoves.isEmpty && document.editVersion != version {
-            document.bookmarks.remap { l in lineMoves.first { $0.lines.contains(l) }.map { l + $0.by } ?? l }
+            let remapped = Array(Set(oldBookmarks.map { l in lineMoves.first { $0.lines.contains(l) }.map { l + $0.by } ?? l })).sorted()
+            document.setBookmarksWithUndo(remapped, from: oldBookmarks)
             bookmarksChanged()
         }
     }
