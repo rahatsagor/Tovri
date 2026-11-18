@@ -31,19 +31,33 @@ function splitLines(text: string): string[] {
   return lines
 }
 
+function isFenceToggle(line: string): boolean {
+  return /^(`{3,}|~{3,})/.test(line.trimStart())
+}
+
 /** Join hard-wrapped lines. GitHub shows every newline in release notes as a
  * line break, so wrapped changelog lines would break mid-sentence. */
 export function unwrap(markdown: string): string {
   const lines: string[] = []
+  let inFence = false
   for (const line of splitLines(markdown)) {
+    if (isFenceToggle(line)) {
+      inFence = !inFence
+      lines.push(line.trimEnd())
+      continue
+    }
+    if (inFence) {
+      lines.push(line.trimEnd())
+      continue
+    }
     const stripped = line.trim()
     const last = lines.at(-1)
     const continues =
       last !== undefined &&
       stripped !== '' &&
       last.trim() !== '' &&
-      !['#', '- ', '* ', '>', '|', '```'].some((start) => stripped.startsWith(start)) &&
-      !['#', '|', '```'].some((start) => last.trimStart().startsWith(start))
+      !['#', '- ', '* ', '>', '|', '```', '~~~'].some((start) => stripped.startsWith(start)) &&
+      !['#', '|', '```', '~~~'].some((start) => last.trimStart().startsWith(start))
     if (continues) {
       lines[lines.length - 1] = `${last.trimEnd()} ${stripped}`
     } else {
@@ -61,31 +75,48 @@ function escapeRegExp(text: string): string {
 export function section(version: string, root = ROOT): string {
   const text = readFileSync(join(root, 'CHANGELOG.md'), 'utf8')
   // The lookahead stops 1.2.1 from matching the heading of 1.2.10 or 1.2.1-beta.
-  const pattern = new RegExp(
-    `^## \\[?${escapeRegExp(version)}(?![\\w.-])\\]?[^\\n]*\\n([\\s\\S]*?)(?=^## |(?![\\s\\S]))`,
-    'm',
-  )
-  const match = pattern.exec(text)
-  if (!match) fail(`CHANGELOG.md has no section for ${version}`)
-  const body = (match[1] ?? '').replace(/^\[[^\]]+\]: .*$/gm, '').trim()
+  const headerPattern = new RegExp(`^## \\[?${escapeRegExp(version)}(?![\\w.-])\\]?`)
+  let inFence = false
+  let collecting = false
+  const collected: string[] = []
+
+  for (const line of splitLines(text)) {
+    if (isFenceToggle(line)) {
+      inFence = !inFence
+      if (collecting) collected.push(line)
+      continue
+    }
+    if (!inFence && line.startsWith('## ')) {
+      if (collecting) break
+      if (headerPattern.test(line)) collecting = true
+      continue
+    }
+    if (collecting) collected.push(line)
+  }
+
+  if (!collecting) fail(`CHANGELOG.md has no section for ${version}`)
+  const body = collected.join('\n').replace(/^\[[^\]]+\]: .*$/gm, '').trim()
   if (!body) fail(`the CHANGELOG.md section for ${version} is empty`)
   return body
 }
 
+function escapeHtml(text: string): string {
+  return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+}
+
 function inline(text: string): string {
-  return text
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
+  return escapeHtml(text)
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>')
 }
 
-/** Just enough Markdown for changelog sections: headings, lists, paragraphs. */
+/** Just enough Markdown for changelog sections: headings, lists, code blocks, paragraphs. */
 export function toHtml(markdown: string): string {
   const parts: string[] = []
   let inList = false
+  let inFence = false
+  const codeLines: string[] = []
   const paragraph: string[] = []
 
   const endParagraph = () => {
@@ -103,6 +134,21 @@ export function toHtml(markdown: string): string {
   }
 
   for (const line of splitLines(markdown)) {
+    if (isFenceToggle(line)) {
+      if (!inFence) {
+        flush()
+        inFence = true
+      } else {
+        parts.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
+        codeLines.length = 0
+        inFence = false
+      }
+      continue
+    }
+    if (inFence) {
+      codeLines.push(line)
+      continue
+    }
     const stripped = line.trim()
     if (!stripped) {
       flush()
@@ -123,6 +169,9 @@ export function toHtml(markdown: string): string {
     } else {
       paragraph.push(stripped)
     }
+  }
+  if (inFence) {
+    parts.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
   }
   flush()
   return parts.join('\n')
@@ -281,20 +330,25 @@ ${notes}
   writeFileSync(out, feed, 'utf8')
 }
 
+function stripVPrefix(version: string): string {
+  return version.startsWith('v') ? version.slice(1) : version
+}
+
 function main(args: string[]): void {
   const [command, ...rest] = args
   if (command === 'notes' && rest.length === 1) {
-    console.log(unwrap(section(rest[0]!)))
+    console.log(unwrap(section(stripVPrefix(rest[0]!))))
   } else if (command === 'check' && rest.length === 1) {
-    checkVersion(rest[0]!)
-    console.log(`Release metadata for ${rest[0]} is consistent`)
+    const version = stripVPrefix(rest[0]!)
+    checkVersion(version)
+    console.log(`Release metadata for ${version} is consistent`)
   } else if (command === 'check-keys' && rest.length === 0) {
     checkKeys()
     console.log('Sparkle keys match')
   } else if (command === 'appcast' && rest.length === 3) {
-    appcast(rest[0]!, rest[1]!, rest[2]!)
+    appcast(stripVPrefix(rest[0]!), rest[1]!, rest[2]!)
   } else if (command === 'html' && rest.length === 1) {
-    console.log(toHtml(section(rest[0]!)))
+    console.log(toHtml(section(stripVPrefix(rest[0]!))))
   } else {
     throw new ReleaseError(USAGE)
   }

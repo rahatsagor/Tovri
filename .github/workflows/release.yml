@@ -77,7 +77,7 @@ jobs:
         run: |
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
-          echo "$P12" | base64 --decode > "$RUNNER_TEMP/identity.p12"
+          (umask 077 && printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/identity.p12")
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 3600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"

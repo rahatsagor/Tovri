@@ -9,6 +9,7 @@ Open files and folders in Tovri. Paths that don't exist open as new, unsaved fil
 Options:
   -n, --new-window   Open in a new window
   -w, --wait         Wait until the opened files are closed (e.g. git config core.editor "tovri -w")
+  -g, --goto         Parse path:line[:column] even if the file does not exist yet
   -                  Read text from standard input into a new tab (also used when input is piped)
   --                 Treat every following argument as a path, even one starting with -
   -h, --help         Show this help
@@ -20,10 +21,17 @@ Examples:
 USAGE
 }
 
-hex() { printf '%s' "$1" | xxd -p | tr -d '\n'; }
+hex() {
+    if command -v xxd >/dev/null 2>&1; then
+        printf '%s' "$1" | xxd -p | tr -d '\n'
+    else
+        printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+    fi
+}
 
 NEW=0
 WAIT=0
+GOTO=0
 STDIN=0
 PATHS=()
 OPTIONS=1
@@ -33,6 +41,7 @@ for arg in "$@"; do
         --) OPTIONS=0 ;;
         --new-window) NEW=1 ;;
         --wait) WAIT=1 ;;
+        --goto) GOTO=1 ;;
         --help) usage; exit 0 ;;
         -) STDIN=1 ;;
         --*) echo "tovri: unknown option $arg" >&2; usage >&2; exit 2 ;;
@@ -44,6 +53,7 @@ for arg in "$@"; do
                 case "$ch" in
                     n) NEW=1 ;;
                     w) WAIT=1 ;;
+                    g) GOTO=1 ;;
                     h) usage; exit 0 ;;
                     *) echo "tovri: unknown option -$ch" >&2; usage >&2; exit 2 ;;
                 esac
@@ -80,9 +90,10 @@ URLS=()
 MARKERS=()
 REQUESTS=()
 
+umask 077
 add_wait() {
     if [ $WAIT -eq 1 ]; then
-        mkdir -p "$WAITDIR"
+        mkdir -p -m 700 "$WAITDIR"
         local id
         id=$(uuidgen)
         : > "$WAITDIR/$id"
@@ -113,9 +124,9 @@ for p in "${PATHS[@]}"; do
     line=""
     col=""
     if [ ! -e "$p" ]; then
-        if [[ "$p" =~ ^(.+):([0-9]+):([0-9]+)$ ]] && [ -e "${BASH_REMATCH[1]}" ]; then
+        if [[ "$p" =~ ^(.+):([0-9]+):([0-9]+)$ ]] && { [ $GOTO -eq 1 ] || [ -e "${BASH_REMATCH[1]}" ]; }; then
             p="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"; col="${BASH_REMATCH[3]}"
-        elif [[ "$p" =~ ^(.+):([0-9]+)$ ]] && [ -e "${BASH_REMATCH[1]}" ]; then
+        elif [[ "$p" =~ ^(.+):([0-9]+)$ ]] && { [ $GOTO -eq 1 ] || [ -e "${BASH_REMATCH[1]}" ]; }; then
             p="${BASH_REMATCH[1]}"; line="${BASH_REMATCH[2]}"
         fi
     fi
@@ -141,7 +152,15 @@ unread_request() {
     return 1
 }
 
+cleanup_wait() {
+    rm -f "${MARKERS[@]}" "${REQUESTS[@]}"
+    [ -n "${TMP:-}" ] && rm -f "$TMP"
+}
+
 if [ $WAIT -eq 1 ]; then
+    trap 'cleanup_wait; exit 130' INT
+    trap 'cleanup_wait; exit 143' TERM
+    trap 'cleanup_wait; exit 129' HUP
     ticks=0
     running=0
     for m in "${MARKERS[@]}"; do
@@ -155,8 +174,7 @@ if [ $WAIT -eq 1 ]; then
                 # running for 20 seconds was refused, so nothing will ever release the wait.
                 if [ $running -ge 10 ] && unread_request; then
                     echo "tovri: Tovri didn't accept the request, so there is nothing to wait for." >&2
-                    rm -f "${MARKERS[@]}" "${REQUESTS[@]}"
-                    [ -n "${TMP:-}" ] && rm -f "$TMP"
+                    cleanup_wait
                     exit 1
                 fi
             elif [ $ticks -gt 50 ]; then

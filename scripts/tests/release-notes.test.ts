@@ -73,6 +73,24 @@ describe('release versions', () => {
     expect(() => section('0.1.0', root)).toThrow('no section for 0.1.0')
   })
 
+  test('fenced headings inside code blocks do not terminate a section early', () => {
+    writeFileSync(
+      join(root, 'CHANGELOG.md'),
+      '## [0.1.0] - 2026-11-01\n\n### Notes\n\n```md\n## Not a section heading\nline two\n```\n\n- Kept after fence.\n\n## [0.0.9]\n\n- Older.\n',
+    )
+    expect(section('0.1.0', root)).toContain('- Kept after fence.')
+  })
+
+  test('v-prefixed CLI version arguments are normalized', () => {
+    const plist = readFileSync(join(SCRIPTS, '../Resources/Info.plist'), 'utf8')
+    const version = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1] ?? ''
+    const result = spawnSync('bun', [join(SCRIPTS, 'release-notes.ts'), 'check', `v${version}`], {
+      encoding: 'utf8',
+    })
+    expect(result.status, result.stderr).toBe(0)
+    expect(result.stdout).toContain(`Release metadata for ${version} is consistent`)
+  })
+
   test('the minimum macOS comes from Info.plist and must match Package.swift', () => {
     expect(minimumMacOS(root)).toBe('14.0')
     writeFileSync(join(root, 'Package.swift'), 'platforms: [.macOS(.v15)]\n')
@@ -117,12 +135,23 @@ describe('release notes', () => {
         'A paragraph that wraps onto two lines.',
     )
   })
+
+  test('fenced code blocks keep line breaks when unwrapped', () => {
+    const markdown = '```sh\ntovri -g file.txt:10\ntovri -w note.txt\n```\n'
+    expect(unwrap(markdown)).toBe('```sh\ntovri -g file.txt:10\ntovri -w note.txt\n```')
+  })
 })
 
 describe('release notes HTML', () => {
   test('wrapped list items stay inside their item', () => {
     expect(toHtml('### Fixes\n\n- One that\n  wraps.\n- Two that\nwraps lazily.\n\nAfter.')).toBe(
       '<h3>Fixes</h3>\n<ul>\n<li>One that wraps.</li>\n<li>Two that wraps lazily.</li>\n</ul>\n<p>After.</p>',
+    )
+  })
+
+  test('fenced code blocks render as escaped pre/code elements', () => {
+    expect(toHtml('```sh\necho "a < b" && tovri\n```')).toBe(
+      '<pre><code>echo "a &lt; b" &amp;&amp; tovri</code></pre>',
     )
   })
 

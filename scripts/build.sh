@@ -45,7 +45,7 @@ if [[ -n "$UPDATE_KEY" ]]; then
     fi
 fi
 
-for tool in swift codesign ditto; do
+for tool in swift codesign ditto lipo plutil; do
     command -v "$tool" >/dev/null || { echo "error: $tool is required; install Xcode (see CONTRIBUTING.md)" >&2; exit 1; }
 done
 
@@ -85,6 +85,7 @@ PLIST="$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $UPDATE_KEY" "$PLIST"
+plutil -lint "$PLIST" >/dev/null
 
 EXECUTABLE="$APP/Contents/MacOS/Tovri"
 # SwiftPM also adds rpaths into the toolchain that built the app. Only Sparkle loads through
@@ -131,11 +132,39 @@ fi
 
 sign() { codesign --force --timestamp=none ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --sign "$IDENTITY" "$@"; }
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
+# Remove development headers/modules and strip unused non-arm64 slices from Sparkle.
+rm -rf \
+    "$APP/Contents/Frameworks/Sparkle.framework/Headers" \
+    "$APP/Contents/Frameworks/Sparkle.framework/PrivateHeaders" \
+    "$APP/Contents/Frameworks/Sparkle.framework/Modules" \
+    "$SPARKLE/Headers" \
+    "$SPARKLE/PrivateHeaders" \
+    "$SPARKLE/Modules"
+DOWNLOADER_ENT="$STAGING/downloader.entitlements"
+codesign -d --entitlements - --xml "$SPARKLE/XPCServices/Downloader.xpc" > "$DOWNLOADER_ENT" 2>/dev/null || : > "$DOWNLOADER_ENT"
+for bin in \
+    "$SPARKLE/Sparkle" \
+    "$SPARKLE/Autoupdate" \
+    "$SPARKLE/Updater.app/Contents/MacOS/Updater" \
+    "$SPARKLE/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" \
+    "$SPARKLE/XPCServices/Installer.xpc/Contents/MacOS/Installer"; do
+    [[ -f "$bin" ]] || continue
+    if lipo -info "$bin" 2>/dev/null | grep -q "Non-fat file:.*arm64"; then
+        continue
+    fi
+    lipo -extract arm64 "$bin" -output "$bin.arm64"
+    chmod 755 "$bin.arm64"
+    mv -f "$bin.arm64" "$bin"
+done
 # Inside-out, as Sparkle's documentation describes for re-signing. The app's entitlements turn
 # off library validation: a self-signed identity has no Team ID, so the hardened runtime would
 # otherwise refuse Sparkle.framework.
 sign --options runtime "$SPARKLE/XPCServices/Installer.xpc"
-sign --options runtime --preserve-metadata=entitlements "$SPARKLE/XPCServices/Downloader.xpc"
+if [[ -s "$DOWNLOADER_ENT" ]]; then
+    sign --options runtime --entitlements "$DOWNLOADER_ENT" "$SPARKLE/XPCServices/Downloader.xpc"
+else
+    sign --options runtime --preserve-metadata=entitlements "$SPARKLE/XPCServices/Downloader.xpc"
+fi
 sign --options runtime "$SPARKLE/Autoupdate"
 sign --options runtime "$SPARKLE/Updater.app"
 sign --options runtime "$APP/Contents/Frameworks/Sparkle.framework"

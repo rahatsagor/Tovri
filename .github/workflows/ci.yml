@@ -36,10 +36,7 @@ jobs:
         with:
           bun-version: latest
       - name: Install build tools
-        run: |
-          brew update
-          brew install actionlint
-          brew upgrade actionlint
+        run: command -v actionlint >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install actionlint
       - name: Check release tooling and workflows
         run: |
           actionlint

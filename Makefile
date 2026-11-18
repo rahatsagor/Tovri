@@ -1,6 +1,6 @@
 APP := build/Release/Tovri.app
 
-.PHONY: build debug run test package icon clean
+.PHONY: build debug run test check package icon clean
 
 build:
 	@scripts/build.sh
@@ -12,6 +12,10 @@ run: build
 	@open $(APP)
 
 test:
+	@swift test
+
+check:
+	@cd scripts && bun run lint && bun run typecheck && bun run test
 	@swift test
 
 package: build
