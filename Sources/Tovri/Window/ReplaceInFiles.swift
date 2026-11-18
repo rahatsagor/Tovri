@@ -99,7 +99,7 @@ enum ReplaceInFiles {
             // Find in Files skips empty matches, so replacing them would change what the preview didn't show.
             guard m.range.length > 0 else { return true }
             let raw = o.regex ? re.replacementString(for: m, in: text, offset: 0, template: template) : replacement
-            let normalized = raw.contains("\r") ? LineEnding.normalize(raw, rawData: nil).0 : raw
+            let normalized = raw.utf8.contains(13) ? LineEnding.normalize(raw, rawData: nil).0 : raw
             out.append((m.range, normalized))
             return true
         }

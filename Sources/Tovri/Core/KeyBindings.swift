@@ -89,6 +89,7 @@ final class KeyBindings: ObservableObject {
     @Published private(set) var commands: [CommandBinding] = []
     private var defaults: [String: KeyShortcut?] = [:]
     private var hiddenDefaults: [ObjectIdentifier: KeyShortcut] = [:]
+    private let itemIDs = NSMapTable<NSMenuItem, NSString>.weakToStrongObjects()
     private var overrides: [String: String]
     static let storeKey = "keyBindings"
     private var storeKey: String { KeyBindings.storeKey }
@@ -117,7 +118,7 @@ final class KeyBindings: ObservableObject {
             guard let action = item.action, !item.title.isEmpty,
                   !KeyBindings.skippedActions.contains(NSStringFromSelector(action)) else { continue }
             let p = path.joined(separator: " › ")
-            let id = item.identifier?.rawValue ?? (p + "/" + item.title)
+            let id = (itemIDs.object(forKey: item) as String?) ?? (p + "/" + item.title)
             visit(item, id, p)
         }
     }
@@ -131,7 +132,7 @@ final class KeyBindings: ObservableObject {
             }
             if item.isHidden && item.allowsKeyEquivalentWhenHidden {
                 let p = path.joined(separator: " › ")
-                let id = item.identifier?.rawValue ?? (p + "/" + item.title)
+                let id = (itemIDs.object(forKey: item) as String?) ?? (p + "/" + item.title)
                 visit(item, id)
             }
         }
@@ -140,7 +141,7 @@ final class KeyBindings: ObservableObject {
     func install(on menu: NSMenu) {
         self.menu = menu
         walk(menu, path: []) { item, id, _ in
-            if item.identifier == nil { item.identifier = NSUserInterfaceItemIdentifier(id) }
+            if itemIDs.object(forKey: item) == nil { itemIDs.setObject(id as NSString, forKey: item) }
             if defaults[id] == nil { defaults[id] = .some(KeyShortcut(item: item)) }
         }
         walkHiddenAlternates(menu, path: []) { item, _ in

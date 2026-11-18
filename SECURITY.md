@@ -18,21 +18,24 @@ Only the latest release receives fixes.
 ## Untrusted files and folders
 
 - **Markdown preview.** The preview is the only web view in Tovri. Its page
-  allows only Tovri's own script, so scripts, forms and frames in a Markdown
-  file never run. From disk it can read only image and media files, and
-  only small ones, up to 256 MB per preview. Remote images and media are
-  blocked until you click **Load Remote Images** in the bar above the preview
-  (which the document can't draw or click itself) or allow them in
-  **Settings → Files**, because loading them tells the sender when and where
-  the document was read. Links to local files open in Tovri, in Quick Look or
-  as a folder; they never launch an app or a script. Web and email links open
-  in your default browser or mail app.
+  allows only Tovri's own script under a strict Content Security Policy with
+  DNS prefetching disabled, strips active elements including `<base>`,
+  `<meta>`, and `<link>` inside templates, ignores untrusted synthetic clicks
+  on code-copy buttons, and limits local media loads to 256 MB total per
+  preview session. Remote images and media are blocked until you click
+  **Load Remote Images** in the bar above the preview (which the document can't
+  draw or click itself) or allow them in **Settings → Files**, because loading
+  them tells the sender when and where the document was read. Links to local
+  files open in Tovri, in Quick Look or as a folder; they never launch an app
+  or a script. Web and email links open in your default browser or mail app.
 - **Git.** Tovri reads the branch, file status, history and committed copies
   of files, and from the Changes list it can stage, unstage and discard
   changes when you ask. It never commits, pushes or fetches. A repository's
   own configuration can name programs for Git to run, so Tovri runs Git with
-  hooks, `core.fsmonitor`, signature checking and every network transport
-  turned off, every configured filter neutralized, and the work tree pinned to
+  hooks (including Git 2.54+ `hook.*` entries), `core.fsmonitor`,
+  `submodule.recurse`, signature checking and every network transport turned
+  off, every configured filter neutralized, the `.git` directory/gitfile and
+  ref paths validated, subprocess output capped, and the work tree pinned to
   the repository's folder. These settings are passed in a way the repository
   can't override, and Tovri doesn't use Git versions older than 2.31, which
   ignore them. Files that use a filter, such as Git LFS, can't be staged or
@@ -60,8 +63,10 @@ a `sudo` command for you to run yourself instead of asking for your password.
 ## Your files and unsaved work
 
 - Saving writes a new copy and then replaces the file, so a failed save never
-  leaves a half-written file. Read-only files are never replaced, and a file
-  changed by another app since Tovri read it asks before it's overwritten.
+  leaves a half-written file. Read-only files are never replaced, file and CLI
+  request reads verify a regular file on a single non-blocking (`O_NONBLOCK`)
+  descriptor so FIFOs, devices, or swapped symlinks cannot hang the app, and a
+  file changed by another app since Tovri read it asks before it's overwritten.
 - Hot exit keeps unsaved changes in `~/Library/Application Support/Tovri`
   between launches. These files are readable only by your user account, but
   they are not encrypted, so they are as safe as the rest of your home

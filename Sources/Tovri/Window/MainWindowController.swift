@@ -987,10 +987,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
     }
 
+    var dirtyDocumentsNeedingCloseConfirmation: [Document] {
+        allOpenDocuments().filter { $0.isDirty && !isOpenInAnotherWindow($0) && ($0.editorCount <= editorsCount(for: $0)) }
+    }
+
     /// Asks about each dirty document in turn.
     func confirmCloseAll(_ completion: @escaping (Bool) -> Void) {
-        let dirty = allOpenDocuments().filter { $0.isDirty && !isOpenInAnotherWindow($0) && ($0.editorCount <= editorsCount(for: $0)) }
-        confirmClose(dirty, completion: completion)
+        confirmClose(dirtyDocumentsNeedingCloseConfirmation, completion: completion)
     }
 
     private func isOpenInAnotherWindow(_ doc: Document) -> Bool {
@@ -1036,7 +1039,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         if let app = NSApp.delegate as? AppDelegate, app.closingKeepsUnsavedChanges(self) {
             return app.saveSessionBeforeClosingWindow(self)
         }
-        guard hasDirtyDocuments else { return true }
+        guard !dirtyDocumentsNeedingCloseConfirmation.isEmpty else { return true }
         confirmCloseAll { [weak self] ok in
             guard ok, let self else { return }
             self.isClosing = true

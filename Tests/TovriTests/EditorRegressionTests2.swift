@@ -3,6 +3,21 @@ import XCTest
 @testable import Tovri
 
 final class EditorRegressionTests2: XCTestCase {
+    private var isolatedPasteboard: NSPasteboard!
+
+    override func setUp() {
+        super.setUp()
+        isolatedPasteboard = NSPasteboard.withUniqueName()
+        EditorTextView.pasteboard = isolatedPasteboard
+    }
+
+    override func tearDown() {
+        EditorTextView.pasteboard = .general
+        isolatedPasteboard?.releaseGlobally()
+        isolatedPasteboard = nil
+        super.tearDown()
+    }
+
     private func makeEditor(_ text: String, lang: String? = nil) -> EditorView {
         _ = NSApplication.shared
         let language = lang.flatMap { LanguageRegistry.shared.language(id: $0) } ?? LanguageRegistry.shared.plain
@@ -308,7 +323,7 @@ final class EditorRegressionTests2: XCTestCase {
         defer { e.close() }
         e.textView.cut(nil)
         XCTAssertEqual(e.document.string as String, "def b():\n    z = 3\n")
-        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "def a():\n    x = 1\n    y = 2\n")
+        XCTAssertEqual(EditorTextView.pasteboard.string(forType: .string), "def a():\n    x = 1\n    y = 2\n")
     }
 
     func testCaretAtTheVisibleEndOfAFoldedLineKeepsItFolded() {

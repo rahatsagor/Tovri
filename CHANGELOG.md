@@ -9,6 +9,52 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Line-level Patience diffing.** Inline diffs and Git change comparisons now
+  use Patience diffing to keep moved or structural blocks aligned cleanly.
+- **`tovri -g` / `--goto` CLI flag.** Parse `path:line[:column]` arguments
+  even before a file exists on disk, with private (`0700`) temp files and
+  wait-marker cleanup on interrupt signals.
+- **`file:line:column` and richer globs.** Goto Anything accepts `:line:column`
+  jumps, and Find in Files supports `{a,b}` brace expansion, leading `./`,
+  `**/` globs, and trailing `/` directory filters while deduplicating
+  symlinked files.
+
+### Changed
+
+- **Faster large-file indexing and TextKit layout.** Switched `LineIndex` to a
+  gap buffer, cached per-edit document symbols, and eliminated `.numberOfGlyphs`
+  full-layout triggers across layout, caret, and gutter paths.
+- **Live split tab moves.** Moving or collapsing tabs across split groups now
+  keeps each tab's live editor view, undo stack, folds, scroll position, and
+  preview state intact.
+- **Smaller Apple Silicon app bundle.** Stripped development headers, modules,
+  and unused `x86_64` slices from the bundled Sparkle framework cleanly before
+  re-signing.
+- **Improved Changes workflow and navigation.** Added **Restore This Version**
+  for commit comparisons, live diff count updates, single-click preview vs
+  double-click focus in Changes, and fence-aware changelog parsing in release
+  tooling.
+
+### Fixed
+
+- **Hardened Git, Markdown preview, and file I/O safety.** Neutralized Git
+  2.54+ `hook.*` config keys and `submodule.recurse`, validated `.git`
+  directories and ref paths, capped Git output, sanitized `<base>`/`<meta>`/`<link>`
+  inside Markdown `<template>` blocks with stricter CSP and DNS-prefetch
+  controls, enforced cumulative preview resource budgets, and guarded reads
+  with single-descriptor `O_NONBLOCK` regular-file checks.
+- **Editing, IME, and multi-cursor reliability.** Guarded read-only mutations,
+  snapped selections to valid UTF-16 boundaries, prevented multi-cursor IME
+  duplication on commit, fixed deferred fold invalidation, and kept
+  `KeyBindings` IDs stable across dynamic menu title changes.
+- **Default editor claims and window lifecycle.** Excluded media UTIs such as
+  `.ts` MPEG-2 transport streams from default-editor claims while keeping
+  TypeScript source files, blocked closing or quitting during active Replace in
+  Files, preserved shared dirty documents across windows, and normalized `\r\n`
+  replacements on CRLF files and open buffers.
+
 ## [0.6.1] - 2026-11-12
 
 ### Added

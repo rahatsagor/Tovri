@@ -30,7 +30,7 @@ final class SessionTests: XCTestCase {
         _ = NSApplication.shared
         let controller = MainWindowController()
         defer {
-            for group in controller.groups { for tab in group.tabs { tab.close() } }
+            controller.teardown()
             controller.window?.delegate = nil
             controller.window?.close()
         }

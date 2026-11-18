@@ -64,7 +64,7 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
     unowned let controller: MainWindowController
     private let backdrop = PaletteBackdrop()
     private let panel = FlippedView()
-    private let field = ThemedTextField(placeholder: "")
+    let field = ThemedTextField(placeholder: "")
     private let scroll = OverlayScrollView(frame: .zero)
     private let table = NSTableView()
     private var mode: Mode = .files

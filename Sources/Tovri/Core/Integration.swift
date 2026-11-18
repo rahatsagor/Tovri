@@ -136,6 +136,10 @@ final class Integration: ObservableObject {
     /// Content types Tovri declares that are reasonable to claim. Broad or non-code types
     /// (any data, HTML, SVG, CSV, plists) keep their current handlers.
     static var defaultEditorContentTypes: [UTType] {
+        defaultEditorContentTypes(from: Bundle.main.infoDictionary)
+    }
+
+    static func defaultEditorContentTypes(from infoDictionary: [String: Any]?) -> [UTType] {
         let skip: Set<String> = ["public.data", "public.text", "public.folder", "public.html", "public.svg-image",
                                  "public.comma-separated-values-text", "public.tab-separated-values-text",
                                  "com.apple.property-list", "public.log"]
@@ -148,7 +152,7 @@ final class Integration: ObservableObject {
             guard isTextLike && !isNonEditorMedia, seen.insert(t.identifier).inserted else { return }
             result.append(t)
         }
-        let docTypes = Bundle.main.infoDictionary?["CFBundleDocumentTypes"] as? [[String: Any]] ?? []
+        let docTypes = infoDictionary?["CFBundleDocumentTypes"] as? [[String: Any]] ?? []
         for entry in docTypes {
             for id in entry["LSItemContentTypes"] as? [String] ?? [] { add(UTType(id)) }
             for ext in entry["CFBundleTypeExtensions"] as? [String] ?? [] { add(UTType(filenameExtension: ext)) }
