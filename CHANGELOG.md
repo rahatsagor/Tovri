@@ -40,20 +40,27 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **Hardened Git, Markdown preview, and file I/O safety.** Neutralized Git
-  2.54+ `hook.*` config keys and `submodule.recurse`, validated `.git`
-  directories and ref paths, capped Git output, sanitized `<base>`/`<meta>`/`<link>`
-  inside Markdown `<template>` blocks with stricter CSP and DNS-prefetch
-  controls, enforced cumulative preview resource budgets, and guarded reads
-  with single-descriptor `O_NONBLOCK` regular-file checks.
-- **Editing, IME, and multi-cursor reliability.** Guarded read-only mutations,
-  snapped selections to valid UTF-16 boundaries, prevented multi-cursor IME
-  duplication on commit, fixed deferred fold invalidation, and kept
-  `KeyBindings` IDs stable across dynamic menu title changes.
-- **Default editor claims and window lifecycle.** Excluded media UTIs such as
-  `.ts` MPEG-2 transport streams from default-editor claims while keeping
-  TypeScript source files, blocked closing or quitting during active Replace in
-  Files, preserved shared dirty documents across windows, and normalized `\r\n`
-  replacements on CRLF files and open buffers.
+  2.54+ `hook.*` config keys and `submodule.recurse`, verified `.git` ownership
+  (`geteuid()`) and bidirectional worktree/submodule binding while rejecting
+  `.git` symlinks and unbound standalone `gitdir:` pointers, validated ref
+  paths, capped Git output, sanitized `<base>`/`<meta>`/`<link>` inside Markdown
+  `<template>` blocks with stricter CSP and DNS-prefetch controls, enforced
+  cumulative preview resource budgets, and guarded reads with
+  single-descriptor `O_NONBLOCK` regular-file checks.
+- **Editing, gutter, diff, and picker reliability.** Guarded read-only
+  mutations, snapped selections to valid UTF-16 boundaries, prevented
+  multi-cursor IME duplication on commit, fixed deferred fold invalidation,
+  clamped stale highlights across split views, fixed gutter clicks on
+  empty/EOF/folded lines, corrected empty-file inline diff marks, kept
+  `KeyBindings` IDs stable across dynamic menu title changes, restored Theme
+  Picker previews on `Esc` or window close, and synced dirty buffer baselines
+  when discarding Git changes.
+- **Default editor claims, CLI wait, and window lifecycle.** Excluded media UTIs
+  such as `.ts` MPEG-2 transport streams from default-editor claims while
+  keeping TypeScript source files, exited non-zero from `tovri -w` if Tovri
+  exits before closing the waited file, blocked closing or quitting during
+  active Replace in Files, preserved shared dirty documents across windows,
+  and normalized `\r\n` replacements on CRLF files and open buffers.
 
 ## [0.6.1] - 2026-11-12
 

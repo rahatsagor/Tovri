@@ -259,4 +259,26 @@ describe('Sparkle keys', () => {
       'archive signature verification failed',
     )
   })
+
+  test('inline code spans protect asterisks, links escape quotes, and ordered lists render cleanly', () => {
+    const html = toHtml(
+      'Use `a/**` and `**/b` with **bold** and [docs](https://example.com/"quote").\n\n1. First item\n2. Second item',
+    )
+    expect(html).toContain('<code>a/**</code> and <code>**/b</code> with <strong>bold</strong>')
+    expect(html).not.toContain('<code>a/<strong>')
+    expect(html).toContain('<a href="https://example.com/&quot;quote&quot;">docs</a>')
+    expect(html).toContain('<ol>\n<li>First item</li>\n<li>Second item</li>\n</ol>')
+
+    expect(unwrap('1. First item\n2. Second item\nwrapped line')).toBe('1. First item\n2. Second item wrapped line')
+  })
+
+  test('make-signing-identity validates CLI options before touching Keychain', () => {
+    const help = spawnSync(join(SCRIPTS, 'make-signing-identity.sh'), ['--help'], { encoding: 'utf8' })
+    expect(help.status).toBe(0)
+    expect(help.stdout).toContain('usage:')
+
+    const bad = spawnSync(join(SCRIPTS, 'make-signing-identity.sh'), ['--unknown-flag'], { encoding: 'utf8' })
+    expect(bad.status).toBe(2)
+    expect(bad.stderr).toContain('unknown option')
+  })
 })

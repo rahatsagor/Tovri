@@ -56,6 +56,7 @@ export function unwrap(markdown: string): string {
       last !== undefined &&
       stripped !== '' &&
       last.trim() !== '' &&
+      !/^\d+\.\s+/.test(stripped) &&
       !['#', '- ', '* ', '>', '|', '```', '~~~'].some((start) => stripped.startsWith(start)) &&
       !['#', '|', '```', '~~~'].some((start) => last.trimStart().startsWith(start))
     if (continues) {
@@ -105,16 +106,25 @@ function escapeHtml(text: string): string {
 }
 
 function inline(text: string): string {
-  return escapeHtml(text)
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2">$1</a>')
+  return text
+    .split(/(`[^`]+`)/g)
+    .map((part) => {
+      if (part.startsWith('`') && part.endsWith('`') && part.length >= 2) {
+        return `<code>${escapeHtml(part.slice(1, -1))}</code>`
+      }
+      return escapeHtml(part)
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label: string, url: string) => {
+          return `<a href="${url.replaceAll('"', '&quot;')}">${label}</a>`
+        })
+    })
+    .join('')
 }
 
 /** Just enough Markdown for changelog sections: headings, lists, code blocks, paragraphs. */
 export function toHtml(markdown: string): string {
   const parts: string[] = []
-  let inList = false
+  let listTag: 'ul' | 'ol' | null = null
   let inFence = false
   const codeLines: string[] = []
   const paragraph: string[] = []
@@ -125,12 +135,15 @@ export function toHtml(markdown: string): string {
       paragraph.length = 0
     }
   }
+  const closeList = () => {
+    if (listTag) {
+      parts.push(`</${listTag}>`)
+      listTag = null
+    }
+  }
   const flush = () => {
     endParagraph()
-    if (inList) {
-      parts.push('</ul>')
-      inList = false
-    }
+    closeList()
   }
 
   for (const line of splitLines(markdown)) {
@@ -150,6 +163,7 @@ export function toHtml(markdown: string): string {
       continue
     }
     const stripped = line.trim()
+    const orderedMatch = /^\d+\.\s+(.*)$/.exec(stripped)
     if (!stripped) {
       flush()
     } else if (stripped.startsWith('### ')) {
@@ -157,12 +171,21 @@ export function toHtml(markdown: string): string {
       parts.push(`<h3>${inline(stripped.slice(4))}</h3>`)
     } else if (stripped.startsWith('- ') || stripped.startsWith('* ')) {
       endParagraph()
-      if (!inList) {
+      if (listTag !== 'ul') {
+        closeList()
         parts.push('<ul>')
-        inList = true
+        listTag = 'ul'
       }
       parts.push(`<li>${inline(stripped.slice(2))}</li>`)
-    } else if (inList) {
+    } else if (orderedMatch) {
+      endParagraph()
+      if (listTag !== 'ol') {
+        closeList()
+        parts.push('<ol>')
+        listTag = 'ol'
+      }
+      parts.push(`<li>${inline(orderedMatch[1] ?? '')}</li>`)
+    } else if (listTag !== null) {
       // An indented or lazy continuation of the last item.
       const item = parts.pop() ?? ''
       parts.push(`${item.slice(0, -'</li>'.length)} ${inline(stripped)}</li>`)

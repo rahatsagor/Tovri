@@ -150,15 +150,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Upload every file to a draft before making downloads discoverable.
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
-            --title "Tovri $VERSION" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            "dist/Tovri-$VERSION.zip" \
-            "dist/Tovri-$VERSION.dmg" \
-            dist/Tovri.dmg \
-            dist/appcast.xml \
-            dist/SHA256SUMS
+          # Upload every file to a draft (idempotently on workflow re-runs) before publishing.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "Tovri $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              "dist/Tovri-$VERSION.zip" \
+              "dist/Tovri-$VERSION.dmg" \
+              dist/Tovri.dmg \
+              dist/appcast.xml \
+              dist/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+              --title "Tovri $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "dist/Tovri-$VERSION.zip" \
+              "dist/Tovri-$VERSION.dmg" \
+              dist/Tovri.dmg \
+              dist/appcast.xml \
+              dist/SHA256SUMS
+          fi
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
 
       - name: Update Homebrew tap

@@ -15,7 +15,22 @@ set -euo pipefail
 
 NAME="Tovri Self-Signed"
 EXPORT=0
-[[ "${1:-}" == "--export" ]] && EXPORT=1
+case "${1:-}" in
+    "") ;;
+    --export) EXPORT=1 ;;
+    -h|--help)
+        echo "usage: $0 [--export]"
+        exit 0
+        ;;
+    *)
+        echo "error: unknown option: $1 (usage: $0 [--export])" >&2
+        exit 2
+        ;;
+esac
+if [[ $# -gt 1 ]]; then
+    echo "error: unexpected argument: $2 (usage: $0 [--export])" >&2
+    exit 2
+fi
 
 IDENTITIES="$(security find-identity -p codesigning)"
 if grep -q "\"$NAME\"" <<<"$IDENTITIES"; then

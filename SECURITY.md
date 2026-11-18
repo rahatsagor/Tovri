@@ -34,11 +34,18 @@ Only the latest release receives fixes.
   own configuration can name programs for Git to run, so Tovri runs Git with
   hooks (including Git 2.54+ `hook.*` entries), `core.fsmonitor`,
   `submodule.recurse`, signature checking and every network transport turned
-  off, every configured filter neutralized, the `.git` directory/gitfile and
-  ref paths validated, subprocess output capped, and the work tree pinned to
-  the repository's folder. These settings are passed in a way the repository
-  can't override, and Tovri doesn't use Git versions older than 2.31, which
-  ignore them. Files that use a filter, such as Git LFS, can't be staged or
+  off, every configured filter neutralized, subprocess output capped, and ref
+  paths validated. Before opening or running Git on a folder, Tovri verifies
+  that the current user (`geteuid()`) owns the repository root, `.git`
+  entry, resolved git directory, and common directory; rejects `.git`
+  symlinks and unbound standalone `gitdir:` pointers (including
+  `--separate-git-dir` setups without worktree back-links); validates linked
+  worktrees (`commondir` and `worktrees/<name>/gitdir`) and submodules
+  (`core.worktree` inside an enclosing repository's `modules/`)
+  bidirectionally; and pins canonical `--git-dir` and `--work-tree` paths on
+  every Git call. These settings are passed in a way the repository can't
+  override, and Tovri doesn't use Git versions older than 2.31, which ignore
+  them. Files that use a filter, such as Git LFS, can't be staged or
   discarded in Tovri. Browsing a cloned folder doesn't run anything from its
   `.git` folder.
 - **EditorConfig.** `.editorconfig` files only set indentation, whitespace
