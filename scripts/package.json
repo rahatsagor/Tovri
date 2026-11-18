@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "lint": "oxlint release-notes.ts tests",
+    "lint": "oxlint release-notes.ts verify-sparkle-update.ts tests",
     "typecheck": "tsc -p .",
     "test": "bun test ./tests"
   },
