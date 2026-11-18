@@ -67,7 +67,7 @@ final class SessionStore {
     /// Supplies the windows to persist; set by the app delegate.
     var stateProvider: (() -> [WindowSession])?
 
-    private let queue = DispatchQueue(label: "app.tovri.session", qos: .utility)
+    let queue = DispatchQueue(label: "app.tovri.session", qos: .utility)
     private var scheduled = false
     private struct BufferWrite {
         let documentID: UUID
@@ -90,6 +90,7 @@ final class SessionStore {
     private var allowLarge = false
     private static let largeBuffer = 4_000_000
     private var lastLargeWrite: [UUID: TimeInterval] = [:]
+    var nowProvider: () -> TimeInterval = { Date.timeIntervalSinceReferenceDate }
 
     lazy var directory: URL = AppRuntime.supportDirectory
 
@@ -128,7 +129,7 @@ final class SessionStore {
         if doc.length > SessionStore.largeBuffer && !allowLarge {
             // Copying a huge buffer stalls typing, so between quits it is backed up less often,
             // reusing the buffer currently being written on `queue` or already on disk.
-            let now = Date.timeIntervalSinceReferenceDate
+            let now = nowProvider()
             let interval = max(60, Double(doc.length) / 1_000_000 * 3)
             writtenLock.lock()
             let last = lastLargeWrite[doc.id]

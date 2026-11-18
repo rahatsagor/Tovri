@@ -120,6 +120,8 @@ final class OriginalAuditScenariosTests: XCTestCase {
         let store = SessionStore()
         store.directory = dir
         store.bufferDirectory = dir.appendingPathComponent("Buffers")
+        var fakeNow: TimeInterval = 1_000
+        store.nowProvider = { fakeNow }
         defer { store.stateProvider = nil }
 
         let d = AppRuntime.defaults
@@ -139,27 +141,60 @@ final class OriginalAuditScenariosTests: XCTestCase {
                                   activeGroup: 0, fullScreen: false)]
         }
 
-        // Pass 1: initial write succeeds.
-        try store.saveNow(synchronously: true).get()
+        // Pass 1 (t = 1000, async): initial large-buffer write completes onto disk before the next window.
+        doc.textStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "pass1\n")
+        store.saveNow(synchronously: false)
+        store.queue.sync {}
         let pass1Name = try XCTUnwrap(store.load()?.windows.first?.groups.first?.tabs.first?.buffer)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.bufferDirectory.appendingPathComponent(pass1Name).path))
 
-        // Pass 2 & Pass 3: async in-flight edit + immediate throttled edit keep backup file valid.
+        // Block SessionStore's serial I/O queue so Pass 2 is guaranteed still in-flight when Pass 3 throttles.
+        fakeNow = 1_100
+        let gateEntered = DispatchSemaphore(value: 0)
+        let releaseGate = DispatchSemaphore(value: 0)
+        store.queue.async {
+            gateEntered.signal()
+            releaseGate.wait()
+        }
+        gateEntered.wait()
+
+        // Pass 2 (t = 1100, unthrottled async): queues pass2 backup in `inFlightBuffers`.
         doc.textStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "pass2\n")
         store.saveNow(synchronously: false)
+
+        // Pass 3 (t = 1101, throttled async while Pass 2 is in flight): must keep in-flight Pass 2, not stale Pass 1.
+        fakeNow = 1_101
         doc.textStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "pass3\n")
         store.saveNow(synchronously: false)
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }
 
-        let pass3Name = try XCTUnwrap(store.load()?.windows.first?.groups.first?.tabs.first?.buffer)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: store.bufferDirectory.appendingPathComponent(pass3Name).path))
-        XCTAssertFalse(pass1Name.isEmpty)
+        releaseGate.signal()
+        store.queue.sync {}
 
-        // Pass 4: final synchronous flush captures pass3 + pass2 edits.
+        let pass3Name = store.load()?.windows.first?.groups.first?.tabs.first?.buffer
+        XCTAssertNotNil(pass3Name, "Pass 3 must preserve a large-buffer reference")
+        XCTAssertNotEqual(pass3Name, pass1Name, "Pass 3 must prefer in-flight Pass 2 backup over stale Pass 1 backup")
+        if let pass3Name {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: store.bufferDirectory.appendingPathComponent(pass3Name).path))
+        }
+
+        // Pass 4 (t = 1102, still throttled after Pass 2 finished): must retain Pass 2 backup on disk instead of dropping to nil.
+        fakeNow = 1_102
+        doc.textStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: "pass4\n")
+        store.saveNow(synchronously: false)
+        store.queue.sync {}
+
+        let pass4ThrottledName = store.load()?.windows.first?.groups.first?.tabs.first?.buffer
+        XCTAssertNotNil(pass4ThrottledName, "Pass 4 must not drop backup to nil during throttle window")
+        XCTAssertEqual(pass4ThrottledName, pass3Name)
+        if let pass4ThrottledName {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: store.bufferDirectory.appendingPathComponent(pass4ThrottledName).path))
+        }
+
+        // Synchronous quit flush writes all edits.
         try store.saveNow(synchronously: true).get()
-        let pass4Name = try XCTUnwrap(store.load()?.windows.first?.groups.first?.tabs.first?.buffer)
-        let saved = try String(contentsOf: store.bufferDirectory.appendingPathComponent(pass4Name), encoding: .utf8)
-        XCTAssertTrue(saved.hasPrefix("pass3\npass2\n"))
+        let finalName = try XCTUnwrap(store.load()?.windows.first?.groups.first?.tabs.first?.buffer)
+        let saved = try String(contentsOf: store.bufferDirectory.appendingPathComponent(finalName), encoding: .utf8)
+        XCTAssertTrue(saved.hasPrefix("pass4\npass3\npass2\npass1\n"))
     }
 
     // MARK: 1.4 tovri --wait, Hot-Exit interaction & empty stdin release
