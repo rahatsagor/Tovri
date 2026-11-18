@@ -1609,15 +1609,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     @objc func copyFilePath(_ sender: Any?) {
         guard let url = activeDocument?.url else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url.path, forType: .string)
+        AppRuntime.pasteboard.clearContents()
+        AppRuntime.pasteboard.setString(url.path, forType: .string)
     }
 
     @objc func copyRelativePath(_ sender: Any?) {
         guard let url = activeDocument?.url else { return }
         let s = pathInFolder(url) ?? url.lastPathComponent
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(s, forType: .string)
+        AppRuntime.pasteboard.clearContents()
+        AppRuntime.pasteboard.setString(s, forType: .string)
     }
 
     /// `url`'s path inside the open folder, also for a file opened through a symlink to it.
@@ -2343,19 +2343,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         updateStatusBar()
     }
 
-    @objc private func setEncoding(_ sender: NSMenuItem) {
+    @objc func setEncoding(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let e = TextEncoding(rawValue: raw), let doc = activeDocument else { return }
         guard !doc.isReadOnly else { NSSound.beep(); return }
-        let previous = doc.encoding
-        doc.encoding = e
-        if doc.url != nil && !doc.isNewFile {
-            save(doc) { [weak self] ok in
-                if !ok { doc.encoding = previous }
-                self?.updateStatusBar()
-            }
-        } else {
-            updateStatusBar()
+        if !doc.setEncoding(e) {
+            showError(DocumentError.encodingFailed(e))
         }
+        updateStatusBar()
     }
 
     @objc func reopenWithEncoding(_ sender: NSMenuItem) {

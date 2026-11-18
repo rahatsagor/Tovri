@@ -78,14 +78,24 @@ enum ReplaceInFiles {
         o.recordsHits = true
         guard let result = searcher.run(o) else { return nil }
         o.unsaved = [:]
-        var seen = Set<String>()
+        let openByRealPath = Dictionary(open.values.map { ($0.url.realPathURL.path, $0) }, uniquingKeysWith: { a, _ in a })
+        var seenIndexByRealPath: [String: Int] = [:]
         var targets: [Target] = []
         for hit in result.hits {
-            let f = open[hit.path]
-            let url = f?.url ?? o.root.appendingPathComponent(hit.path)
-            // Two paths can lead to one file through a symlink; it is changed once.
-            guard seen.insert(url.realPathURL.path).inserted else { continue }
-            targets.append(Target(url: url, matches: hit.matches, digest: f == nil ? hit.digest : nil, open: f))
+            let candidateURL = o.root.appendingPathComponent(hit.path)
+            let real = (open[hit.path]?.url ?? candidateURL).realPathURL.path
+            let f = open[hit.path] ?? openByRealPath[real]
+            let url = f?.url ?? candidateURL
+            let target = Target(url: url, matches: hit.matches, digest: f == nil ? hit.digest : nil, open: f)
+            // Two paths can lead to one file through a symlink; it is changed once, preferring the open document.
+            if let existing = seenIndexByRealPath[real] {
+                if targets[existing].open == nil && target.open != nil {
+                    targets[existing] = target
+                }
+                continue
+            }
+            seenIndexByRealPath[real] = targets.count
+            targets.append(target)
         }
         return Plan(options: o, replacement: replacement, result: result, targets: targets)
     }

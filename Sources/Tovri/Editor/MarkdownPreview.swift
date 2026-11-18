@@ -80,7 +80,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
         }
     }
 
-    static func copyCodeText(_ text: String, to pasteboard: NSPasteboard = .general) {
+    static func copyCodeText(_ text: String, to pasteboard: NSPasteboard = AppRuntime.pasteboard) {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
     }

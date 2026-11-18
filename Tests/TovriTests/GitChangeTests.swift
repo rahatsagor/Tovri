@@ -291,7 +291,7 @@ func testNumstatCountsLinesAndSkipsBinaryFiles() {
 
     func testChangesListAndHistoryStayAwayUntilTurnedOn() throws {
         try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         defer { d.removeObject(forKey: Settings.Key.gitChangesAndHistory) }
         let dir = try makeRepository(committed: "one\ntwo\n", current: "one\nTWO\nthree\n")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -358,7 +358,7 @@ func testNumstatCountsLinesAndSkipsBinaryFiles() {
 
     func testComparingWithAnEarlierCommitDrivesMarkersNavigationAndRevert() throws {
         try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         d.set(true, forKey: Settings.Key.gitChangesAndHistory)
         defer { d.removeObject(forKey: Settings.Key.gitChangesAndHistory) }
         // The working file matches HEAD, so only the comparison has changes.
@@ -423,7 +423,7 @@ func testNumstatCountsLinesAndSkipsBinaryFiles() {
 
     func testTurningHistoryOffClosesAnOpenHistoryListAndStopsComparing() throws {
         try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         d.set(true, forKey: Settings.Key.gitChangesAndHistory)
         defer { d.removeObject(forKey: Settings.Key.gitChangesAndHistory) }
         let dir = try makeRepository(committed: "one\n", current: "two\n")
@@ -538,7 +538,7 @@ func testNumstatCountsLinesAndSkipsBinaryFiles() {
 
     func testTurningGitOffStopsLoadingCommittedCopiesAndStatus() throws {
         try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         defer { d.removeObject(forKey: Settings.Key.gitEnabled); d.removeObject(forKey: Settings.Key.gitGutter) }
         let dir = try makeRepository(committed: "a\n", current: "b\n")
         defer { try? FileManager.default.removeItem(at: dir) }

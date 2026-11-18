@@ -8,8 +8,7 @@ final class WaitRegistry {
     private var markers: [ObjectIdentifier: [String]] = [:]
 
     private var directory: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Tovri/Wait", isDirectory: true)
+        AppRuntime.supportDirectory.appendingPathComponent("Wait", isDirectory: true)
     }
 
     func register(_ id: String, for doc: Document) {

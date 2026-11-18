@@ -9,7 +9,10 @@ final class FileSafetyRegressionTests2: XCTestCase {
     private var oldDirectory: URL!
     private var oldBufferDirectory: URL!
     private var oldProvider: (() -> [WindowSession])?
-    private var oldArguments: [String: Any] = [:]
+    private var oldHotExit: Any?
+    private var oldRestoreSession: Any?
+    private var oldTrim: Any?
+    private var oldNewline: Any?
     private var controllers: [MainWindowController] = []
     private var store: SessionStore { SessionStore.shared }
 
@@ -24,7 +27,11 @@ final class FileSafetyRegressionTests2: XCTestCase {
         store.directory = directory.appendingPathComponent("Support", isDirectory: true)
         store.bufferDirectory = store.directory.appendingPathComponent("Buffers", isDirectory: true)
         store.stateProvider = nil
-        oldArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        oldHotExit = d.object(forKey: Settings.Key.hotExit)
+        oldRestoreSession = d.object(forKey: Settings.Key.restoreSession)
+        oldTrim = d.object(forKey: Settings.Key.trimTrailingWhitespace)
+        oldNewline = d.object(forKey: Settings.Key.ensureNewlineAtEOF)
         setDefaults([Settings.Key.hotExit: true, Settings.Key.restoreSession: true,
                      Settings.Key.trimTrailingWhitespace: false, Settings.Key.ensureNewlineAtEOF: false])
     }
@@ -37,7 +44,14 @@ final class FileSafetyRegressionTests2: XCTestCase {
         store.stateProvider = oldProvider
         store.directory = oldDirectory
         store.bufferDirectory = oldBufferDirectory
-        UserDefaults.standard.setVolatileDomain(oldArguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        for (key, old) in [(Settings.Key.hotExit, oldHotExit),
+                           (Settings.Key.restoreSession, oldRestoreSession),
+                           (Settings.Key.trimTrailingWhitespace, oldTrim),
+                           (Settings.Key.ensureNewlineAtEOF, oldNewline)] {
+            if let old { d.set(old, forKey: key) } else { d.removeObject(forKey: key) }
+        }
+        Settings.shared.reloadFromDefaults()
         if let items = FileManager.default.enumerator(atPath: directory.path) {
             for case let item as String in items {
                 let path = directory.appendingPathComponent(item).path
@@ -51,9 +65,9 @@ final class FileSafetyRegressionTests2: XCTestCase {
     // MARK: Helpers
 
     private func setDefaults(_ values: [String: Any]) {
-        var arguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        for (k, v) in values { arguments[k] = v }
-        UserDefaults.standard.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        for (k, v) in values { d.set(v, forKey: k) }
+        Settings.shared.reloadFromDefaults()
     }
 
     private func file(_ name: String, _ text: String) throws -> URL { try file(name, Data(text.utf8)) }

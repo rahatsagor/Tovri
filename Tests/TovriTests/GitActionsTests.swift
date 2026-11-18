@@ -390,7 +390,7 @@ final class GitActionsTests: XCTestCase {
     }
 
     func testStagingFromTheListMovesTheFileAndDiscardingReloadsOnlyCleanDocuments() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         d.set(true, forKey: Settings.Key.gitChangesAndHistory)
         defer {
             d.removeObject(forKey: Settings.Key.gitChangesAndHistory)
@@ -558,7 +558,7 @@ final class GitActionsTests: XCTestCase {
     }
 
     func testChangesViewSortsByPathNameStatusAndLinesChanged() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
         let oldSort = d.object(forKey: Settings.Key.gitChangesSort)
         defer {
@@ -608,7 +608,7 @@ final class GitActionsTests: XCTestCase {
     }
 
     func testTrackedFilterSkipsUntrackedFilesInGitAndRefreshesFilesTabWhenSwitchedBack() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
         let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
         defer {
@@ -699,7 +699,7 @@ final class GitActionsTests: XCTestCase {
     }
 
     func testInFlightFilteredRefreshDoesNotClobberBroaderActiveFilter() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
         let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
         defer {
@@ -747,7 +747,7 @@ final class GitActionsTests: XCTestCase {
     }
 
     func testStatusBarCountStaysIndependentOfChangesFilter() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
         let oldStatusBar = d.object(forKey: Settings.Key.gitStatusBarChanges)
         let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)
@@ -794,7 +794,7 @@ final class GitActionsTests: XCTestCase {
     }
 
     func testFilteredViewPreservesStagingMetadataForLiveLineCounts() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldHistory = d.object(forKey: Settings.Key.gitChangesAndHistory)
         let oldGutter = d.object(forKey: Settings.Key.gitGutter)
         let oldFilter = d.object(forKey: Settings.Key.gitChangesFilter)

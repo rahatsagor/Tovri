@@ -13,7 +13,8 @@ enum SettingsWindow {
             let content: AnyView = height > clampedHeight
                 ? AnyView(ScrollView { view.frame(width: 620, height: height) })
                 : AnyView(view.frame(width: 620, height: clampedHeight))
-            let vc = NSHostingController(rootView: content.frame(width: 620, height: clampedHeight))
+            let vc = NSHostingController(rootView: content.frame(width: 620, height: clampedHeight)
+                .defaultAppStorage(AppRuntime.defaults))
             vc.sizingOptions = []
             vc.preferredContentSize = NSSize(width: 620, height: clampedHeight)
             vc.title = title
@@ -269,7 +270,7 @@ struct EditorSettings: View {
                 .fixedSize()
             } label: {
                 Text("Indentation for a language")
-                Text("Used instead of the indentation found in the file. A project's .editorconfig still comes first.")
+                Text("Used for new files and files without existing indentation. A project's .editorconfig and a file's own indentation come first.")
             }
         } header: {
             Text("Languages")

@@ -30,7 +30,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let menu = MainMenu.build(recentMenu: recentMenu)
         KeyBindings.shared.install(on: menu)
         NSApp.mainMenu = menu
-        UserDefaults.standard.set(false, forKey: "NSFullScreenMenuItemEverywhere")
+        if !AppRuntime.isRunningTests {
+            UserDefaults.standard.set(false, forKey: "NSFullScreenMenuItemEverywhere")
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

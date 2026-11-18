@@ -308,7 +308,7 @@ final class HunkRowsView: NSView {
     @objc private func copyAdded() { copy(addedText) }
 
     private func copy(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        AppRuntime.pasteboard.clearContents()
+        AppRuntime.pasteboard.setString(text, forType: .string)
     }
 }

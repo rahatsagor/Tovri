@@ -91,10 +91,7 @@ final class SessionStore {
     private static let largeBuffer = 4_000_000
     private var lastLargeWrite: [UUID: TimeInterval] = [:]
 
-    lazy var directory: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("Tovri", isDirectory: true)
-    }()
+    lazy var directory: URL = AppRuntime.supportDirectory
 
     lazy var bufferDirectory: URL = {
         directory.appendingPathComponent("Buffers", isDirectory: true)

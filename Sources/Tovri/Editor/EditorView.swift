@@ -393,11 +393,12 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     // MARK: DocumentEditor
 
     func documentDidEdit(range: NSRange, delta: Int) {
+        textView.clampTransientRangesToDocumentLength()
         adjustFolds(editedRange: range, delta: delta)
         closeChangeCard()
         if let d = inlineDiff {
             let r = document.lastEditLines
-            if d.applyEdit(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted) {
+            if d.applyEdit(firstLine: r.firstLine, removed: r.removed, inserted: r.inserted, lineCount: document.lines.count) {
                 layoutManager.setGaps(d.gaps, lines: document.lines)
             }
             if comparisonBase != nil { scheduleBaseDiff() }
@@ -584,8 +585,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         let current = document.string.copy() as! NSString
         let version = document.editVersion
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let diff = GitRepository.diff(old: base.split(separator: "\n", omittingEmptySubsequences: false),
-                                          new: (current as String).split(separator: "\n", omittingEmptySubsequences: false))
+            let diff = GitRepository.diff(oldText: base, newText: current as String)
             DispatchQueue.main.async {
                 guard let self, generation == self.baseDiffGeneration, self.comparisonBase != nil else { return }
                 // Turned off in Settings while diffing.

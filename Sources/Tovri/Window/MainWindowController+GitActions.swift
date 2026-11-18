@@ -71,7 +71,7 @@ extension MainWindowController {
         alert.beginSheetModal(for: window) { if $0 == .alertFirstButtonReturn { discard() } }
     }
 
-    private func finishGitAction(_ r: GitRepository.ActionResult, files: [GitRepository.ChangedFile], verb: String) {
+    func finishGitAction(_ r: GitRepository.ActionResult, files: [GitRepository.ChangedFile], verb: String) {
         if verb == "discard", let folder = folderURL, let repo = GitRepository.find(for: folder) {
             let doneURLs = Set(r.done.map { repo.root.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath().path })
             if !doneURLs.isEmpty {
@@ -79,7 +79,11 @@ extension MainWindowController {
                     guard let url = doc.url,
                           doneURLs.contains(url.standardizedFileURL.resolvingSymlinksInPath().path) else { continue }
                     if FileManager.default.fileExists(atPath: url.path) {
-                        _ = reloadPreservingViews(doc)
+                        if doc.isDirty {
+                            doc.syncDiskBaselineAfterDiscard()
+                        } else {
+                            _ = reloadPreservingViews(doc)
+                        }
                     } else {
                         doc.markDeletedOnDisk()
                     }

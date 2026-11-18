@@ -127,8 +127,8 @@ final class Integration: ObservableObject {
     }
 
     private func copy(_ s: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(s, forType: .string)
+        AppRuntime.pasteboard.clearContents()
+        AppRuntime.pasteboard.setString(s, forType: .string)
     }
 
     // MARK: Default editor

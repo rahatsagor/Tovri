@@ -228,6 +228,15 @@ final class FileSearcher {
                 return true
             }
         }
+        var unsavedByReal: [String: (text: String, language: Language?)] = [:]
+        if !o.unsaved.isEmpty {
+            for (rel, txt) in o.unsaved {
+                let real = o.root.appendingPathComponent(rel).realPathURL.path
+                if unsavedByReal[real] == nil {
+                    unsavedByReal[real] = (txt, o.languages[rel])
+                }
+            }
+        }
         var results = [Found?](repeating: nil, count: files.count)
         let root = o.root
         let unsaved = o.unsaved
@@ -235,6 +244,15 @@ final class FileSearcher {
         let chunk = 64
         let chunks = (files.count + chunk - 1) / chunk
         var finished = [Bool](repeating: false, count: chunks)
+        func isSymlink(_ path: String) -> Bool {
+            var st = stat()
+            return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK
+        }
+        func fileID(for url: URL) -> FileID? {
+            var st = stat()
+            guard stat(url.path, &st) == 0 else { return nil }
+            return FileID(dev: UInt64(st.st_dev), ino: UInt64(st.st_ino))
+        }
         results.withUnsafeMutableBufferPointer { resultBuf in
             finished.withUnsafeMutableBufferPointer { doneBuf in
                 let resultPtr = resultBuf.baseAddress!
@@ -251,7 +269,16 @@ final class FileSearcher {
                         let isWordChar = FileSearcher.wordTest(o, path: files[i])
                         let hit: Found?
                         if let text = unsaved[files[i]] {
-                            hit = FileSearcher.search(text: text, path: url.path, re, isWordChar: isWordChar)
+                            var h = FileSearcher.search(text: text, path: url.path, re, isWordChar: isWordChar)
+                            h?.fileID = fileID(for: url)
+                            hit = h
+                        } else if !unsavedByReal.isEmpty && isSymlink(url.path),
+                                  let mapped = unsavedByReal[url.realPathURL.path] {
+                            let lang = mapped.language ?? LanguageRegistry.shared.language(forFileName: url.lastPathComponent)
+                            let mappedWordChar = o.wholeWord ? FindState.wordCharTest(lang) : nil
+                            var h = FileSearcher.search(text: mapped.text, path: url.path, re, isWordChar: mappedWordChar)
+                            h?.fileID = fileID(for: url)
+                            hit = h
                         } else {
                             var tooLarge = false
                             hit = FileSearcher.search(url, path: url.path, re, isWordChar: isWordChar, digest: digest, tooLarge: &tooLarge)
@@ -267,33 +294,38 @@ final class FileSearcher {
             }
         }
         if isCancelled { return nil }
+        var kept: [(rel: String, found: Found, fullPath: String)] = []
+        var seenInodes: [FileID: Int] = [:]
+        for (i, found) in results.enumerated() {
+            guard finished[i / chunk] else { break }
+            guard let found else { continue }
+            let fullPath = root.appendingPathComponent(files[i]).path
+            if let fid = found.fileID {
+                if let prevIdx = seenInodes[fid] {
+                    let prevPath = kept[prevIdx].fullPath
+                    if !isSymlink(fullPath) && isSymlink(prevPath) {
+                        kept[prevIdx] = (files[i], found, fullPath)
+                    }
+                    if isSymlink(fullPath) || isSymlink(prevPath) { continue }
+                } else {
+                    seenInodes[fid] = kept.count
+                }
+            }
+            kept.append((files[i], found, fullPath))
+        }
         var text = ""
         var total = 0
         var fileCount = 0
-        var limited = false
+        var limited = results.indices.contains { !finished[$0 / chunk] && results[$0] != nil }
+        if !finished.allSatisfy({ $0 }) { limited = true }
         var hits: [Hit] = []
-        var seenInodes: [FileID: String] = [:]
-        func isSymlink(_ path: String) -> Bool {
-            var st = stat()
-            return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK
-        }
-        for (i, found) in results.enumerated() {
-            guard finished[i / chunk] else { limited = true; break }
-            guard let found else { continue }
-            if let fid = found.fileID {
-                let fullPath = root.appendingPathComponent(files[i]).path
-                if let prevPath = seenInodes[fid] {
-                    if isSymlink(fullPath) || isSymlink(prevPath) { continue }
-                } else {
-                    seenInodes[fid] = fullPath
-                }
-            }
+        for entry in kept {
             if total >= FileSearcher.maxMatches || fileCount >= FileSearcher.maxFiles { limited = true; break }
-            text += found.text
-            total += found.matches
+            text += entry.found.text
+            total += entry.found.matches
             fileCount += 1
-            if found.truncated { limited = true }
-            if o.recordsHits { hits.append(Hit(path: files[i], matches: found.matches, digest: found.digest)) }
+            if entry.found.truncated { limited = true }
+            if o.recordsHits { hits.append(Hit(path: entry.rel, matches: entry.found.matches, digest: entry.found.digest)) }
         }
         lock.lock()
         let skippedLarge = skippedLargeCount

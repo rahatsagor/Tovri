@@ -3,6 +3,10 @@ import XCTest
 @testable import Tovri
 
 final class AccessibilityTests: XCTestCase {
+    override class func setUp() {
+        super.setUp()
+        TestIsolationObserver.install()
+    }
     private func withController(_ body: (MainWindowController) throws -> Void) rethrows {
         _ = NSApplication.shared
         let controller = MainWindowController()

@@ -6,11 +6,11 @@ import XCTest
 final class ReplaceInFilesTests: XCTestCase {
     override func setUp() {
         super.setUp()
-        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
+        AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
     }
 
     override func tearDown() {
-        UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled)
+        AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled)
         super.tearDown()
     }
 

@@ -10,14 +10,14 @@ final class SessionExitTests: XCTestCase {
         let oldDirectory = store.directory
         let oldBuffers = store.bufferDirectory
         let oldProvider = store.stateProvider
-        let defaults = UserDefaults.standard
-        let oldArguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        let defaults = AppRuntime.defaults
+        let oldHotExit = defaults.object(forKey: Settings.Key.hotExit)
+        let oldRestore = defaults.object(forKey: Settings.Key.restoreSession)
         let directory = URL(fileURLWithPath: "/tmp").appendingPathComponent("TovriExit-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        var arguments = oldArguments
-        arguments[Settings.Key.hotExit] = true
-        arguments[Settings.Key.restoreSession] = true
-        defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        defaults.set(true, forKey: Settings.Key.hotExit)
+        defaults.set(true, forKey: Settings.Key.restoreSession)
+        Settings.shared.reloadFromDefaults()
         store.directory = directory
         store.bufferDirectory = directory.appendingPathComponent("BlockedBuffers")
         try Data([1]).write(to: store.bufferDirectory)
@@ -39,7 +39,9 @@ final class SessionExitTests: XCTestCase {
             store.directory = oldDirectory
             store.bufferDirectory = oldBuffers
             store.stateProvider = oldProvider
-            defaults.setVolatileDomain(oldArguments, forName: UserDefaults.argumentDomain)
+            if let oldHotExit { defaults.set(oldHotExit, forKey: Settings.Key.hotExit) } else { defaults.removeObject(forKey: Settings.Key.hotExit) }
+            if let oldRestore { defaults.set(oldRestore, forKey: Settings.Key.restoreSession) } else { defaults.removeObject(forKey: Settings.Key.restoreSession) }
+            Settings.shared.reloadFromDefaults()
             try? FileManager.default.removeItem(at: directory)
         }
         try body(app, controller, store.bufferDirectory)

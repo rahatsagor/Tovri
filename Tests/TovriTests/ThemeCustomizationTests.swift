@@ -128,16 +128,22 @@ final class ThemeCustomizationTests: XCTestCase {
 }
 
 final class SettingsBackupTests: XCTestCase {
-    private var suites: [String] = []
+    private var suites: [(name: String, defaults: UserDefaults)] = []
 
     private func makeDefaults() -> UserDefaults {
         let name = "tovri-backup-tests-\(UUID().uuidString)"
-        suites.append(name)
-        return UserDefaults(suiteName: name)!
+        let defaults = UserDefaults(suiteName: name)!
+        suites.append((name, defaults))
+        return defaults
     }
 
     override func tearDown() {
-        for s in suites { UserDefaults.standard.removePersistentDomain(forName: s) }
+        for (name, defaults) in suites {
+            defaults.removePersistentDomain(forName: name)
+            let plist = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Preferences/\(name).plist")
+            try? FileManager.default.removeItem(at: plist)
+        }
         suites = []
     }
 
@@ -179,7 +185,8 @@ final class SettingsBackupTests: XCTestCase {
         XCTAssertEqual(target.integer(forKey: Settings.Key.tabWidth), 8)
         XCTAssertTrue(target.object(forKey: Settings.Key.tabWidth) is NSNumber)
         XCTAssertEqual(target.string(forKey: Settings.Key.searchExcludes), "node_modules")
-        let stored = UserDefaults.standard.persistentDomain(forName: suites.last!) ?? [:]
+        let last = suites.last!
+        let stored = last.defaults.persistentDomain(forName: last.name) ?? [:]
         XCTAssertNil(stored[Settings.Key.showInvisibles], "a setting missing from the file should go back to its default")
         XCTAssertEqual(target.dictionary(forKey: KeyBindings.storeKey) as? [String: String], ["Edit/Copy": ""])
     }

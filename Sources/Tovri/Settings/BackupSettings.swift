@@ -84,9 +84,10 @@ enum SettingsTransfer {
         if let window { alert.beginSheetModal(for: window, completionHandler: finish) } else { finish(alert.runModal()) }
     }
 
-    /// Themes go first so settings that choose an imported theme find it.
+    /// Saves custom themes to disk first, writes settings to defaults, then reloads custom themes
+    /// so any newly imported theme selection resolves against the imported files.
     @discardableResult
-    static func apply(_ backup: SettingsBackup, defaults: UserDefaults = .standard, themes tm: ThemeManager = .shared) -> String {
+    static func apply(_ backup: SettingsBackup, defaults: UserDefaults = AppRuntime.defaults, themes tm: ThemeManager = .shared) -> String {
         var saved = 0, failed = 0, reserved = 0
         for t in backup.themes {
             if tm.isBuiltIn(t.name) { reserved += 1; continue }

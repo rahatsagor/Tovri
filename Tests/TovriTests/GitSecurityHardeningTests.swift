@@ -389,4 +389,148 @@ final class GitSecurityHardeningTests: XCTestCase {
         XCTAssertLessThanOrEqual(budget.total, PreviewResourceBudget.limit)
         XCTAssertTrue(budget.admit(try key("big.mp4?3"), size: 64 * mb), "a URL that was admitted stopped loading")
     }
+
+    // MARK: - .git ownership & bidirectional binding (worktrees and submodules)
+
+    func testWorktreesSubmodulesAndSubmodulesInWorktreesAreSupported() throws {
+        try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
+        let subSrc = dir.appendingPathComponent("sub-src")
+        let main = dir.appendingPathComponent("main")
+        let wt = dir.appendingPathComponent("wt")
+        try FileManager.default.createDirectory(at: subSrc, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
+
+        try initRepository(subSrc)
+        try shell("echo sub-v1 > sub.txt && git add sub.txt && \(commit) sub-init", in: subSrc)
+
+        try initRepository(main)
+        try shell("echo main-v1 > main.txt && git add main.txt && \(commit) main-init", in: main)
+        try shell("git -c protocol.file.allow=always submodule add -q '\(subSrc.path)' sub && \(commit) add-sub", in: main)
+        try shell("git worktree add -q '\(wt.path)' -b wt-branch && git -C '\(wt.path)' -c protocol.file.allow=always submodule update --init -q", in: main)
+
+        // 1. Main repo
+        let mainFile = main.appendingPathComponent("main.txt")
+        let mainRepo = try XCTUnwrap(GitRepository.find(for: mainFile))
+        try "main-v2\n".write(to: mainFile, atomically: true, encoding: .utf8)
+        XCTAssertEqual(mainRepo.root.realPathURL.path, main.realPathURL.path)
+        XCTAssertEqual(status(mainRepo)["main.txt"], .modified)
+        XCTAssertEqual(mainRepo.stage([GitRepository.ChangedFile(path: "main.txt", status: .modified)]).done, ["main.txt"])
+        XCTAssertEqual(mainRepo.unstage([GitRepository.ChangedFile(path: "main.txt", status: .modified, staged: true)]).done, ["main.txt"])
+
+        // 2. Linked worktree
+        let wtFile = wt.appendingPathComponent("main.txt")
+        let wtRepo = try XCTUnwrap(GitRepository.find(for: wtFile))
+        try "wt-v2\n".write(to: wtFile, atomically: true, encoding: .utf8)
+        XCTAssertEqual(wtRepo.root.realPathURL.path, wt.realPathURL.path)
+        XCTAssertEqual(wtRepo.branch, "wt-branch")
+        XCTAssertEqual(status(wtRepo)["main.txt"], .modified)
+        XCTAssertEqual(wtRepo.stage([GitRepository.ChangedFile(path: "main.txt", status: .modified)]).done, ["main.txt"])
+        XCTAssertEqual(wtRepo.unstage([GitRepository.ChangedFile(path: "main.txt", status: .modified, staged: true)]).done, ["main.txt"])
+        XCTAssertEqual(wtRepo.discard([GitRepository.ChangedFile(path: "main.txt", status: .modified)], trash: { _ in }).done, ["main.txt"])
+        XCTAssertEqual(try String(contentsOf: wtFile, encoding: .utf8), "main-v1\n")
+
+        // 3. Direct submodule inside main repo
+        let subFile = main.appendingPathComponent("sub/sub.txt")
+        let subRepo = try XCTUnwrap(GitRepository.find(for: subFile))
+        XCTAssertEqual(subRepo.root.realPathURL.path, main.appendingPathComponent("sub").realPathURL.path)
+        try "sub-v2\n".write(to: subFile, atomically: true, encoding: .utf8)
+        XCTAssertEqual(status(subRepo)["sub.txt"], .modified)
+        XCTAssertEqual(subRepo.discard([GitRepository.ChangedFile(path: "sub.txt", status: .modified)], trash: { _ in }).done, ["sub.txt"])
+        XCTAssertEqual(try String(contentsOf: subFile, encoding: .utf8), "sub-v1\n")
+
+        // 4. Submodule inside linked worktree
+        let wtSubFile = wt.appendingPathComponent("sub/sub.txt")
+        let wtSubRepo = try XCTUnwrap(GitRepository.find(for: wtSubFile))
+        XCTAssertEqual(wtSubRepo.root.realPathURL.path, wt.appendingPathComponent("sub").realPathURL.path)
+        try "wt-sub-v2\n".write(to: wtSubFile, atomically: true, encoding: .utf8)
+        XCTAssertEqual(status(wtSubRepo)["sub.txt"], .modified)
+        XCTAssertEqual(wtSubRepo.stage([GitRepository.ChangedFile(path: "sub.txt", status: .modified)]).done, ["sub.txt"])
+        XCTAssertEqual(wtSubRepo.unstage([GitRepository.ChangedFile(path: "sub.txt", status: .modified, staged: true)]).done, ["sub.txt"])
+    }
+
+    func testUntrustedGitdirPointersAndSymlinksAreRejectedWithoutMutatingTargetRepos() throws {
+        try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
+        let victim = dir.appendingPathComponent("victim")
+        let subSrc = dir.appendingPathComponent("sub-src")
+        let wt = dir.appendingPathComponent("victim-wt")
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: subSrc, withIntermediateDirectories: true)
+
+        try initRepository(subSrc)
+        try shell("echo sub > sub.txt && git add sub.txt && \(commit) sub", in: subSrc)
+
+        try initRepository(victim)
+        try shell("echo clean > a.txt && git add a.txt && \(commit) init", in: victim)
+        try shell("git -c protocol.file.allow=always submodule add -q '\(subSrc.path)' sub && \(commit) add-sub", in: victim)
+        try shell("git worktree add -q '\(wt.path)' -b wt-branch", in: victim)
+
+        // Attack 1: untrusted folder points gitdir: directly to victim/.git
+        let spoofMain = dir.appendingPathComponent("spoof-main")
+        try FileManager.default.createDirectory(at: spoofMain, withIntermediateDirectories: true)
+        try "gitdir: \(victim.path)/.git\n".write(to: spoofMain.appendingPathComponent(".git"), atomically: true, encoding: .utf8)
+        try "spoof\n".write(to: spoofMain.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        XCTAssertNil(GitRepository.find(for: spoofMain.appendingPathComponent("a.txt")))
+
+        // Attack 2: untrusted folder points gitdir: to victim/.git/modules/sub
+        let spoofSub = dir.appendingPathComponent("spoof-sub")
+        try FileManager.default.createDirectory(at: spoofSub, withIntermediateDirectories: true)
+        try "gitdir: \(victim.path)/.git/modules/sub\n".write(to: spoofSub.appendingPathComponent(".git"), atomically: true, encoding: .utf8)
+        try "spoof\n".write(to: spoofSub.appendingPathComponent("sub.txt"), atomically: true, encoding: .utf8)
+        XCTAssertNil(GitRepository.find(for: spoofSub.appendingPathComponent("sub.txt")))
+
+        // Attack 3: untrusted folder points gitdir: to victim/.git/worktrees/wt-branch
+        let spoofWT = dir.appendingPathComponent("spoof-wt")
+        try FileManager.default.createDirectory(at: spoofWT, withIntermediateDirectories: true)
+        try "gitdir: \(victim.path)/.git/worktrees/victim-wt\n".write(to: spoofWT.appendingPathComponent(".git"), atomically: true, encoding: .utf8)
+        try "spoof\n".write(to: spoofWT.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        XCTAssertNil(GitRepository.find(for: spoofWT.appendingPathComponent("a.txt")))
+
+        // Attack 4: .git symlink pointing to victim/.git (including nested inside another valid repo)
+        let hostRepo = dir.appendingPathComponent("host-repo")
+        try FileManager.default.createDirectory(at: hostRepo, withIntermediateDirectories: true)
+        try initRepository(hostRepo)
+        let nestedSym = hostRepo.appendingPathComponent("untrusted-sub")
+        try FileManager.default.createDirectory(at: nestedSym, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: nestedSym.appendingPathComponent(".git"),
+                                                 withDestinationURL: victim.appendingPathComponent(".git"))
+        try "x\n".write(to: nestedSym.appendingPathComponent("x.txt"), atomically: true, encoding: .utf8)
+        XCTAssertNil(GitRepository.find(for: nestedSym.appendingPathComponent("x.txt")))
+
+        // Verify victim repo stayed completely clean.
+        let realVictim = try XCTUnwrap(GitRepository.find(for: victim.appendingPathComponent("a.txt")))
+        XCTAssertTrue(changedFiles(realVictim).isEmpty)
+    }
+
+    func testGitOwnershipMismatchAcrossRootDotGitGitDirAndCommonDirIsRejected() throws {
+        try XCTSkipIf(GitRepository.executable == nil, "git is not installed")
+        let repoDir = dir.appendingPathComponent("repo")
+        let wtDir = dir.appendingPathComponent("wt")
+        try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
+        try initRepository(repoDir)
+        try shell("echo one > a.txt && git add a.txt && \(commit) init", in: repoDir)
+        try shell("git worktree add -q '\(wtDir.path)' -b wt", in: repoDir)
+
+        let wt = try XCTUnwrap(GitRepository.find(for: wtDir.appendingPathComponent("a.txt")))
+        XCTAssertEqual(wt.branch, "wt")
+
+        let actualUID = geteuid()
+        let foreignUID: uid_t = actualUID + 1
+        let savedProvider = GitRepository.currentUIDProvider
+        defer { GitRepository.currentUIDProvider = savedProvider }
+
+        // Direct resolver validates ownership at every layer (root, .git, gitDir, commondir).
+        XCTAssertNotNil(GitRepository.resolveGitDir(at: repoDir, uid: actualUID))
+        XCTAssertNil(GitRepository.resolveGitDir(at: repoDir, uid: foreignUID))
+        XCTAssertNotNil(GitRepository.resolveGitDir(at: wtDir, uid: actualUID))
+        XCTAssertNil(GitRepository.resolveGitDir(at: wtDir, uid: foreignUID))
+
+        // Live GitRepository operations fail closed when simulated UID mismatches the directory owner.
+        GitRepository.currentUIDProvider = { foreignUID }
+        XCTAssertNil(GitRepository.find(for: repoDir.appendingPathComponent("a.txt")))
+        XCTAssertNil(GitRepository.find(for: wtDir.appendingPathComponent("a.txt")))
+        XCTAssertNil(wt.branch)
+        XCTAssertNil(wt.headToken)
+        XCTAssertTrue(changedFiles(wt).isEmpty)
+        XCTAssertFalse(wt.stage([GitRepository.ChangedFile(path: "a.txt", status: .modified)]).failed.isEmpty)
+    }
 }

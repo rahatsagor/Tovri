@@ -178,9 +178,12 @@ if [ $WAIT -eq 1 ]; then
                     exit 1
                 fi
             elif [ $ticks -gt 50 ]; then
-                # Give Tovri time to launch, then stop waiting if it quit or crashed.
-                rm -f "${MARKERS[@]}"
-                exit 0
+                # Wait long enough for launch; if the marker still exists after Tovri exited or crashed,
+                # report failure and clean up so callers such as git core.editor abort safely.
+                [ -e "$m" ] || break
+                echo "tovri: Tovri exited before closing the waited file." >&2
+                cleanup_wait
+                exit 1
             fi
         done
     done

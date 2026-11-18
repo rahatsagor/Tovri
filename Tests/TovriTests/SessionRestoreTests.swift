@@ -9,7 +9,8 @@ final class SessionRestoreTests: XCTestCase {
     private var oldDirectory: URL!
     private var oldBufferDirectory: URL!
     private var oldProvider: (() -> [WindowSession])?
-    private var oldArguments: [String: Any] = [:]
+    private var oldHotExit: Any?
+    private var oldRestoreSession: Any?
     private var store: SessionStore { SessionStore.shared }
 
     override func setUpWithError() throws {
@@ -23,11 +24,12 @@ final class SessionRestoreTests: XCTestCase {
         store.directory = directory.appendingPathComponent("Support", isDirectory: true)
         store.bufferDirectory = store.directory.appendingPathComponent("Buffers", isDirectory: true)
         store.stateProvider = nil
-        oldArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        var arguments = oldArguments
-        arguments[Settings.Key.hotExit] = true
-        arguments[Settings.Key.restoreSession] = true
-        UserDefaults.standard.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        oldHotExit = d.object(forKey: Settings.Key.hotExit)
+        oldRestoreSession = d.object(forKey: Settings.Key.restoreSession)
+        d.set(true, forKey: Settings.Key.hotExit)
+        d.set(true, forKey: Settings.Key.restoreSession)
+        Settings.shared.reloadFromDefaults()
     }
 
     override func tearDownWithError() throws {
@@ -37,7 +39,10 @@ final class SessionRestoreTests: XCTestCase {
         store.stateProvider = oldProvider
         store.directory = oldDirectory
         store.bufferDirectory = oldBufferDirectory
-        UserDefaults.standard.setVolatileDomain(oldArguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        if let oldHotExit { d.set(oldHotExit, forKey: Settings.Key.hotExit) } else { d.removeObject(forKey: Settings.Key.hotExit) }
+        if let oldRestoreSession { d.set(oldRestoreSession, forKey: Settings.Key.restoreSession) } else { d.removeObject(forKey: Settings.Key.restoreSession) }
+        Settings.shared.reloadFromDefaults()
         try FileManager.default.removeItem(at: directory)
     }
 
@@ -234,20 +239,25 @@ final class SessionRestoreTests: XCTestCase {
 /// Uses separate store instances to model one launch writing backups and the next reading them.
 final class SessionManifestRecoveryTests: XCTestCase {
     private var directory: URL!
-    private var oldArguments: [String: Any] = [:]
+    private var oldHotExit: Any?
+    private var oldRestoreSession: Any?
 
     override func setUpWithError() throws {
         directory = URL(fileURLWithPath: "/tmp").appendingPathComponent("TovriManifest-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        oldArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        var arguments = oldArguments
-        arguments[Settings.Key.hotExit] = true
-        arguments[Settings.Key.restoreSession] = true
-        UserDefaults.standard.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        oldHotExit = d.object(forKey: Settings.Key.hotExit)
+        oldRestoreSession = d.object(forKey: Settings.Key.restoreSession)
+        d.set(true, forKey: Settings.Key.hotExit)
+        d.set(true, forKey: Settings.Key.restoreSession)
+        Settings.shared.reloadFromDefaults()
     }
 
     override func tearDownWithError() throws {
-        UserDefaults.standard.setVolatileDomain(oldArguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        if let oldHotExit { d.set(oldHotExit, forKey: Settings.Key.hotExit) } else { d.removeObject(forKey: Settings.Key.hotExit) }
+        if let oldRestoreSession { d.set(oldRestoreSession, forKey: Settings.Key.restoreSession) } else { d.removeObject(forKey: Settings.Key.restoreSession) }
+        Settings.shared.reloadFromDefaults()
         try FileManager.default.removeItem(at: directory)
     }
 

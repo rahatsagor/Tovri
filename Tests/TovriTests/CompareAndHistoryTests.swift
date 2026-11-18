@@ -192,7 +192,7 @@ final class CompareAndHistoryTests: XCTestCase {
     }
 
     func testComparisonsOtherThanCommitsWorkWithGitTurnedOff() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         d.set(false, forKey: Settings.Key.gitChangesAndHistory)
         defer { d.removeObject(forKey: Settings.Key.gitChangesAndHistory) }
         let url = try file("nogit.txt", "x\ny\n")

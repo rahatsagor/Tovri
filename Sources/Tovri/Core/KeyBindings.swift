@@ -96,12 +96,12 @@ final class KeyBindings: ObservableObject {
     private weak var menu: NSMenu?
 
     private init() {
-        overrides = UserDefaults.standard.dictionary(forKey: KeyBindings.storeKey) as? [String: String] ?? [:]
+        overrides = AppRuntime.defaults.dictionary(forKey: KeyBindings.storeKey) as? [String: String] ?? [:]
     }
 
     /// Picks up overrides written to UserDefaults directly, such as by a settings import.
     func reloadFromDefaults() {
-        overrides = UserDefaults.standard.dictionary(forKey: storeKey) as? [String: String] ?? [:]
+        overrides = AppRuntime.defaults.dictionary(forKey: storeKey) as? [String: String] ?? [:]
         apply()
     }
 
@@ -209,7 +209,7 @@ final class KeyBindings: ObservableObject {
     }
 
     private func persist() {
-        UserDefaults.standard.set(overrides, forKey: storeKey)
+        AppRuntime.defaults.set(overrides, forKey: storeKey)
     }
 }
 

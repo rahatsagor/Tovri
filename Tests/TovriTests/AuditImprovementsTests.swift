@@ -35,12 +35,17 @@ final class AuditImprovementsTests: XCTestCase {
         store.bufferDirectory = dir.appendingPathComponent("Buffers")
         defer { store.stateProvider = nil }
 
-        let oldArgs = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        var args = oldArgs
-        args[Settings.Key.hotExit] = true
-        args[Settings.Key.restoreSession] = true
-        UserDefaults.standard.setVolatileDomain(args, forName: UserDefaults.argumentDomain)
-        defer { UserDefaults.standard.setVolatileDomain(oldArgs, forName: UserDefaults.argumentDomain) }
+        let d = AppRuntime.defaults
+        let oldHotExit = d.object(forKey: Settings.Key.hotExit)
+        let oldRestore = d.object(forKey: Settings.Key.restoreSession)
+        d.set(true, forKey: Settings.Key.hotExit)
+        d.set(true, forKey: Settings.Key.restoreSession)
+        Settings.shared.reloadFromDefaults()
+        defer {
+            if let oldHotExit { d.set(oldHotExit, forKey: Settings.Key.hotExit) } else { d.removeObject(forKey: Settings.Key.hotExit) }
+            if let oldRestore { d.set(oldRestore, forKey: Settings.Key.restoreSession) } else { d.removeObject(forKey: Settings.Key.restoreSession) }
+            Settings.shared.reloadFromDefaults()
+        }
 
         let initial = String(repeating: "0123456789abcdef\n", count: 250_000) // ~4.25M UTF-16 units
         let doc = Document()
@@ -501,10 +506,10 @@ final class AuditImprovementsTests: XCTestCase {
         let file = dir.appendingPathComponent("note.txt")
         try "hi".write(to: file, atomically: true, encoding: .utf8)
 
-        let saved = UserDefaults.standard.stringArray(forKey: "recentItems")
+        let saved = AppRuntime.defaults.stringArray(forKey: "recentItems")
         defer {
-            if let saved { UserDefaults.standard.set(saved, forKey: "recentItems") }
-            else { UserDefaults.standard.removeObject(forKey: "recentItems") }
+            if let saved { AppRuntime.defaults.set(saved, forKey: "recentItems") }
+            else { AppRuntime.defaults.removeObject(forKey: "recentItems") }
         }
         RecentFiles.shared.clear()
         RecentFiles.shared.add(file)
@@ -588,8 +593,8 @@ final class AuditImprovementsTests: XCTestCase {
             XCTAssertEqual(panel.findField.stringValue, "\\$item")
             panel.close()
 
-            UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
-            defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+            AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
+            defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled) }
             let inputs = c.openSearchInputs(under: dir)
             XCTAssertTrue(inputs.languages["snippet.txt"] === js)
             var opts = FileSearcher.Options(query: "item", regex: false, caseSensitive: true, wholeWord: true,
@@ -604,10 +609,10 @@ final class AuditImprovementsTests: XCTestCase {
     func testHiddenAlternateShortcutsYieldToCustomKeyBindingsAndMergeInHelp() {
         let recent = NSMenu(title: "Open Recent")
         let menu = MainMenu.build(recentMenu: recent)
-        let saved = UserDefaults.standard.dictionary(forKey: KeyBindings.storeKey)
+        let saved = AppRuntime.defaults.dictionary(forKey: KeyBindings.storeKey)
         defer {
-            if let saved { UserDefaults.standard.set(saved, forKey: KeyBindings.storeKey) }
-            else { UserDefaults.standard.removeObject(forKey: KeyBindings.storeKey) }
+            if let saved { AppRuntime.defaults.set(saved, forKey: KeyBindings.storeKey) }
+            else { AppRuntime.defaults.removeObject(forKey: KeyBindings.storeKey) }
             if let main = NSApp.mainMenu { KeyBindings.shared.install(on: main); KeyBindings.shared.reloadFromDefaults() }
         }
 
@@ -766,15 +771,15 @@ final class AuditImprovementsTests: XCTestCase {
 
     func testClearingVisibleShortcutAlsoClearsHiddenAlternates() throws {
         _ = NSApplication.shared
-        let saved = UserDefaults.standard.dictionary(forKey: KeyBindings.storeKey)
+        let saved = AppRuntime.defaults.dictionary(forKey: KeyBindings.storeKey)
         let originalMenu = NSApp.mainMenu
         defer {
-            if let saved { UserDefaults.standard.set(saved, forKey: KeyBindings.storeKey) }
-            else { UserDefaults.standard.removeObject(forKey: KeyBindings.storeKey) }
+            if let saved { AppRuntime.defaults.set(saved, forKey: KeyBindings.storeKey) }
+            else { AppRuntime.defaults.removeObject(forKey: KeyBindings.storeKey) }
             if let originalMenu { KeyBindings.shared.install(on: originalMenu) }
             KeyBindings.shared.reloadFromDefaults()
         }
-        UserDefaults.standard.removeObject(forKey: KeyBindings.storeKey)
+        AppRuntime.defaults.removeObject(forKey: KeyBindings.storeKey)
         let menu = MainMenu.build(recentMenu: NSMenu(title: "Open Recent"))
         KeyBindings.shared.install(on: menu)
         KeyBindings.shared.reloadFromDefaults()
@@ -829,8 +834,8 @@ final class AuditImprovementsTests: XCTestCase {
 
     func testRecentFilesColdCacheNeverProbesDiskOnMainThread() {
         let testKey = "recentItems.coldTest.\(UUID().uuidString)"
-        defer { UserDefaults.standard.removeObject(forKey: testKey) }
-        UserDefaults.standard.set(["/tmp/one.txt", "/tmp/two-dir", "/tmp/missing.txt"], forKey: testKey)
+        defer { AppRuntime.defaults.removeObject(forKey: testKey) }
+        AppRuntime.defaults.set(["/tmp/one.txt", "/tmp/two-dir", "/tmp/missing.txt"], forKey: testKey)
 
         let probeLock = NSLock()
         var mainThreadProbes = 0
@@ -922,7 +927,7 @@ final class AuditImprovementsTests: XCTestCase {
 
     func testRecentFilesDropsDeletedItemAfterBackgroundProbe() throws {
         let key = "recentItems.followup.\(UUID().uuidString)"
-        defer { UserDefaults.standard.removeObject(forKey: key) }
+        defer { AppRuntime.defaults.removeObject(forKey: key) }
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("tovri-recent-\(UUID().uuidString).txt")
         try "text".write(to: file, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: file) }

@@ -256,7 +256,7 @@ final class WindowRegressionTests: XCTestCase {
 
     func testOpeningAFolderLeavesTheSidebarSettingAlone() throws {
         let dir = try makeFolder()
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let previous = d.object(forKey: Settings.Key.sidebarVisible)
         defer { d.set(previous, forKey: Settings.Key.sidebarVisible) }
         d.set(false, forKey: Settings.Key.sidebarVisible)
@@ -309,8 +309,8 @@ final class WindowRegressionTests: XCTestCase {
     func testFindInFilesStopsAtALimitAndSaysSo() throws {
         let many = String(repeating: "e\n", count: 6000)
         let dir = try makeFolder(["a.txt": many, "b.txt": many, "c.txt": many])
-        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
-        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+        AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
+        defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled) }
         let o = FileSearcher.Options(query: "e", regex: false, caseSensitive: false, wholeWord: false, root: dir, include: [], exclude: [])
         let r = try XCTUnwrap(FileSearcher().run(o))
         XCTAssertTrue(r.limited)
@@ -321,8 +321,8 @@ final class WindowRegressionTests: XCTestCase {
 
     func testFindInFilesSearchesUnsavedText() throws {
         let dir = try makeFolder(["a.txt": "nothing here\n", "b.txt": "needle on disk\n"])
-        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
-        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+        AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
+        defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled) }
         var o = FileSearcher.Options(query: "needle", regex: false, caseSensitive: false, wholeWord: false, root: dir, include: [], exclude: [])
         o.unsaved = ["a.txt": "first\nneedle typed\n", "b.txt": "removed\n"]
         let r = try XCTUnwrap(FileSearcher().run(o))
@@ -382,7 +382,7 @@ final class WindowRegressionTests: XCTestCase {
     func testSaveCleanupsDoNotMutateBufferWhenSaveIsBlockedByExternalChange() throws {
         let dir = try makeFolder(["a.txt": "hello\n"])
         let url = dir.appendingPathComponent("a.txt")
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldTrim = d.object(forKey: Settings.Key.trimTrailingWhitespace)
         let oldNewline = d.object(forKey: Settings.Key.ensureNewlineAtEOF)
         defer {
@@ -418,7 +418,7 @@ final class WindowRegressionTests: XCTestCase {
     }
 
     func testFontWeightChangeUpdatesDocumentAttributesKey() {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let prev = d.object(forKey: Settings.Key.fontWeight)
         defer { d.set(prev, forKey: Settings.Key.fontWeight) }
         let doc = Document()
@@ -453,7 +453,7 @@ final class WindowRegressionTests: XCTestCase {
 
     func testClosingLastTabInOpenFolderKeepsWindowAndAppOpen() throws {
         let dir = try makeFolder(["a.txt": "alpha\n", "b.txt": "beta\n"])
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldQuit = d.object(forKey: Settings.Key.quitWhenLastWindowCloses)
         defer { d.set(oldQuit, forKey: Settings.Key.quitWhenLastWindowCloses) }
         d.set(true, forKey: Settings.Key.quitWhenLastWindowCloses)
@@ -502,7 +502,7 @@ final class WindowRegressionTests: XCTestCase {
 
     func testClosingLastStandaloneFileTabStillClosesWindowWhenQuitOnLastCloseIsEnabled() throws {
         let dir = try makeFolder(["a.txt": "alpha\n", "b.txt": "beta\n"])
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let oldQuit = d.object(forKey: Settings.Key.quitWhenLastWindowCloses)
         let oldHotExit = d.object(forKey: Settings.Key.hotExit)
         defer {

@@ -75,6 +75,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     private var savedLength = 0
     private var savedHash: UInt64?
     private var savedLineEnding: LineEnding = .lf
+    private var savedEncoding: TextEncoding = .utf8
     private var cleanCheckScheduled = false
     private var isBulkLoading = false
     private var wasDirty = false
@@ -625,7 +626,9 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     /// With the file gone from disk, matching the last saved text no longer means nothing would be lost.
     private func matchesSavedVersion() -> Bool {
-        guard !fileMissing, length == savedLength, url == nil || lineEnding == savedLineEnding, let h = savedHash else { return false }
+        guard !fileMissing, length == savedLength,
+              url == nil || (lineEnding == savedLineEnding && encoding == savedEncoding),
+              let h = savedHash else { return false }
         return Document.contentHash(string) == h
     }
 
@@ -635,6 +638,22 @@ final class Document: NSObject, NSTextStorageDelegate {
         savedLength = length
         savedHash = length <= 64_000_000 ? Document.contentHash(string) : nil
         savedLineEnding = lineEnding
+        savedEncoding = encoding
+    }
+
+    /// Changes the encoding the next save writes, as an undoable edit without touching disk.
+    @discardableResult
+    func setEncoding(_ newEncoding: TextEncoding) -> Bool {
+        guard newEncoding != encoding else { return true }
+        guard Document.encode(string, encoding: newEncoding, lineEnding: lineEnding) != nil else { return false }
+        let old = encoding
+        encoding = newEncoding
+        undoManager.registerUndo(withTarget: self) { _ = $0.setEncoding(old) }
+        undoManager.setActionName("Change Encoding")
+        dirtyFlag = !matchesSavedVersion()
+        postStateChange(force: true)
+        SessionStore.shared.setNeedsSave()
+        return true
     }
 
     /// Changes the line endings the next save writes. It is an unsaved, undoable change like an edit.
@@ -882,11 +901,9 @@ final class Document: NSObject, NSTextStorageDelegate {
         do { old = try readAll(fd, path: path) } catch { throw writeError(EIO, path: path) }
         // Copy-on-write volumes need room for the whole new text before the old blocks are freed.
         var fs = statfs()
-        if fstatfs(fd, &fs) == 0 {
-            let (avail, overflow) = UInt64(fs.f_bavail).multipliedReportingOverflow(by: UInt64(fs.f_bsize))
-            if !overflow && avail < UInt64(data.count) {
-                throw writeError(ENOSPC, path: path)
-            }
+        if fstatfs(fd, &fs) == 0,
+           !fitsAvailableSpace(neededBytes: data.count, availableBlocks: UInt64(fs.f_bavail), blockSize: UInt64(fs.f_bsize)) {
+            throw writeError(ENOSPC, path: path)
         }
         var failure = writeAll(data, to: fd)
         if failure == 0 && ftruncate(fd, off_t(data.count)) != 0 { failure = errno }
@@ -895,6 +912,12 @@ final class Document: NSObject, NSTextStorageDelegate {
         if writeAll(old, to: fd) == 0 { _ = ftruncate(fd, off_t(old.count)) }
         _ = fsync(fd)
         throw writeError(failure, path: path)
+    }
+
+    static func fitsAvailableSpace(neededBytes: Int, availableBlocks: UInt64, blockSize: UInt64) -> Bool {
+        guard neededBytes > 0 else { return true }
+        let (avail, overflow) = availableBlocks.multipliedReportingOverflow(by: blockSize)
+        return overflow || avail >= UInt64(neededBytes)
     }
 
     /// Writes all of `data` from the start of the file; returns 0 or the errno of the failure.
@@ -1068,10 +1091,7 @@ final class Document: NSObject, NSTextStorageDelegate {
             let current = self.string.copy() as! NSString
             let version = self.editVersion
             DispatchQueue.global(qos: .utility).async {
-                let old = base.split(separator: "\n", omittingEmptySubsequences: false)
-                let newText = current as String
-                let new = newText.split(separator: "\n", omittingEmptySubsequences: false)
-                let diff = GitRepository.diff(old: old, new: new)
+                let diff = GitRepository.diff(oldText: base, newText: current as String)
                 DispatchQueue.main.async {
                     guard gen == self.gitGeneration else { return }
                     self.gitDiff = diff
@@ -1156,6 +1176,18 @@ final class Document: NSObject, NSTextStorageDelegate {
     func acknowledgeDiskVersion() {
         guard let url else { return }
         diskStamp = DiskStamp(url)
+    }
+
+    /// Keeps unsaved edits in memory after an explicit Git discard restored the file on disk,
+    /// updating `diskStamp` so external-change checks do not raise a contradictory conflict sheet.
+    func syncDiskBaselineAfterDiscard() {
+        guard let url else { return }
+        diskStamp = DiskStamp(url)
+        fileMissing = false
+        dirtyOnlyFromDeletion = false
+        savedHash = nil
+        dirtyFlag = true
+        postStateChange(force: true)
     }
 
     // MARK: Word count
@@ -1409,7 +1441,7 @@ final class RecentFiles {
     }
 
     var paths: [String] {
-        UserDefaults.standard.stringArray(forKey: key) ?? []
+        AppRuntime.defaults.stringArray(forKey: key) ?? []
     }
 
     var items: [URL] {
@@ -1491,11 +1523,11 @@ final class RecentFiles {
 
     func add(_ url: URL) {
         let normalized = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
-        var list = UserDefaults.standard.stringArray(forKey: key) ?? []
+        var list = AppRuntime.defaults.stringArray(forKey: key) ?? []
         list.removeAll { $0 == normalized.path }
         list.insert(normalized.path, at: 0)
         if list.count > maxItems { list = Array(list.prefix(maxItems)) }
-        UserDefaults.standard.set(list, forKey: key)
+        AppRuntime.defaults.set(list, forKey: key)
         lock.lock()
         mutationGeneration += 1
         unprobedAdditions[normalized.path] = (mutationGeneration, normalized)
@@ -1505,19 +1537,19 @@ final class RecentFiles {
             existingCache = Array(c.prefix(maxItems))
         }
         lock.unlock()
-        if key == "recentItems" {
+        if key == "recentItems" && !AppRuntime.isRunningTests {
             NSDocumentController.shared.noteNewRecentDocumentURL(normalized)
         }
     }
 
     func clear() {
-        UserDefaults.standard.removeObject(forKey: key)
+        AppRuntime.defaults.removeObject(forKey: key)
         lock.lock()
         mutationGeneration += 1
         existingCache = []
         unprobedAdditions.removeAll()
         lock.unlock()
-        if key == "recentItems" {
+        if key == "recentItems" && !AppRuntime.isRunningTests {
             NSDocumentController.shared.clearRecentDocuments(nil)
         }
     }

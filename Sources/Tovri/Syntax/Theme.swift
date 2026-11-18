@@ -288,8 +288,7 @@ extension Notification.Name {
 struct CustomThemeStore {
     let directory: URL
 
-    static let shared = CustomThemeStore(directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Tovri", isDirectory: true).appendingPathComponent("Themes", isDirectory: true))
+    static let shared = CustomThemeStore(directory: AppRuntime.supportDirectory.appendingPathComponent("Themes", isDirectory: true))
 
     static let maxFileSize = 256 * 1024
 
@@ -385,7 +384,7 @@ final class ThemeManager: ObservableObject {
     /// Theme settings that name a missing theme, or a light or dark slot holding the other kind
     /// (after a theme was switched between light and dark), go back to Tovri's own themes.
     private func repairSelection() {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         func fix(_ key: String, fallback: String, valid: (Theme) -> Bool) {
             guard let name = d.string(forKey: key) else { return }
             if let t = theme(named: name), valid(t) { return }
@@ -412,7 +411,7 @@ final class ThemeManager: ObservableObject {
     func deleteCustomTheme(named name: String) throws {
         let dark = theme(named: name)?.isDark ?? true
         try store.delete(named: name)
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         if d.string(forKey: Settings.Key.theme) == name { d.set(dark ? "Tovri Dark" : "Tovri Day", forKey: Settings.Key.theme) }
         if d.string(forKey: Settings.Key.lightTheme) == name { d.set("Tovri Day", forKey: Settings.Key.lightTheme) }
         if d.string(forKey: Settings.Key.darkTheme) == name { d.set("Tovri Dark", forKey: Settings.Key.darkTheme) }
@@ -420,7 +419,7 @@ final class ThemeManager: ObservableObject {
     }
 
     private func renameSelection(from old: String, to new: String) {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         for key in [Settings.Key.theme, Settings.Key.lightTheme, Settings.Key.darkTheme] where d.string(forKey: key) == old {
             d.set(new, forKey: key)
         }
@@ -448,6 +447,13 @@ final class ThemeManager: ObservableObject {
         case .picker: pickerPreview = theme
         case .editor: editorPreview = theme
         }
+        NotificationCenter.default.post(name: .themeDidChange, object: nil)
+    }
+
+    func clearPreviews() {
+        guard pickerPreview != nil || editorPreview != nil else { return }
+        pickerPreview = nil
+        editorPreview = nil
         NotificationCenter.default.post(name: .themeDidChange, object: nil)
     }
 }

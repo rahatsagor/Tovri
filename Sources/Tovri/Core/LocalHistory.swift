@@ -35,12 +35,8 @@ final class LocalHistory {
     static var shared = LocalHistory(directory: LocalHistory.defaultDirectory)
 
     static var defaultDirectory: URL {
-        // The tests save many files; their copies must not fill the history of the person running them.
-        if NSClassFromString("XCTestCase") != nil {
-            return FileManager.default.temporaryDirectory.appendingPathComponent("TovriTests-History-\(getpid())", isDirectory: true)
-        }
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("Tovri", isDirectory: true).appendingPathComponent("History", isDirectory: true)
+        // Tests route through AppRuntime.supportDirectory so their copies never fill live history.
+        AppRuntime.supportDirectory.appendingPathComponent("History", isDirectory: true)
     }
 
     let directory: URL

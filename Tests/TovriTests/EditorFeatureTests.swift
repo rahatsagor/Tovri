@@ -15,7 +15,7 @@ final class EditorFeatureTests: XCTestCase {
     override func tearDown() {
         AutoSave.shared.save = nil
         AutoSave.shared.delayOverride = nil
-        for k in touchedKeys { UserDefaults.standard.removeObject(forKey: k) }
+        for k in touchedKeys { AppRuntime.defaults.removeObject(forKey: k) }
         waitForSettings()
         super.tearDown()
     }
@@ -226,7 +226,7 @@ final class EditorFeatureTests: XCTestCase {
         XCTAssertTrue(saved.isEmpty, "only files already on disk are saved automatically")
 
         AutoSave.shared.delayOverride = nil
-        UserDefaults.standard.set(0, forKey: Settings.Key.autoSaveDelay)
+        AppRuntime.defaults.set(0, forKey: Settings.Key.autoSaveDelay)
         let off = try Document(contentsOf: try file("off.txt", "x\n", in: dir))
         edit(off, NSRange(location: 0, length: 0), "edit")
         spin(0.3)
@@ -242,7 +242,7 @@ final class EditorFeatureTests: XCTestCase {
         XCTAssertEqual(Settings.parseRulers(""), [])
         XCTAssertEqual(Settings.formatRulers([80, 120]), "80, 120")
 
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         d.set(100, forKey: Settings.Key.rulerColumn)
         XCTAssertEqual(Settings.shared.rulerColumns, [100], "a single ruler from an older version still shows")
         Settings.shared.rulersText = "120, 80"
@@ -263,7 +263,7 @@ final class EditorFeatureTests: XCTestCase {
     }
 
     func testIndentationPrecedence() throws {
-        let d = UserDefaults.standard
+        let d = AppRuntime.defaults
         let dir = try temporaryFolder()
         let fourSpaces = "func a() {\n    b()\n    if c {\n        d()\n    }\n}\n"
 
@@ -310,7 +310,7 @@ final class EditorFeatureTests: XCTestCase {
     func testLigatureSettingChangesTextAttributes() {
         let doc = document("a -> b != c")
         XCTAssertEqual(doc.textStorage.attribute(.ligature, at: 0, effectiveRange: nil) as? Int, 0, "off by default")
-        UserDefaults.standard.set(true, forKey: Settings.Key.fontLigatures)
+        AppRuntime.defaults.set(true, forKey: Settings.Key.fontLigatures)
         XCTAssertEqual(Settings.shared.ligatureAttribute, 1)
         NotificationCenter.default.post(name: .settingsDidChange, object: nil)
         XCTAssertEqual(doc.textStorage.attribute(.ligature, at: 0, effectiveRange: nil) as? Int, 1)
@@ -318,14 +318,14 @@ final class EditorFeatureTests: XCTestCase {
     }
 
     func testFontWeightChangesTheFontButNotTheLineHeight() {
-        UserDefaults.standard.set("", forKey: Settings.Key.fontName)
+        AppRuntime.defaults.set("", forKey: Settings.Key.fontName)
         waitForSettings()
-        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.fontName) }
+        defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.fontName) }
         let regular = Settings.shared.font
         let regularLayout = TovriLayoutManager()
         regularLayout.configure(font: regular, lineHeightMultiple: 1.4)
 
-        UserDefaults.standard.set(Settings.FontWeight.semibold.rawValue, forKey: Settings.Key.fontWeight)
+        AppRuntime.defaults.set(Settings.FontWeight.semibold.rawValue, forKey: Settings.Key.fontWeight)
         let deadline = Date().addingTimeInterval(2)
         while Settings.shared.font == regular && Date() < deadline { spin(0.02) }
         let semibold = Settings.shared.font

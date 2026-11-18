@@ -107,8 +107,8 @@ final class DeepAuditRegressionTests: XCTestCase {
             ["*.swift", "tests/*.swift"]
         )
 
-        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
-        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+        AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
+        defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled) }
 
         let dir = try makeTempDir("tovri-search-patterns-")
         let logs = dir.appendingPathComponent("logs")
@@ -139,8 +139,8 @@ final class DeepAuditRegressionTests: XCTestCase {
     }
 
     func testReplaceInFilesNormalizesCarriageReturnsForDocumentsAndCRLFOnDisk() throws {
-        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
-        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+        AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
+        defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled) }
 
         let dir = try makeTempDir("tovri-replace-crlf-")
         let diskFile = dir.appendingPathComponent("disk.txt")
@@ -211,10 +211,10 @@ final class DeepAuditRegressionTests: XCTestCase {
         _ = NSApplication.shared
         let recent = NSMenu(title: "Open Recent")
         let menu = MainMenu.build(recentMenu: recent)
-        let saved = UserDefaults.standard.dictionary(forKey: KeyBindings.storeKey)
+        let saved = AppRuntime.defaults.dictionary(forKey: KeyBindings.storeKey)
         defer {
-            if let saved { UserDefaults.standard.set(saved, forKey: KeyBindings.storeKey) }
-            else { UserDefaults.standard.removeObject(forKey: KeyBindings.storeKey) }
+            if let saved { AppRuntime.defaults.set(saved, forKey: KeyBindings.storeKey) }
+            else { AppRuntime.defaults.removeObject(forKey: KeyBindings.storeKey) }
             if let main = NSApp.mainMenu {
                 KeyBindings.shared.install(on: main)
                 KeyBindings.shared.reloadFromDefaults()

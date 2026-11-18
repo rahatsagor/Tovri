@@ -812,11 +812,23 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         alert.addButton(withTitle: "Move to Trash")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        NSWorkspace.shared.recycle([node.url]) { [weak self] _, error in
+        recycleNode(node)
+    }
+
+    func recycleNode(
+        _ node: FileNode,
+        recycle: @escaping ([URL], @escaping ([URL: URL], (any Error)?) -> Void) -> Void = NSWorkspace.shared.recycle,
+        errorHandler: ((any Error) -> Void)? = nil
+    ) {
+        recycle([node.url]) { [weak self] _, error in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if let error { self.showError(error) }
-                self.reloadDirectory(node.url.deletingLastPathComponent())
+                if let parent = node.parent {
+                    self.refresh(node: parent, recursive: false)
+                } else {
+                    self.reloadDirectory(node.url.deletingLastPathComponent())
+                }
+                if let error { (errorHandler ?? self.showError)(error) }
             }
         }
     }
@@ -836,15 +848,15 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     @objc private func copyPath(_ sender: Any?) {
         guard let n = node(for: sender) ?? root else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(n.url.path, forType: .string)
+        AppRuntime.pasteboard.clearContents()
+        AppRuntime.pasteboard.setString(n.url.path, forType: .string)
     }
 
     @objc private func copyRelativePath(_ sender: Any?) {
         guard let n = node(for: sender) ?? root, let r = root else { return }
         let rel = n.url.path.hasPrefix(r.path + "/") ? String(n.url.path.dropFirst(r.path.count + 1)) : n.name
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(rel, forType: .string)
+        AppRuntime.pasteboard.clearContents()
+        AppRuntime.pasteboard.setString(rel, forType: .string)
     }
 
     @objc private func findInFolder(_ sender: Any?) {
@@ -857,7 +869,10 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         refreshTree()
     }
     private func reloadDirectory(_ url: URL) {
-        if let n = nodesByPath[norm(url.path)] { refresh(node: n, recursive: false) }
+        let p = norm(url.path)
+        let real = norm(url.realPathURL.path)
+        let target = nodesByPath[p] ?? nodesByPath[real] ?? (root.flatMap { norm($0.url.realPathURL.path) == real ? $0 : nil })
+        if let n = target { refresh(node: n, recursive: false) }
     }
 }
 

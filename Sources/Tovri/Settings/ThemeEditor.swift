@@ -202,7 +202,7 @@ struct ThemeEditor: View {
             return
         }
         if originalName == nil {
-            let s = UserDefaults.standard
+            let s = AppRuntime.defaults
             if s.bool(forKey: Settings.Key.followSystemAppearance) {
                 s.set(d.name, forKey: d.dark ? Settings.Key.darkTheme : Settings.Key.lightTheme)
             } else {

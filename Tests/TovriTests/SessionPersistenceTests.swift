@@ -5,7 +5,8 @@ import XCTest
 final class SessionPersistenceTests: XCTestCase {
     private var directory: URL!
     private var store: SessionStore!
-    private var oldArguments: [String: Any] = [:]
+    private var oldHotExit: Any?
+    private var oldRestoreSession: Any?
 
     override func setUpWithError() throws {
         _ = NSApplication.shared
@@ -14,17 +15,21 @@ final class SessionPersistenceTests: XCTestCase {
         store = SessionStore()
         store.directory = directory
         store.bufferDirectory = directory.appendingPathComponent("Buffers")
-        oldArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        var arguments = oldArguments
-        arguments[Settings.Key.hotExit] = true
-        arguments[Settings.Key.restoreSession] = true
-        UserDefaults.standard.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        oldHotExit = d.object(forKey: Settings.Key.hotExit)
+        oldRestoreSession = d.object(forKey: Settings.Key.restoreSession)
+        d.set(true, forKey: Settings.Key.hotExit)
+        d.set(true, forKey: Settings.Key.restoreSession)
+        Settings.shared.reloadFromDefaults()
     }
 
     override func tearDownWithError() throws {
         store.stateProvider = nil
         store = nil
-        UserDefaults.standard.setVolatileDomain(oldArguments, forName: UserDefaults.argumentDomain)
+        let d = AppRuntime.defaults
+        if let oldHotExit { d.set(oldHotExit, forKey: Settings.Key.hotExit) } else { d.removeObject(forKey: Settings.Key.hotExit) }
+        if let oldRestoreSession { d.set(oldRestoreSession, forKey: Settings.Key.restoreSession) } else { d.removeObject(forKey: Settings.Key.restoreSession) }
+        Settings.shared.reloadFromDefaults()
         try FileManager.default.removeItem(at: directory)
     }
 

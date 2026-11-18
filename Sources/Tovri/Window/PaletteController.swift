@@ -240,8 +240,8 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         let prev = previousResponder
         previousResponder = nil
         listTag = nil
-        backdrop.removeFromSuperview()
         if cancelled { cancelShownList() }
+        backdrop.removeFromSuperview()
         didPreview = false
         onCancel = nil
         restore = nil

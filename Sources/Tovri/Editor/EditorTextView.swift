@@ -53,7 +53,7 @@ final class EditorTextView: NSTextView {
 
     static let fullLinePasteboardType = NSPasteboard.PasteboardType("app.tovri.fullline")
     /// Pasteboard used by editor copy, cut, and paste; tests can swap in a private pasteboard.
-    static var pasteboard: NSPasteboard = .general
+    static var pasteboard: NSPasteboard = AppRuntime.pasteboard
 
     var tovriLayoutManager: TovriLayoutManager { layoutManager as! TovriLayoutManager }
     var lineHeight: CGFloat { tovriLayoutManager.lineHeight }
@@ -1802,5 +1802,23 @@ final class EditorTextView: NSTextView {
             }
         }
         if !old.isEmpty || !occurrenceRanges.isEmpty { setNeedsDisplay(visibleRect) }
+    }
+
+    /// Drops or clamps transient selection/highlight ranges when another split pane shrinks the shared document.
+    func clampTransientRangesToDocumentLength() {
+        let len = document.length
+        if !extraSelections.isEmpty {
+            let clamped = extraSelections.compactMap { r -> NSRange? in
+                guard r.location <= len else { return nil }
+                return NSRange(location: r.location, length: min(r.length, len - r.location))
+            }
+            if clamped != extraSelections { extraSelections = clamped }
+        }
+        if !occurrenceRanges.isEmpty {
+            occurrenceRanges = occurrenceRanges.filter { $0.length > 0 && NSMaxRange($0) <= len }
+        }
+        if let (a, b) = bracketPair, a >= len || b >= len {
+            bracketPair = nil
+        }
     }
 }

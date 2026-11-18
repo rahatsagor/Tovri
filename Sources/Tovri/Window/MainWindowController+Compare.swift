@@ -9,7 +9,7 @@ extension MainWindowController {
     static let maxComparedSize = 20_000_000
     static let localHistoryListTag = "localHistory"
     /// Where Compare with Clipboard reads from; tests use a private pasteboard.
-    static var comparisonPasteboard = NSPasteboard.general
+    static var comparisonPasteboard = AppRuntime.pasteboard
 
     enum ComparisonReadProblem: Error, Equatable {
         case notAFile, tooLarge, binary, unreadable

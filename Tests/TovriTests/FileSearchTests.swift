@@ -52,8 +52,8 @@ final class FileSearchTests: XCTestCase {
         printf 'ignored.txt\\n' > .gitignore
         echo needle > ignored.txt && echo needle > tracked.txt && git add tracked.txt
         """, in: root)
-        UserDefaults.standard.set(false, forKey: Settings.Key.gitEnabled)
-        defer { UserDefaults.standard.removeObject(forKey: Settings.Key.gitEnabled) }
+        AppRuntime.defaults.set(false, forKey: Settings.Key.gitEnabled)
+        defer { AppRuntime.defaults.removeObject(forKey: Settings.Key.gitEnabled) }
         let result = try search(root)
         XCTAssertEqual(result.files, 2)
         XCTAssertTrue(result.text.contains("ignored.txt:"), "Git's ignore list was used with Git turned off")

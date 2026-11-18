@@ -93,17 +93,27 @@ final class InlineDiff {
         guard delta != 0 else { return false }
         var above: [Int: Int] = [:]
         var lines: [Int: [String]] = [:]
+        var trailing = gaps.trailing
         if let t = removed[InlineDiff.trailingKey] { lines[InlineDiff.trailingKey] = t }
         for line in gaps.above.keys.sorted() {
             let n = gaps.above[line] ?? 0
             let to = line > a + r ? line + delta : (line > a ? a + 1 : line)
-            above[to, default: 0] += n
-            lines[to, default: []] += removed[line] ?? []
+            if let lc = lineCount, to >= lc {
+                trailing += n
+                lines[InlineDiff.trailingKey, default: []] += removed[line] ?? []
+            } else {
+                above[to, default: 0] += n
+                lines[to, default: []] += removed[line] ?? []
+            }
         }
         gaps.above = above
+        gaps.trailing = trailing
         removed = lines
         rendered.removeAll()
         changed.shift(startingAt: a + r + 1, by: delta)
+        if let lc = lineCount, let last = changed.last, last >= lc {
+            changed.remove(integersIn: lc...last)
+        }
         return true
     }
 

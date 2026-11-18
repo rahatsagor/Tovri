@@ -261,20 +261,32 @@ final class GitRepository {
         return major > 2 || (major == 2 && minor >= 31)
     }
 
+    struct ResolvedGitDirs: Equatable {
+        let workTree: URL
+        let gitDir: URL
+        let commonDir: URL
+    }
+
+    static var currentUIDProvider: () -> uid_t = { geteuid() }
+
     private init(root: URL) { self.root = root }
 
-    /// Finds the repository containing `url` by walking up to the nearest `.git`. The `.git` is
-    /// checked every time, so a repository that was deleted or moved stops being found.
+    /// Finds the repository containing `url` by walking up to the nearest `.git`. Ownership and
+    /// bindings are re-validated on every lookup so moved, deleted, or untrusted `.git` entries
+    /// are rejected even after a repository was previously cached.
     static func find(for url: URL) -> GitRepository? {
         var dir = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
-        let fm = FileManager.default
         for _ in 0..<64 {
-            if fm.fileExists(atPath: dir.appendingPathComponent(".git").path) {
-                let key = dir.standardizedFileURL.path
+            let dotGit = dir.appendingPathComponent(".git")
+            var info = stat()
+            if lstat(dotGit.path, &info) == 0 {
+                guard resolveGitDir(at: dir) != nil else { return nil }
+                let root = dir.standardizedFileURL
+                let key = root.path
                 cacheLock.lock()
                 defer { cacheLock.unlock() }
                 if let r = cache[key] { return r }
-                let r = GitRepository(root: dir.standardizedFileURL)
+                let r = GitRepository(root: root)
                 cache[key] = r
                 return r
             }
@@ -290,38 +302,186 @@ final class GitRepository {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Resolves `.git` safely, validating `gitdir:` files against non-regular targets,
-    /// cross-user hijacking, and missing repository metadata directories.
-    private static func resolveGitDir(at root: URL) -> URL? {
-        let dotGit = root.appendingPathComponent(".git")
-        var linkInfo = stat()
-        guard lstat(dotGit.path, &linkInfo) == 0 else { return nil }
-        var targetInfo = stat()
-        guard stat(dotGit.path, &targetInfo) == 0 else { return nil }
-        let type = targetInfo.st_mode & S_IFMT
-        if type == S_IFDIR { return dotGit }
-        guard type == S_IFREG, let s = readSmallText(dotGit), s.hasPrefix("gitdir:") else { return nil }
-        let raw = s.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return nil }
-        let candidate = URL(fileURLWithPath: raw, relativeTo: root).standardizedFileURL
-        var dirInfo = stat()
-        guard stat(candidate.path, &dirInfo) == 0,
-              (dirInfo.st_mode & S_IFMT) == S_IFDIR else { return nil }
-        let uid = getuid()
-        guard dirInfo.st_uid == uid || dirInfo.st_uid == 0 || dirInfo.st_uid == targetInfo.st_uid else { return nil }
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: candidate.appendingPathComponent("HEAD").path),
-              fm.fileExists(atPath: candidate.appendingPathComponent("objects").path)
-                || fm.fileExists(atPath: candidate.appendingPathComponent("commondir").path) else { return nil }
-        return candidate
+    private static func isOwnedDirectory(_ url: URL, uid: uid_t) -> Bool {
+        var info = stat()
+        return stat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR && info.st_uid == uid
     }
 
-    private var gitDir: URL {
-        GitRepository.resolveGitDir(at: root) ?? root.appendingPathComponent(".git")
+    private static func isOwnedRegularFile(_ url: URL, uid: uid_t) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == uid
+    }
+
+    private static func hasValidHead(in dir: URL, uid: uid_t) -> Bool {
+        let head = dir.appendingPathComponent("HEAD")
+        var info = stat()
+        guard lstat(head.path, &info) == 0, info.st_uid == uid else { return false }
+        let type = info.st_mode & S_IFMT
+        if type == S_IFREG { return true }
+        guard type == S_IFLNK else { return false }
+        let target = head.realPathURL
+        let refsPrefix = dir.appendingPathComponent("refs").realPathURL.path + "/"
+        return target.path.hasPrefix(refsPrefix) && isOwnedRegularFile(target, uid: uid)
+    }
+
+    /// Parses `core.worktree` from an owned repository `config` file (bounded regular-file read).
+    static func parseCoreWorktree(in configURL: URL, uid: uid_t) -> String? {
+        guard isOwnedRegularFile(configURL, uid: uid),
+              let content = readSmallText(configURL, limit: 262_144) else { return nil }
+        var inCoreSection = false
+        var result: String?
+
+        func parseValue(_ raw: Substring) -> String? {
+            var s = raw.drop(while: { $0 == " " || $0 == "\t" })
+            var out = ""
+            var lastNonSpaceCount = 0
+            var inQuotes = false
+            var escaped = false
+            while let ch = s.first {
+                s = s.dropFirst()
+                if escaped {
+                    switch ch {
+                    case "n": out.append("\n")
+                    case "t": out.append("\t")
+                    case "b": out.append("\u{08}")
+                    default: out.append(ch)
+                    }
+                    lastNonSpaceCount = out.count
+                    escaped = false
+                    continue
+                }
+                if ch == "\\" {
+                    escaped = true
+                    continue
+                }
+                if ch == "\"" {
+                    inQuotes.toggle()
+                    lastNonSpaceCount = out.count
+                    continue
+                }
+                if !inQuotes && (ch == "#" || ch == ";") {
+                    break
+                }
+                out.append(ch)
+                if inQuotes || (ch != " " && ch != "\t" && ch != "\r") {
+                    lastNonSpaceCount = out.count
+                }
+            }
+            guard !inQuotes else { return nil }
+            let trimmed = String(out.prefix(lastNonSpaceCount))
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        for rawLine in content.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            var line = rawLine.drop(while: { $0 == " " || $0 == "\t" })
+            if line.isEmpty || line.first == "#" || line.first == ";" { continue }
+            if line.first == "[" {
+                guard let close = line.firstIndex(of: "]") else { inCoreSection = false; continue }
+                let header = String(line[line.index(after: line.startIndex)..<close]).trimmingCharacters(in: .whitespaces)
+                inCoreSection = !header.contains("\"") && header.lowercased() == "core"
+                line = line[line.index(after: close)...].drop(while: { $0 == " " || $0 == "\t" })
+                if line.isEmpty || line.first == "#" || line.first == ";" { continue }
+            }
+            guard inCoreSection, let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+            if key == "worktree" {
+                result = parseValue(line[line.index(after: eq)...])
+            }
+        }
+        return result
+    }
+
+    /// Resolves `.git` safely, requiring current-user ownership across `root`, `.git`, `gitDir`,
+    /// and `commondir`, rejecting symlinked/non-regular `.git` entries, and requiring bidirectional
+    /// binding for `gitdir:` pointers (linked worktrees or enclosing-repo submodules).
+    static func resolveGitDir(at root: URL, uid: uid_t = currentUIDProvider(), depth: Int = 0) -> ResolvedGitDirs? {
+        guard depth <= 8 else { return nil }
+        guard isOwnedDirectory(root, uid: uid) else { return nil }
+        let realRoot = root.realPathURL
+        guard isOwnedDirectory(realRoot, uid: uid) else { return nil }
+        let dotGit = realRoot.appendingPathComponent(".git")
+        var dotInfo = stat()
+        guard lstat(dotGit.path, &dotInfo) == 0, dotInfo.st_uid == uid else { return nil }
+        let dotType = dotInfo.st_mode & S_IFMT
+        if dotType == S_IFDIR {
+            let realGitDir = dotGit.realPathURL
+            guard isOwnedDirectory(realGitDir, uid: uid) else { return nil }
+            return ResolvedGitDirs(workTree: realRoot, gitDir: realGitDir, commonDir: realGitDir)
+        }
+        guard dotType == S_IFREG, let s = readSmallText(dotGit), s.hasPrefix("gitdir:") else { return nil }
+        let raw = s.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        let realGitDir = URL(fileURLWithPath: raw, relativeTo: realRoot).realPathURL
+        guard isOwnedDirectory(realGitDir, uid: uid),
+              hasValidHead(in: realGitDir, uid: uid) else { return nil }
+
+        let commonFile = realGitDir.appendingPathComponent("commondir")
+        var commonInfo = stat()
+        let realCommonDir: URL
+        if lstat(commonFile.path, &commonInfo) == 0 {
+            guard (commonInfo.st_mode & S_IFMT) == S_IFREG,
+                  commonInfo.st_uid == uid,
+                  let commonRaw = readSmallText(commonFile)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !commonRaw.isEmpty else { return nil }
+            realCommonDir = URL(fileURLWithPath: commonRaw, relativeTo: realGitDir).realPathURL
+            guard isOwnedDirectory(realCommonDir, uid: uid) else { return nil }
+        } else if errno == ENOENT {
+            realCommonDir = realGitDir
+        } else {
+            return nil
+        }
+        guard isOwnedDirectory(realCommonDir.appendingPathComponent("objects"), uid: uid) else { return nil }
+
+        // (a) Linked worktree: commondir points to main/common repo, gitdir lives under
+        // <commonDir>/worktrees/<name>, and its back-link `gitdir` file resolves back to `dotGit`.
+        let dotGitReal = dotGit.realPathURL
+        let worktreesParent = realGitDir.deletingLastPathComponent()
+        if realCommonDir.path != realGitDir.path,
+           worktreesParent.lastPathComponent == "worktrees",
+           worktreesParent.deletingLastPathComponent().realPathURL.path == realCommonDir.path {
+            let backLink = realGitDir.appendingPathComponent("gitdir")
+            if isOwnedRegularFile(backLink, uid: uid),
+               let backTarget = readSmallText(backLink)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !backTarget.isEmpty,
+               URL(fileURLWithPath: backTarget, relativeTo: realGitDir).realPathURL.path == dotGitReal.path {
+                return ResolvedGitDirs(workTree: realRoot, gitDir: realGitDir, commonDir: realCommonDir)
+            }
+            return nil
+        }
+
+        // (b) Submodule (normal, nested, or inside a linked worktree): core.worktree binds
+        // `realGitDir` to `realRoot`, and `realGitDir` resides inside an enclosing repo's `modules/`.
+        if realCommonDir.path == realGitDir.path,
+           let wt = parseCoreWorktree(in: realGitDir.appendingPathComponent("config"), uid: uid),
+           URL(fileURLWithPath: wt, relativeTo: realGitDir).realPathURL.path == realRoot.path {
+            var anc = realRoot.deletingLastPathComponent()
+            for _ in 0..<64 {
+                let ancDotGit = anc.appendingPathComponent(".git")
+                var ancInfo = stat()
+                if lstat(ancDotGit.path, &ancInfo) == 0 {
+                    guard let parent = resolveGitDir(at: anc, uid: uid, depth: depth + 1) else { return nil }
+                    let modGit = parent.gitDir.appendingPathComponent("modules").realPathURL.path + "/"
+                    let modCommon = parent.commonDir.appendingPathComponent("modules").realPathURL.path + "/"
+                    if realGitDir.path.hasPrefix(modGit) || realGitDir.path.hasPrefix(modCommon) {
+                        return ResolvedGitDirs(workTree: realRoot, gitDir: realGitDir, commonDir: realCommonDir)
+                    }
+                    return nil
+                }
+                let next = anc.deletingLastPathComponent()
+                if next.path == anc.path { break }
+                anc = next
+            }
+        }
+        return nil
+    }
+
+    private var resolvedDirs: ResolvedGitDirs? {
+        GitRepository.resolveGitDir(at: root)
     }
 
     var branch: String? {
-        guard let head = GitRepository.readSmallText(gitDir.appendingPathComponent("HEAD")) else { return nil }
+        guard let dir = resolvedDirs?.gitDir,
+              let head = GitRepository.readSmallText(dir.appendingPathComponent("HEAD")) else { return nil }
         let t = head.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.hasPrefix("ref: refs/heads/") { return String(t.dropFirst("ref: refs/heads/".count)) }
         return t.isEmpty ? nil : String(t.prefix(7))
@@ -335,18 +495,15 @@ final class GitRepository {
     /// Identifies the commit HEAD points at by reading .git directly, without running git. Nil when
     /// it can't be worked out cheaply; callers then treat HEAD as changed.
     var headToken: String? {
-        guard let dir = GitRepository.resolveGitDir(at: root) else { return nil }
+        guard let dirs = resolvedDirs else { return nil }
+        let dir = dirs.gitDir
         guard let head = GitRepository.readSmallText(dir.appendingPathComponent("HEAD"))?
             .trimmingCharacters(in: .whitespacesAndNewlines), !head.isEmpty else { return nil }
         guard head.hasPrefix("ref: ") else { return head }
         let ref = String(head.dropFirst(5))
         guard GitRepository.isValidRefPath(ref) else { return nil }
         // Linked worktrees keep their HEAD here but share refs with the main repository.
-        var refDirs = [dir]
-        if let common = GitRepository.readSmallText(dir.appendingPathComponent("commondir"))?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !common.isEmpty {
-            refDirs.append(URL(fileURLWithPath: common, relativeTo: dir).standardizedFileURL)
-        }
+        let refDirs = dirs.commonDir.path == dir.path ? [dir] : [dir, dirs.commonDir]
         for d in refDirs {
             if let sha = GitRepository.readSmallText(d.appendingPathComponent(ref))?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !sha.isEmpty { return head + " " + sha }
@@ -453,7 +610,10 @@ final class GitRepository {
 
     private func filterCacheStamp(extraFiles: [URL] = [], includeHead: Bool = false) -> FilterCacheStamp {
         let env = GitRepository.userEnvironment
-        let dir = gitDir
+        guard let dirs = resolvedDirs else {
+            return FilterCacheStamp(env: env, files: [], headToken: nil)
+        }
+        let dir = dirs.gitDir
         var paths = GitRepository.defaultSystemConfigPaths
         if let sys = env["GIT_CONFIG_SYSTEM"], !sys.isEmpty {
             paths.append(URL(fileURLWithPath: sys))
@@ -466,11 +626,9 @@ final class GitRepository {
         }
         paths.append(dir.appendingPathComponent("config"))
         paths.append(dir.appendingPathComponent("config.worktree"))
-        if let common = GitRepository.readSmallText(dir.appendingPathComponent("commondir"))?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !common.isEmpty {
-            let commonDir = URL(fileURLWithPath: common, relativeTo: dir).standardizedFileURL
-            paths.append(commonDir.appendingPathComponent("config"))
-            paths.append(commonDir.appendingPathComponent("config.worktree"))
+        if dirs.commonDir.path != dir.path {
+            paths.append(dirs.commonDir.appendingPathComponent("config"))
+            paths.append(dirs.commonDir.appendingPathComponent("config.worktree"))
         }
         if let home = env["HOME"], !home.isEmpty {
             let homeURL = URL(fileURLWithPath: home, isDirectory: true)
@@ -536,7 +694,7 @@ final class GitRepository {
         return URL(fileURLWithPath: raw, relativeTo: originFile.deletingLastPathComponent()).standardizedFileURL
     }
 
-    private struct ParsedOverrides {
+    struct ParsedOverrides {
         var filters = Set<String>()
         var hooks = Set<String>()
         var extraFiles: [URL] = []
@@ -544,7 +702,7 @@ final class GitRepository {
         var uncacheable = false
     }
 
-    private static func parseConfigOverrides(_ configOutput: Data, home: String?) -> ParsedOverrides? {
+    static func parseConfigOverrides(_ configOutput: Data, home: String?) -> ParsedOverrides? {
         var out = ParsedOverrides()
         var parts = configOutput.split(separator: 0, omittingEmptySubsequences: false)
         if parts.last?.isEmpty == true { parts.removeLast() }
@@ -633,11 +791,11 @@ final class GitRepository {
     private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0],
                         maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
         guard let git = GitRepository.executable,
-              let gd = GitRepository.resolveGitDir(at: root) else { return nil }
-        // A repository's core.worktree could point git at another folder, and GIT_DIR can override
-        // discovery; fix both `--git-dir` and `--work-tree` to what we validated.
+              let dirs = resolvedDirs else { return nil }
+        // Canonical `--git-dir` and `--work-tree` bind git to the validated targets, preventing
+        // core.worktree, GIT_DIR, or symlink swaps from redirecting git commands.
         return GitRepository.runProcess(URL(fileURLWithPath: git),
-                                        ["--git-dir=" + gd.path, "--work-tree=" + root.path, "-C", root.path] + args,
+                                        ["--git-dir=" + dirs.gitDir.path, "--work-tree=" + dirs.workTree.path, "-C", dirs.workTree.path] + args,
                                         environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses,
                                         maxOutputBytes: maxOutputBytes)
     }
@@ -1439,6 +1597,16 @@ final class GitRepository {
     /// interning and Patience unique-line anchors so large files diff quickly without quadratic blowup.
     static func diff(old: [Substring], new: [Substring]) -> LineDiff {
         diffElements(old: old, new: new, makeString: String.init)
+    }
+
+    /// String-level diff avoiding phantom blank-line modifications when adding text without a
+    /// trailing newline to an empty baseline.
+    static func diff(oldText: String, newText: String) -> LineDiff {
+        let oldLines: [Substring] = oldText.isEmpty && !newText.isEmpty && !newText.hasSuffix("\n")
+            ? []
+            : oldText.split(separator: "\n", omittingEmptySubsequences: false)
+        let newLines = newText.split(separator: "\n", omittingEmptySubsequences: false)
+        return diff(old: oldLines, new: newLines)
     }
 
     private static func diffElements<T: Hashable>(old: [T], new: [T], makeString: (T) -> String) -> LineDiff {

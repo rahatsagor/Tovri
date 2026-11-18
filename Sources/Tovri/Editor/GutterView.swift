@@ -255,13 +255,37 @@ final class GutterView: NSView {
         case selectLine(Int)
     }
 
+    /// Resolves the 0-based document line at `localPoint` (in `GutterView` coordinates) without
+    /// querying invalid glyph indices on empty buffers or the trailing extra line fragment.
+    static func line(at localPoint: NSPoint, in tv: EditorTextView, from gutter: GutterView? = nil) -> Int? {
+        guard let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
+        let doc = tv.document
+        guard doc.length > 0 else { return 0 }
+        let p = tv.convert(localPoint, from: gutter ?? tv.editor?.gutter)
+        let y = p.y - tv.textContainerOrigin.y
+        lm.ensureLayout(forCharacterRange: NSRange(location: doc.length - 1, length: 1))
+        let extra = lm.extraLineFragmentRect
+        if extra.height > 0 && y >= extra.minY {
+            return max(0, doc.lines.count - 1)
+        }
+        var fraction: CGFloat = 0
+        let glyph = lm.glyphIndex(for: NSPoint(x: 0, y: max(0, y)), in: tc, fractionOfDistanceThroughGlyph: &fraction)
+        guard lm.isValidGlyphIndex(glyph) else { return max(0, doc.lines.count - 1) }
+        let charIndex = min(lm.characterIndexForGlyph(at: glyph), doc.length)
+        return doc.lines.line(containing: charIndex)
+    }
+
+    private static func lineSelectionRange(at localPoint: NSPoint, in tv: EditorTextView, gutter: GutterView) -> NSRange? {
+        guard let line = line(at: localPoint, in: tv, from: gutter) else { return nil }
+        let doc = tv.document
+        return tv.visualLineBlock(doc.lines.fullRange(of: line, textLength: doc.length))
+    }
+
     /// Resolves what clicking at `localPoint` (in `GutterView` coordinates) acts on.
     func hitAction(at localPoint: NSPoint) -> HitAction? {
-        guard let tv = textView, let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
+        guard let tv = textView, let selRange = GutterView.lineSelectionRange(at: localPoint, in: tv, gutter: self) else { return nil }
+        let startLine = tv.document.lines.line(containing: selRange.location)
         let p = tv.convert(localPoint, from: self)
-        let glyph = lm.glyphIndex(for: NSPoint(x: 0, y: p.y - tv.textContainerOrigin.y), in: tc)
-        let charIndex = lm.characterIndexForGlyph(at: glyph)
-        let startLine = tv.document.lines.line(containing: charIndex)
         let x = localPoint.x
         if x < 14, let editor = tv.editor {
             // A deletion marker straddles the boundary, so a click just above a line also counts.
@@ -278,10 +302,9 @@ final class GutterView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard let tv = textView, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
+        guard let tv = textView else { return }
         let localPoint = convert(event.locationInWindow, from: nil)
         guard let action = hitAction(at: localPoint) else { return }
-        let startLine: Int
         switch action {
         case .change(let hunk):
             tv.editor?.showGitChange(hunk, toggle: true)
@@ -289,11 +312,10 @@ final class GutterView: NSView {
         case .fold(let line):
             tv.editor?.toggleFold(line: line)
             return
-        case .selectLine(let line):
-            startLine = line
+        case .selectLine:
+            break
         }
-        let doc = tv.document
-        let anchorRange = doc.lines.fullRange(of: startLine, textLength: doc.length)
+        let anchorRange = GutterView.lineSelectionRange(at: localPoint, in: tv, gutter: self) ?? NSRange(location: 0, length: 0)
         if event.modifierFlags.contains(.shift) {
             tv.setAllSelections([NSUnionRange(tv.selectedRange(), anchorRange)])
         } else {
@@ -302,10 +324,8 @@ final class GutterView: NSView {
         tv.window?.makeFirstResponder(tv)
         while let next = tv.window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]), next.type == .leftMouseDragged {
             tv.autoscroll(with: next)
-            let q = tv.convert(next.locationInWindow, from: nil)
-            let g = lm.glyphIndex(for: NSPoint(x: 0, y: q.y - tv.textContainerOrigin.y), in: tc)
-            let c = lm.characterIndexForGlyph(at: g)
-            let l = doc.lines.fullRange(of: doc.lines.line(containing: c), textLength: doc.length)
+            let q = convert(next.locationInWindow, from: nil)
+            let l = GutterView.lineSelectionRange(at: q, in: tv, gutter: self) ?? anchorRange
             tv.setAllSelections([NSUnionRange(anchorRange, l)], scroll: false)
         }
     }

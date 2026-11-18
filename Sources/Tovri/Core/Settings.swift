@@ -1,5 +1,49 @@
 import AppKit
 
+/// Process-scoped runtime environment so XCTest runs never mutate live user preferences,
+/// Application Support files, system recent documents, or the shared macOS pasteboard.
+enum AppRuntime {
+    static let isRunningTests: Bool = NSClassFromString("XCTestCase") != nil
+    static let testSuiteName: String = "app.tovri.tests.\(getpid())"
+
+    private static let installTestCleanup: Void = {
+        atexit {
+            UserDefaults(suiteName: testSuiteName)?.removePersistentDomain(forName: testSuiteName)
+            let prefs = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Preferences/\(testSuiteName).plist")
+            try? FileManager.default.removeItem(at: prefs)
+            let support = URL(fileURLWithPath: "/tmp", isDirectory: true)
+                .appendingPathComponent("TovriTests-Support-\(getpid())", isDirectory: true)
+            try? FileManager.default.removeItem(at: support)
+        }
+    }()
+
+    static let defaults: UserDefaults = {
+        guard isRunningTests else { return .standard }
+        _ = installTestCleanup
+        let d = UserDefaults(suiteName: testSuiteName)!
+        d.removePersistentDomain(forName: testSuiteName)
+        return d
+    }()
+
+    static let supportDirectory: URL = {
+        guard isRunningTests else {
+            return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Tovri", isDirectory: true)
+        }
+        _ = installTestCleanup
+        let url = URL(fileURLWithPath: "/tmp", isDirectory: true)
+            .appendingPathComponent("TovriTests-Support-\(getpid())", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+
+    static let pasteboard: NSPasteboard = {
+        guard isRunningTests else { return .general }
+        return NSPasteboard(name: NSPasteboard.Name("app.tovri.tests.pb.\(getpid())"))
+    }()
+}
+
 /// UserDefaults-backed preferences. SwiftUI's settings window binds to the same keys via
 /// `@AppStorage`, so any change (from either side) is broadcast as `.settingsDidChange`.
 final class Settings {
@@ -113,7 +157,7 @@ final class Settings {
         Key.fontWeight: FontWeight.regular.rawValue,
     ]
 
-    private let d = UserDefaults.standard
+    private let d = AppRuntime.defaults
     private var pendingNotify = false
     private var lastSnapshot: [String: String] = [:]
 
@@ -123,6 +167,19 @@ final class Settings {
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: d, queue: .main) { [weak self] _ in
             self?.scheduleNotify()
         }
+    }
+
+    func reloadFromDefaults() {
+        d.register(defaults: Settings.defaults)
+        pendingNotify = false
+        rulerCache = nil
+        indentationCache = nil
+        let snap = snapshot()
+        guard snap != lastSnapshot else { return }
+        lastSnapshot = snap
+        _font = nil
+        ThemeManager.shared.refresh()
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
     }
 
     private func snapshot() -> [String: String] {
