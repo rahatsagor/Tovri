@@ -9,58 +9,63 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-18
+
 ### Added
 
 - **Line-level Patience diffing.** Inline diffs and Git change comparisons now
-  use Patience diffing to keep moved or structural blocks aligned cleanly.
-- **`tovri -g` / `--goto` CLI flag.** Parse `path:line[:column]` arguments
-  even before a file exists on disk, with private (`0700`) temp files and
-  wait-marker cleanup on interrupt signals.
-- **`file:line:column` and richer globs.** Goto Anything accepts `:line:column`
-  jumps, and Find in Files supports `{a,b}` brace expansion, leading `./`,
-  `**/` globs, and trailing `/` directory filters while deduplicating
-  symlinked files.
+  use Patience diffing so moved or structural code blocks stay aligned cleanly.
+- **`tovri -g` / `--goto` CLI flag.** Open `path:line[:column]` locations from
+  Terminal even before a file exists on disk.
+- **`file:line:column` jumps and richer search globs.** Goto Anything accepts
+  `:line:column` suffixes, and Find in Files supports `{a,b}` brace patterns,
+  leading `./`, `**/` wildcards, and trailing `/` folder filters while
+  deduplicating symlinked files.
 
 ### Changed
 
-- **Faster large-file indexing and TextKit layout.** Switched `LineIndex` to a
-  gap buffer, cached per-edit document symbols, and eliminated `.numberOfGlyphs`
-  full-layout triggers across layout, caret, and gutter paths.
-- **Live split tab moves.** Moving or collapsing tabs across split groups now
-  keeps each tab's live editor view, undo stack, folds, scroll position, and
+- **Faster large-file editing and layout.** Typing near the top of huge files,
+  opening multi-megabyte files, tailing growing log files, and scanning document
+  symbols do less work per edit and avoid full-document layout passes.
+- **Seamless split tab moves.** Moving tabs between splits or collapsing a
+  split keeps each tab's undo history, folded blocks, scroll position, and
   preview state intact.
-- **Smaller Apple Silicon app bundle.** Stripped development headers, modules,
-  and unused `x86_64` slices from the bundled Sparkle framework cleanly before
-  re-signing.
-- **Improved Changes workflow and navigation.** Added **Restore This Version**
-  for commit comparisons, live diff count updates, single-click preview vs
-  double-click focus in Changes, and fence-aware changelog parsing in release
-  tooling.
+- **Smaller Apple Silicon app bundle.** Unused `x86_64` framework slices and
+  development headers are stripped from the bundled updater, reducing the app's
+  download and disk size.
+- **Smoother Changes workflow.** Comparing with an earlier commit now supports
+  **File → Restore This Version**, single-clicking a changed file previews it
+  without leaving the list while double-clicking focuses the editor, and line
+  counts update live as you type.
+- **Undoable encoding changes.** Choosing a text encoding in the status bar now
+  marks the document as an unsaved, undoable change instead of overwriting the
+  file on disk right away.
 
 ### Fixed
 
-- **Hardened Git, Markdown preview, and file I/O safety.** Neutralized Git
-  2.54+ `hook.*` config keys and `submodule.recurse`, verified `.git` ownership
-  (`geteuid()`) and bidirectional worktree/submodule binding while rejecting
-  `.git` symlinks and unbound standalone `gitdir:` pointers, validated ref
-  paths, capped Git output, sanitized `<base>`/`<meta>`/`<link>` inside Markdown
-  `<template>` blocks with stricter CSP and DNS-prefetch controls, enforced
-  cumulative preview resource budgets, and guarded reads with
-  single-descriptor `O_NONBLOCK` regular-file checks.
-- **Editing, gutter, diff, and picker reliability.** Guarded read-only
-  mutations, snapped selections to valid UTF-16 boundaries, prevented
-  multi-cursor IME duplication on commit, fixed deferred fold invalidation,
-  clamped stale highlights across split views, fixed gutter clicks on
-  empty/EOF/folded lines, corrected empty-file inline diff marks, kept
-  `KeyBindings` IDs stable across dynamic menu title changes, restored Theme
-  Picker previews on `Esc` or window close, and synced dirty buffer baselines
-  when discarding Git changes.
-- **Default editor claims, CLI wait, and window lifecycle.** Excluded media UTIs
-  such as `.ts` MPEG-2 transport streams from default-editor claims while
-  keeping TypeScript source files, exited non-zero from `tovri -w` if Tovri
-  exits before closing the waited file, blocked closing or quitting during
-  active Replace in Files, preserved shared dirty documents across windows,
-  and normalized `\r\n` replacements on CRLF files and open buffers.
+- **Hardened Git, Markdown preview, and file safety.** Disabled Git 2.54+
+  config-defined `hook.*` commands and submodule recursion, verified `.git`
+  ownership and worktree/submodule links while rejecting `.git` symlinks and
+  untrusted `gitdir:` pointers, capped Git subprocess output, stripped active
+  metadata inside Markdown `<template>` blocks with stricter remote-content and
+  copy-button protections, and guarded file and CLI reads against blocking
+  special files.
+- **Editing, gutter, diff, and picker reliability.** Prevented crashes when
+  typing auto-paired brackets in read-only views, clicking the gutter in empty
+  or folded files, or shrinking documents open across splits; snapped
+  multi-cursor moves to character boundaries; prevented duplicate text when
+  committing IME input with multiple cursors; preserved bookmarks across
+  multi-line edits; fixed inline diff marks on empty committed files; kept
+  custom Full Screen shortcuts intact; restored the saved theme when closing the
+  Theme Picker; and avoided false external-change prompts after discarding Git
+  changes on a dirty file.
+- **Default editor claims, `tovri -w`, and session safety.** Excluded `.ts`
+  MPEG-2 transport streams when making Tovri the default editor while keeping
+  TypeScript source files, exited with an error from `tovri -w` if Tovri quits
+  unexpectedly or without saving waited edits, honored turning off **Restore
+  windows and tabs on launch** while **Hot exit** is on, blocked closing or
+  quitting during an active Replace in Files run, and normalized CRLF line
+  endings across multi-file replacements.
 
 ## [0.6.1] - 2026-11-12
 
@@ -543,7 +548,8 @@ agent just changed.
 - VoiceOver reads tabs, the status bar, the sidebar's Git status and the
   empty editor's shortcuts and recent files.
 
-[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/rahatsagor/Tovri/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/rahatsagor/Tovri/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/rahatsagor/Tovri/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/rahatsagor/Tovri/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/rahatsagor/Tovri/compare/v0.4.0...v0.5.0
