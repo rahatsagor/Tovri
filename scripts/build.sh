@@ -1,7 +1,7 @@
 #!/bin/bash
-# Builds Tovri.app (arm64) into build/Release/ or build/Debug/.
+# Builds Tovri.app (arm64) into build/Release/, build/Debug/, or a custom --output-dir.
 #
-#   scripts/build.sh [--version 1.2.3] [--debug]
+#   scripts/build.sh [--version 1.2.3] [--debug] [--output-dir DIR]
 #
 # Environment:
 #   TOVRI_SIGN_IDENTITY  Code signing identity name. Defaults to "Tovri Self-Signed"
@@ -15,6 +15,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 CONFIGURATION=Release
 VERSION=""
+OUTPUT_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -22,7 +23,12 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { echo "error: --version needs a value, like 1.2.3" >&2; exit 2; }
             VERSION="${2#v}"; shift 2 ;;
         --debug) CONFIGURATION=Debug; shift ;;
-        -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --output-dir)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "error: --output-dir needs a directory path" >&2; exit 2; }
+            mkdir -p "$2"
+            OUTPUT_DIR="$(cd "$2" && pwd -P)"
+            shift 2 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -51,13 +57,21 @@ done
 
 echo "==> Building Tovri $VERSION ($BUILD), $CONFIGURATION"
 cd "$ROOT"
-mkdir -p build
+if [[ -n "$OUTPUT_DIR" ]]; then
+    OUT="$OUTPUT_DIR"
+    mkdir -p "$OUT"
+    LOG="$OUT/swift-build.log"
+else
+    mkdir -p build
+    LOG="$ROOT/build/swift-build.log"
+    OUT="$ROOT/build/$CONFIGURATION"
+    mkdir -p "$OUT"
+fi
 if [[ ! -f Resources/AppIcon.icns ]] || [[ scripts/make-icon.swift -nt Resources/AppIcon.icns ]]; then
     swift scripts/make-icon.swift Resources/AppIcon.icns
 fi
 
 SWIFT_CONFIG="$(echo "$CONFIGURATION" | tr '[:upper:]' '[:lower:]')"
-LOG="$ROOT/build/swift-build.log"
 if ! swift build -c "$SWIFT_CONFIG" --arch arm64 >"$LOG" 2>&1; then
     grep -E "error:" "$LOG" | sort -u | head -40 >&2 || true
     echo "error: swift build failed; full log in $LOG" >&2
@@ -67,8 +81,6 @@ grep -E "\.swift:[0-9]+:[0-9]+: warning:" "$LOG" | sort -u || true
 BIN_DIR="$(swift build -c "$SWIFT_CONFIG" --arch arm64 --show-bin-path)"
 [[ -d "$BIN_DIR/Sparkle.framework" ]] || { echo "error: Sparkle.framework is missing from $BIN_DIR" >&2; exit 1; }
 
-OUT="$ROOT/build/$CONFIGURATION"
-mkdir -p "$OUT"
 STAGING="$(mktemp -d "$OUT/.tovri-build.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 APP="$STAGING/Tovri.app"
