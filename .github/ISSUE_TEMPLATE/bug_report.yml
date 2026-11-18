@@ -14,7 +14,7 @@ body:
     attributes:
       label: Tovri version
       description: Tovri → About Tovri.
-      placeholder: "0.1.0 (100)"
+      placeholder: "0.6.2 (602)"
     validations:
       required: true
   - type: input

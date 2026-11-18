@@ -32,12 +32,13 @@ make debug        # build/Debug/Tovri.app
 make              # build/Release/Tovri.app
 make run          # build the release app and open it
 make test         # swift test
+make check        # release-tooling lint/typecheck/tests + swift test
 make package      # dist/Tovri-<version>.dmg and .zip
 ```
 
-The Makefile calls `scripts/build.sh`, which takes `--debug` and
-`--version 1.2.3`. You can also open `Package.swift` in Xcode to edit and run
-the tests there.
+The Makefile calls `scripts/build.sh`, which takes `--debug`,
+`--version 1.2.3` and `--output-dir <dir>`. You can also open `Package.swift`
+in Xcode to edit and run the tests there.
 
 Debug builds and builds without an update key never check for updates, so a
 copy you built can't replace itself with a release.
@@ -90,21 +91,29 @@ Sources/Tovri
   After an edit, re-lexing starts at the edited line and stops when the new
   state matches the old one, so the rest of the file stays valid. Lines are
   lexed on demand for the visible region only.
-- **Documents:** files are memory-mapped and decoded once. A line-start index
-  is updated incrementally on every edit, which keeps line lookups O(log n)
-  for the gutter, Goto Line and the syntax engine.
+- **Documents:** files are memory-mapped and decoded once. A gap-buffer
+  line-start index (`LineIndex`) is updated incrementally on every edit, which
+  keeps edits near the top of huge files fast and line lookups O(log n) for the
+  gutter, Goto Line and the syntax engine.
 - **Markdown preview:** the only web view in the app, created when a preview
   is first opened. A strict Content-Security-Policy allows only Tovri's own
   script, and local images are served from disk by a URL scheme handler.
 - **Updates:** [Sparkle](https://sparkle-project.org), added with SwiftPM.
-  `scripts/build.sh` embeds and signs `Sparkle.framework` and writes the
-  update key into the app's `Info.plist`.
+  `scripts/build.sh` strips development headers, modules and unused `x86_64`
+  slices from `Sparkle.framework`, embeds and signs it, and writes the update
+  key into the app's `Info.plist`.
 
 Set `TOVRI_PERF=1` to log timings for loading, coloring, searching and
 main-thread stalls over 50 ms:
 
 ```sh
 open --env TOVRI_PERF=1 --stderr /tmp/tovri.log -a build/Release/Tovri.app
+```
+
+To run the opt-in Release-mode large-file entry-point benchmarks:
+
+```sh
+TOVRI_RUN_BENCHMARKS=1 swift test -c release --filter LargeFileBenchmarkTests
 ```
 
 ## Checks
@@ -116,11 +125,15 @@ swift test
 scripts/build.sh              # a signed, verified release app
 
 cd scripts                    # release tooling, on Bun
-bun install
+bun install --frozen-lockfile
 bun run lint
 bun run typecheck
 bun run test
 
+cd ..
+# Optional end-to-end Sparkle update check in isolated temp directories
+# (leaves build/, dist/, and host Sparkle preferences untouched):
+bun scripts/verify-sparkle-update.ts
 actionlint                    # workflows, if you changed .github/
 ```
 

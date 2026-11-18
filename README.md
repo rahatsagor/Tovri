@@ -78,16 +78,18 @@ about 45 MB of memory.
 <td width="50%" valign="top">
 
 #### Review what changed
-Gutter markers show every change since the last commit. Click one to see the
-removed and added lines or revert them. **Compare with Last Commit** (⇧⌥⌘D)
-shows removed lines right in the editor, and the status bar counts changed
-files: click it to list them with the lines each one adds and removes.
-Ideal for checking what a coding agent touched. Turn on **Changes and file
-history** in **Settings → Git** for a Changes list in the sidebar, where you
-can stage, unstage and discard changes, and **File History** (⇧⌥⌘H), which
-compares a file with any earlier commit. Every Git feature can be turned off
-there too. You can also compare a file with its saved version, the clipboard
-or another file.
+Gutter markers show every change since the last commit, keeping moved code
+aligned cleanly. Click one to see the removed and added lines or revert them.
+**Compare with Last Commit** (⇧⌥⌘D) shows removed lines right in the editor,
+and the status bar counts changed files: click it to list them with the lines
+each one adds and removes. Ideal for checking what a coding agent touched.
+Turn on **Changes and file history** in **Settings → Git** for a Changes list
+in the sidebar—where you can filter, sort, stage, unstage and discard
+changes—and **File History** (⇧⌥⌘H), which compares a file with any earlier
+commit. Every Git feature can be turned off there too. You can also compare a
+file with its saved version, Local History, the clipboard or another file, and
+use **File → Restore This Version** to bring a compared version back as one
+undoable edit.
 
 </td>
 </tr>
@@ -95,12 +97,14 @@ or another file.
 <td valign="top">
 
 #### Find your way
-**Goto Anything** (⌘P) opens files by a few letters of their name, the
-command palette (⇧⌘P) runs any command, and Goto Symbol (⌘R), Goto Symbol in
-Project (⇧⌘R) and Goto Definition (F12) jump straight to the code you need.
-Find in Files (⇧⌘F) searches a whole folder on every core, Replace in Files
-(⌥⇧⌘F) shows every match before it changes anything, and bookmarks (⌘F2)
-mark lines to come back to.
+**Goto Anything** (⌘P) opens files from a few letters of their name and jumps
+straight to a location or symbol with `file:line:column` and `file@symbol`.
+The command palette (⇧⌘P) runs any command, and Goto Symbol (⌘R), Goto Symbol
+in Project (⇧⌘R) and Goto Definition (F12) jump straight to the code you need.
+Find in Files (⇧⌘F) searches a whole folder on every core with glob and folder
+filters (`*.swift`, `src/**`, `{ts,tsx}`, `tests/`), Replace in Files (⌥⇧⌘F)
+previews every match before changing anything (with **Undo Replace in
+Files**), and bookmarks (⌘F2) mark lines to come back to.
 
 </td>
 <td valign="top">
@@ -117,16 +121,18 @@ themselves, and JSON formats or minifies without reordering its keys.
 
 #### Markdown, rendered
 Preview a document in place (⇧⌘V) or side by side (⌥⌘V), with tables, task
-lists, alerts and highlighted code as on GitHub. Scripts never run, and
+lists, alerts, footnotes, math, highlights, tables of contents, YAML front
+matter and highlighted code with a **Copy** button. Scripts never run, and
 remote images load only when you ask.
 
 </td>
 <td valign="top">
 
 #### Made for the Mac
-15 themes that can follow light and dark mode, plus your own made in
-Settings, tabs and split layouts, a minimap, Quick Look for images, PDFs and documents, printing, `.editorconfig`
-support, and spell checking for prose.
+15 themes that can follow light and dark mode, plus your own made in Settings,
+tabs with an overflow menu and seamless split layouts, a minimap, Quick Look
+for images, PDFs and documents, printing, `.editorconfig` support, settings
+backup and restore, and spell checking for prose.
 
 </td>
 </tr>
@@ -134,10 +140,12 @@ support, and spell checking for prose.
 <td valign="top">
 
 #### Never lose your work
-Windows, tabs and unsaved changes are still there after you quit. Files
-changed by other apps reload on their own, and Tovri asks before it replaces
-your edits. Local History keeps earlier versions of every file you save
-over, and a growing log follows its new lines.
+Windows, tabs and unsaved changes are still there after you quit, and
+**Reopen Closed Tab** (⇧⌘T) or **Reopen Closed Window** (⌥⇧⌘T) brings closed
+work back. Files changed by other apps reload on their own, and Tovri asks
+before replacing your edits. Optional auto-save writes changes as you pause,
+Local History keeps earlier saved versions, and a growing log follows its new
+lines.
 
 </td>
 <td valign="top">
@@ -198,8 +206,9 @@ The same places offer to uninstall it. Then:
 tovri file.swift other.md   # open files
 tovri ~/Projects/app        # open a folder
 tovri src/main.go:42:7      # open at line 42, column 7
+tovri -g new-file.ts:10:4   # open path:line:column even before the file exists
 tovri new-file.ts           # a path that doesn't exist opens as a new, unsaved file
-tovri -n notes.txt          # open in a new window
+tovri -n notes.txt          # open in a new window (-nw also waits until closed)
 git diff | tovri            # piped text opens in a new tab (or: tovri -)
 git config --global core.editor "tovri -w"   # -w waits until the tab is closed
 ```
