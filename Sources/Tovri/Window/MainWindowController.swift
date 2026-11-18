@@ -315,12 +315,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             let removedActive = activeGroupIndex >= n ? activeTab?.document : nil
             for g in groups[n...] {
                 while !g.tabs.isEmpty {
-                    let doc = g.tabs[0].document
                     guard let tab = g.detachTab(at: 0) else { break }
-                    if target.index(of: doc) == nil {
-                        let t = target.add(doc, select: false)
-                        t.pendingSelection = tab.pendingSelection
-                        t.pendingScroll = tab.pendingScroll
+                    if target.index(of: tab.document) == nil {
+                        target.insertTab(tab, select: false)
+                    } else {
+                        tab.close()
                     }
                 }
                 g.container.removeFromSuperview()
@@ -568,9 +567,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         let target = groups.count > 1 ? groups.first(where: { $0 !== group(containing: editor) }) : nil
         // The results' own search, not whatever the find bar holds now.
         let search = lastFindInFiles.flatMap { $0.results === editor.document ? $0.regex : nil }
-        open(url: URL(fileURLWithPath: path), line: line, group: target)
-        if let e = activeEditor, let re = search ?? FindState.shared.makeRegex() {
-            let r = e.document.lines.range(of: line - 1, textLength: e.document.length)
+        guard let opened = open(url: URL(fileURLWithPath: path), line: line, group: target),
+              let e = activeEditor, e.document === opened, e.document.lines.count > 0 else { return }
+        if let re = search ?? FindState.shared.makeRegex() {
+            let safeLine = max(0, min(line - 1, e.document.lines.count - 1))
+            let r = e.document.lines.range(of: safeLine, textLength: e.document.length)
             if let m = re.firstMatch(in: e.document.string as String, range: r) { e.select(m.range) }
         }
     }
@@ -674,9 +675,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     /// Opens a path that doesn't exist yet as a new unsaved file.
     func openNewFile(at url: URL) -> Document {
-        if let d = DocumentRegistry.shared.existing(for: url), let (g, i) = locate(d) {
-            activate(group: g)
-            g.select(i)
+        if let d = DocumentRegistry.shared.existing(for: url) {
+            if let (g, i) = locate(d) {
+                activate(group: g)
+                g.select(i)
+                return d
+            }
+            replaceEmptyUntitled(with: d, in: activeGroup)
+            activeEditor?.focus()
             return d
         }
         let doc = Document(newFileAt: url)
@@ -907,7 +913,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         guard index >= 0, index < group.tabs.count else { completion?(false); return }
         let tab = group.tabs[index]
         let doc = tab.document
-        let otherViews = allGroupsTabs().filter { $0 !== tab && $0.document === doc }.count + (doc.editorCount - (tab.editor == nil ? 0 : 1)) > 0
+        let otherViews = allGroupsTabs().contains { $0 !== tab && $0.document === doc }
+            || isOpenInAnotherWindow(doc)
+            || doc.editorCount > editorsCount(for: doc)
         let finish = { [weak self] in
             guard let self else { return }
             if let url = doc.url { self.closedTabs.append(url) }
@@ -981,8 +989,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     /// Asks about each dirty document in turn.
     func confirmCloseAll(_ completion: @escaping (Bool) -> Void) {
-        let dirty = allOpenDocuments().filter { $0.isDirty && ($0.editorCount <= editorsCount(for: $0)) }
+        let dirty = allOpenDocuments().filter { $0.isDirty && !isOpenInAnotherWindow($0) && ($0.editorCount <= editorsCount(for: $0)) }
         confirmClose(dirty, completion: completion)
+    }
+
+    private func isOpenInAnotherWindow(_ doc: Document) -> Bool {
+        (NSApp.delegate as? AppDelegate)?.controllers.contains { $0 !== self && $0.allOpenDocuments().contains { $0 === doc } } ?? false
     }
 
     /// The app supplies globally deduplicated documents when every window is quitting.
@@ -1016,6 +1028,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if isClosing { return true }
         if (NSApp.delegate as? AppDelegate)?.isTerminating == true { return true }
+        if replaceInFiles.isBusy {
+            NSSound.beep()
+            statusBar.flash("Finish or stop Replace in Files before closing the window.")
+            return false
+        }
         if let app = NSApp.delegate as? AppDelegate, app.closingKeepsUnsavedChanges(self) {
             return app.saveSessionBeforeClosingWindow(self)
         }
@@ -1036,6 +1053,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     func teardown() {
         watcher?.stop()
         searcher?.cancel()
+        replaceInFiles.cancel()
+        if palette.isVisible { palette.close(cancelled: true) }
+        if findInFilesPanel.isVisible { findInFilesPanel.close() }
+        closeQuickLookIfOwned()
         let docs = allOpenDocuments()
         for g in groups { for t in g.tabs { t.close() } }
         let others = (NSApp.delegate as? AppDelegate)?.controllers.filter { $0 !== self } ?? []
@@ -1502,13 +1523,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     private func moveActiveTab(from: EditorGroup, to: EditorGroup) {
         guard from !== to, from.selectedIndex >= 0 else { return }
-        let doc = from.tabs[from.selectedIndex].document
         guard let tab = from.detachTab(at: from.selectedIndex) else { return }
-        if let i = to.index(of: doc) { to.select(i) } else {
-            let t = to.add(doc, select: false)
-            t.pendingSelection = tab.pendingSelection
-            t.pendingScroll = tab.pendingScroll
-            to.select(to.index(of: doc) ?? 0)
+        if let i = to.index(of: tab.document) {
+            tab.close()
+            to.select(i)
+        } else {
+            to.insertTab(tab, select: true)
         }
         activate(group: to)
     }
@@ -1778,8 +1798,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             if top === main.items.first { walk(sub, prefix: "Tovri"); continue }
             walk(sub, prefix: top.title)
         }
-        for lang in LanguageRegistry.shared.all {
-            out.append(PaletteItem(title: "Set Syntax: \(lang.name)") { [weak self] in self?.activeDocument?.setLanguage(lang) })
+        if activeDocument != nil {
+            for lang in LanguageRegistry.shared.all {
+                out.append(PaletteItem(title: "Set Syntax: \(lang.name)") { [weak self] in self?.activeDocument?.setLanguage(lang) })
+            }
         }
         for t in ThemeManager.shared.themes {
             out.append(PaletteItem(title: "Theme: \(t.name)") {
@@ -1806,6 +1828,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             }
             if target == nil, responds(to: action) { target = self }
             if target == nil, let d = NSApp.delegate, d.responds(to: action) { target = d }
+            if target == nil, NSApp.responds(to: action) { target = NSApp }
         }
         guard let target else { return false }
         if let v = target as? NSMenuItemValidation { return v.validateMenuItem(item) }
@@ -2319,9 +2342,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     @objc private func setEncoding(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let e = TextEncoding(rawValue: raw), let doc = activeDocument else { return }
+        guard !doc.isReadOnly else { NSSound.beep(); return }
+        let previous = doc.encoding
         doc.encoding = e
-        if doc.url != nil { save(doc) }
-        updateStatusBar()
+        if doc.url != nil && !doc.isNewFile {
+            save(doc) { [weak self] ok in
+                if !ok { doc.encoding = previous }
+                self?.updateStatusBar()
+            }
+        } else {
+            updateStatusBar()
+        }
     }
 
     @objc func reopenWithEncoding(_ sender: NSMenuItem) {

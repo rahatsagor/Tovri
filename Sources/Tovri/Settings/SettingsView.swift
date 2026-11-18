@@ -7,10 +7,15 @@ enum SettingsWindow {
     static func make() -> NSWindow {
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
+        let maxPaneHeight = max(320, (NSScreen.main?.visibleFrame.height ?? 900) - 120)
         func add<V: View>(_ title: String, _ symbol: String, _ view: V, height: CGFloat) {
-            let vc = NSHostingController(rootView: view.frame(width: 620, height: height))
+            let clampedHeight = min(height, maxPaneHeight)
+            let content: AnyView = height > clampedHeight
+                ? AnyView(ScrollView { view.frame(width: 620, height: height) })
+                : AnyView(view.frame(width: 620, height: clampedHeight))
+            let vc = NSHostingController(rootView: content.frame(width: 620, height: clampedHeight))
             vc.sizingOptions = []
-            vc.preferredContentSize = NSSize(width: 620, height: height)
+            vc.preferredContentSize = NSSize(width: 620, height: clampedHeight)
             vc.title = title
             let item = NSTabViewItem(viewController: vc)
             item.label = title

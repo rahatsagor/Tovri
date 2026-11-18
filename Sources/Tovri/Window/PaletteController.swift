@@ -72,6 +72,8 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
     private var results: [PaletteItem] = []
     private var onCancel: (() -> Void)?
     private var restore: (editor: EditorView, selection: NSRange, scroll: CGPoint)?
+    private var didPreview = false
+    private weak var previousResponder: NSResponder?
     private var symbolCache: [EditorView.Symbol] = []
     private var workspaceSymbols: [WorkspaceSymbol]?
     private var loadGeneration = 0
@@ -173,6 +175,10 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
 
     private func present(initial: String) {
         guard let content = controller.window?.contentView else { return }
+        if !isVisible {
+            previousResponder = controller.window?.firstResponder
+        }
+        didPreview = false
         if let e = controller.activeEditor {
             restore = (e, e.textView.selectedRange(), e.scrollPosition)
             symbolCache = (mode == .symbols || initial.hasPrefix("@")) ? e.symbols() : []
@@ -231,13 +237,22 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
 
     func close(cancelled: Bool) {
         guard isVisible else { return }
+        let prev = previousResponder
+        previousResponder = nil
         listTag = nil
         backdrop.removeFromSuperview()
         if cancelled { cancelShownList() }
+        didPreview = false
         onCancel = nil
         restore = nil
         releaseItems()
-        if cancelled { controller.activeEditor?.focus() }
+        if cancelled {
+            if let editor = controller.activeEditor {
+                editor.focus()
+            } else if let prev, prev.acceptsFirstResponder {
+                controller.window?.makeFirstResponder(prev)
+            }
+        }
     }
 
     /// Undoes what moving through the list previewed (a caret position, a theme), as when it's
@@ -308,10 +323,20 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         rowHeight = results.first?.twoLine == true ? 44 : 32
         table.rowHeight = rowHeight
         table.reloadData()
+        let wantsPreview = mode != .files || q.hasPrefix("@") || q.hasPrefix(":")
+        let canPreview = !results.isEmpty && wantsPreview && results[0].preview != nil
+        if didPreview && !canPreview, let r = restore {
+            r.editor.textView.setAllSelections([r.selection], scroll: false)
+            r.editor.scrollPosition = r.scroll
+            didPreview = false
+        }
         if !results.isEmpty {
             table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
             table.scrollRowToVisible(0)
-            if mode != .files || q.hasPrefix("@") || q.hasPrefix(":") { results[0].preview?() }
+            if wantsPreview, let preview = results[0].preview {
+                preview()
+                didPreview = true
+            }
         }
     }
 
@@ -424,23 +449,38 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         }
     }
 
-    private func fileResults(_ raw: String) -> [PaletteItem] {
-        var query = raw
-        var line: Int?
-        var symbol: String?
+    static func parseFileQuery(_ raw: String) -> (query: String, line: Int?, column: Int?, symbol: String?) {
         if let at = raw.firstIndex(of: "@") {
-            symbol = String(raw[raw.index(after: at)...])
-            query = String(raw[..<at])
-        } else if let colon = raw.lastIndex(of: ":"), let n = Int(raw[raw.index(after: colon)...]) {
-            line = n
-            query = String(raw[..<colon])
+            return (String(raw[..<at]), nil, nil, String(raw[raw.index(after: at)...]))
         }
+        if let c2 = raw.lastIndex(of: ":") {
+            let tail = raw[raw.index(after: c2)...]
+            let prefix = raw[..<c2]
+            if let n2 = Int(tail) {
+                if let c1 = prefix.lastIndex(of: ":"), let n1 = Int(prefix[prefix.index(after: c1)...]) {
+                    return (String(prefix[..<c1]), n1, n2, nil)
+                }
+                return (String(prefix), n2, nil, nil)
+            }
+            if tail.isEmpty, let c1 = prefix.lastIndex(of: ":"), let n1 = Int(prefix[prefix.index(after: c1)...]) {
+                return (String(prefix[..<c1]), n1, nil, nil)
+            }
+        }
+        return (raw, nil, nil, nil)
+    }
+
+    private func fileResults(_ raw: String) -> [PaletteItem] {
+        let parsed = PaletteController.parseFileQuery(raw)
+        let query = parsed.query
+        let line = parsed.line
+        let column = parsed.column
+        let symbol = parsed.symbol
         let controller = self.controller
         let theme = ThemeManager.shared.active
         let make: (URL, String, String) -> PaletteItem = { url, title, detail in
             let dir = (detail as NSString).deletingLastPathComponent
             var item = PaletteItem(title: title, detail: dir.isEmpty ? "./" : dir, icon: nil) {
-                controller.open(url: url, line: line, symbol: symbol)
+                controller.open(url: url, line: line, column: column, symbol: symbol)
             }
             item.image = FileIcons.image(forFileName: title, theme: theme, size: 14)
             item.twoLine = true
@@ -465,7 +505,8 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
                 self.layout()
             }
             for url in openDocs + recents where seen.insert(url.path).inserted {
-                items.append(make(url, url.lastPathComponent, rel(url)))
+                items.append(make(url, url.lastPathComponent.precomposedStringWithCanonicalMapping,
+                                  rel(url).precomposedStringWithCanonicalMapping))
                 if items.count > 40 { break }
             }
             return items
@@ -473,11 +514,11 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
 
         var scored: [(Int, PaletteItem)] = []
         for url in openDocs where seen.insert(url.path).inserted {
-            let r = rel(url)
+            let r = rel(url).precomposedStringWithCanonicalMapping
             let units = Array(r.utf16)
             let base = (units.lastIndex(of: 47) ?? -1) + 1
             if let m = Fuzzy.match(q, units, basenameStart: base) {
-                var item = make(url, url.lastPathComponent, r)
+                var item = make(url, url.lastPathComponent.precomposedStringWithCanonicalMapping, r)
                 item.positions = m.positions.filter { $0 >= base }.map { $0 - base }
                 scored.append((m.score + 10, item))
             }
@@ -501,7 +542,8 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
                 let e = index.entries[i]
                 let url = root.appendingPathComponent(e.relativePath)
                 guard seen.insert(url.path).inserted else { continue }
-                var item = make(url, (e.relativePath as NSString).lastPathComponent, e.relativePath)
+                let title = (e.relativePath as NSString).lastPathComponent.precomposedStringWithCanonicalMapping
+                var item = make(url, title, e.relativePath.precomposedStringWithCanonicalMapping)
                 if let m = Fuzzy.match(q, e.units, basenameStart: e.basenameStart) {
                     item.positions = m.positions.filter { $0 >= e.basenameStart }.map { $0 - e.basenameStart }
                 }
@@ -534,7 +576,10 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
         let row = min(max(0, table.selectedRow + d), results.count - 1)
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         table.scrollRowToVisible(row)
-        results[row].preview?()
+        if let preview = results[row].preview {
+            preview()
+            didPreview = true
+        }
     }
 
     private func execute() {

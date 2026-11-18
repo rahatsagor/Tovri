@@ -3,7 +3,8 @@ import AppKit
 /// Small borderless icon/text button with hover and toggle states, themed from the active theme.
 final class ToolButton: NSView {
     var onClick: (() -> Void)?
-    var isOn = false { didSet { needsDisplay = true } }
+    private var isToggle = false
+    var isOn = false { didSet { isToggle = true; needsDisplay = true } }
     var symbol: String? { didSet { needsDisplay = true } }
     var title: String? { didSet { needsDisplay = true } }
     var symbolSize: CGFloat = 12
@@ -53,7 +54,7 @@ final class ToolButton: NSView {
     }
 
     override func accessibilityHelp() -> String? { toolTip }
-    override func accessibilityValue() -> Any? { isOn ? "On" : nil }
+    override func accessibilityValue() -> Any? { isToggle ? (isOn ? "On" : "Off") : nil }
     override func accessibilityPerformPress() -> Bool {
         guard let onClick else { return false }
         onClick()

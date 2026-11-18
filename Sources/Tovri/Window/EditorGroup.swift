@@ -104,9 +104,16 @@ final class EditorGroup: NSObject, TabBarDelegate {
 
     @discardableResult
     func add(_ document: Document, select: Bool = true, at index: Int? = nil) -> EditorTab {
-        let tab = EditorTab(document: document)
+        insertTab(EditorTab(document: document), select: select, at: index, recordSessionSave: false)
+    }
+
+    /// Inserts an existing tab (e.g. detached from another split group), keeping its live editor view.
+    @discardableResult
+    func insertTab(_ tab: EditorTab, select: Bool = true, at index: Int? = nil, recordSessionSave: Bool = true) -> EditorTab {
+        tab.editor?.delegate = controller
         let i = min(index ?? (selectedIndex >= 0 ? selectedIndex + 1 : tabs.count), tabs.count)
         tabs.insert(tab, at: i)
+        if recordSessionSave { SessionStore.shared.setNeedsSave() }
         if select { self.select(i) } else {
             if selectedIndex >= i { selectedIndex += 1 }
             refreshTabBar()
@@ -140,17 +147,33 @@ final class EditorGroup: NSObject, TabBarDelegate {
     func index(of document: Document) -> Int? { tabs.firstIndex { $0.document === document } }
 
     func removeTab(at index: Int) {
-        guard index >= 0, index < tabs.count else { return }
-        let tab = tabs.remove(at: index)
+        takeTab(at: index, closeEditor: true)
+    }
+
+    /// Removes a tab without closing its editor's document attachment; used when moving between groups.
+    func detachTab(at index: Int) -> EditorTab? {
+        takeTab(at: index, closeEditor: false)
+    }
+
+    @discardableResult
+    private func takeTab(at index: Int, closeEditor: Bool) -> EditorTab? {
+        guard index >= 0, index < tabs.count else { return nil }
+        let tab = tabs[index]
+        if !closeEditor {
+            tab.pendingSelection = tab.editor?.textView.selectedRange() ?? tab.pendingSelection
+            tab.pendingScroll = tab.editor?.scrollPosition ?? tab.pendingScroll
+            tab.editor?.removeFromSuperview()
+        }
+        tabs.remove(at: index)
         SessionStore.shared.setNeedsSave()
         let wasSelected = index == selectedIndex
-        tab.close()
+        if closeEditor { tab.close() }
         if tabs.isEmpty {
             selectedIndex = -1
             emptyView.isHidden = false
             refreshTabBar()
             controller.groupDidChangeSelection(self)
-            return
+            return tab
         }
         if wasSelected {
             selectedIndex = -1
@@ -159,15 +182,6 @@ final class EditorGroup: NSObject, TabBarDelegate {
             if index < selectedIndex { selectedIndex -= 1 }
             refreshTabBar()
         }
-    }
-
-    /// Removes a tab without closing its editor's document attachment; used when moving between groups.
-    func detachTab(at index: Int) -> EditorTab? {
-        guard index >= 0, index < tabs.count else { return nil }
-        let tab = tabs[index]
-        tab.pendingSelection = tab.editor?.textView.selectedRange()
-        tab.pendingScroll = tab.editor?.scrollPosition
-        removeTab(at: index)
         return tab
     }
 

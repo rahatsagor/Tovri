@@ -274,6 +274,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if let busy = controllers.first(where: { $0.replaceInFiles.isBusy }) {
+            busy.window?.makeKeyAndOrderFront(nil)
+            NSSound.beep()
+            busy.statusBar.flash("Finish or stop Replace in Files before quitting.")
+            return .terminateCancel
+        }
         let hotExit = Settings.shared.hotExit
         if !hotExit {
             let unsavedClosed = closedWindows.filter(\.hasUnsavedChanges)

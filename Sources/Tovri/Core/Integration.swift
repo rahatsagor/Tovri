@@ -64,11 +64,15 @@ final class Integration: ObservableObject {
             alert.runModal()
             return
         }
+        var blockedLink: String?
         for dir in Integration.binDirectories where fm.isWritableFile(atPath: dir) {
             let link = dir + "/tovri"
             if (try? fm.attributesOfItem(atPath: link)) != nil || (try? fm.destinationOfSymbolicLink(atPath: link)) != nil {
                 // Only replace a link to some copy of Tovri's launcher; anything else belongs to another tool.
-                guard let dest = try? fm.destinationOfSymbolicLink(atPath: link), dest.hasSuffix("/Contents/Resources/tovri") else { continue }
+                guard let dest = try? fm.destinationOfSymbolicLink(atPath: link), dest.hasSuffix("/Contents/Resources/tovri") else {
+                    if blockedLink == nil { blockedLink = link }
+                    continue
+                }
             }
             try? fm.removeItem(atPath: link)
             do {
@@ -79,6 +83,13 @@ final class Integration: ObservableObject {
                 alert.runModal()
                 return
             } catch { continue }
+        }
+        if let blockedLink {
+            alert.messageText = "A “tovri” command already exists"
+            alert.informativeText = "\(blockedLink) already exists and isn’t linked to Tovri. Remove or rename it first if you want Tovri to install its command there."
+            alert.runModal()
+            refreshCommandLine()
+            return
         }
         let cmd = "sudo mkdir -p /usr/local/bin && sudo ln -sf \(Integration.shellQuoted(script.path)) /usr/local/bin/tovri"
         alert.messageText = "Install the “tovri” command"
@@ -131,7 +142,10 @@ final class Integration: ObservableObject {
         var seen = Set<String>()
         var result: [UTType] = []
         func add(_ t: UTType?) {
-            guard let t, !t.isDynamic, !skip.contains(t.identifier), seen.insert(t.identifier).inserted else { return }
+            guard let t, !t.isDynamic, !skip.contains(t.identifier) else { return }
+            let isTextLike = t.conforms(to: .text) || t.conforms(to: .sourceCode) || t.conforms(to: .script) || t.identifier.hasPrefix("app.tovri.")
+            let isNonEditorMedia = t.conforms(to: .audiovisualContent) || t.conforms(to: .image) || t.conforms(to: .archive) || t.conforms(to: .pdf)
+            guard isTextLike && !isNonEditorMedia, seen.insert(t.identifier).inserted else { return }
             result.append(t)
         }
         let docTypes = Bundle.main.infoDictionary?["CFBundleDocumentTypes"] as? [[String: Any]] ?? []
@@ -165,6 +179,14 @@ final class Integration: ObservableObject {
     }
 
     func makeDefaultEditor() {
+        let app = Bundle.main.bundleURL
+        if Integration.isTemporaryOrDiskImageLocation(app) {
+            let alert = NSAlert()
+            alert.messageText = "Move Tovri to Applications first"
+            alert.informativeText = "Tovri is running from a disk image or a temporary location. Drag it to the Applications folder, open it from there, and set it as the default editor again."
+            alert.runModal()
+            return
+        }
         let types = Integration.defaultEditorContentTypes
         let alert = NSAlert()
         alert.messageText = "Make Tovri the default editor for code files?"
@@ -172,7 +194,6 @@ final class Integration: ObservableObject {
         alert.addButton(withTitle: "Make Default")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let app = Bundle.main.bundleURL
         let group = DispatchGroup()
         var failures = 0
         let lock = NSLock()

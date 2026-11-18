@@ -105,17 +105,21 @@ enum SettingsTransfer {
 struct BackupSettings: View {
     @State private var status: String?
 
+    private var hostWindow: NSWindow? {
+        NSApp.keyWindow ?? NSApp.windows.first { $0.title == "Settings" && $0.isVisible }
+    }
+
     var body: some View {
         Form {
             Section {
                 LabeledContent {
-                    Button("Export…") { SettingsTransfer.export(from: NSApp.keyWindow) { status = $0 } }
+                    Button("Export…") { SettingsTransfer.export(from: hostWindow) { status = $0 } }
                 } label: {
                     Text("Export settings")
                     Text("Saves your preferences, key bindings and custom themes to a file. Keep it as a backup or use it on another Mac.")
                 }
                 LabeledContent {
-                    Button("Import…") { SettingsTransfer.importFile(from: NSApp.keyWindow) { status = $0 } }
+                    Button("Import…") { SettingsTransfer.importFile(from: hostWindow) { status = $0 } }
                 } label: {
                     Text("Import settings")
                     Text("Replaces your preferences and key bindings with the ones in a settings file, and adds its themes.")

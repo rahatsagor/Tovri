@@ -50,10 +50,18 @@ final class FileNode: NSObject {
                 if fm.fileExists(atPath: u.path, isDirectory: &target), target.boolValue {
                     isDir = true
                     isLink = true
-                    let own = realPath ?? url.realPathURL.path
-                    realPath = own
                     let linked = u.realPathURL.path
-                    isLoop = own == linked || own.hasPrefix(linked.hasSuffix("/") ? linked : linked + "/")
+                    let linkedPrefix = linked.hasSuffix("/") ? linked : linked + "/"
+                    var anc: FileNode? = self
+                    while let node = anc {
+                        let own = node === self ? (realPath ?? node.url.realPathURL.path) : node.url.realPathURL.path
+                        if node === self { realPath = own }
+                        if own == linked || own.hasPrefix(linkedPrefix) {
+                            isLoop = true
+                            break
+                        }
+                        anc = node.parent
+                    }
                 }
             }
             if let e = existing[name], e.isDirectory == isDir, e.isLink == isLink, e.isLoop == isLoop {
@@ -434,14 +442,27 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         refresh(node: root, recursive: true)
     }
 
+    private func pruneNodes(under path: String) {
+        let p = norm(path)
+        let prefix = p == "/" ? "/" : p + "/"
+        nodesByPath = nodesByPath.filter { k, _ in k != p && !k.hasPrefix(prefix) }
+    }
+
     private func refresh(node: FileNode, recursive: Bool) {
         guard node.children != nil else { return }
         if recursive {
-            if node === root { nodesByPath.removeAll() }
+            if node === root { nodesByPath.removeAll() } else { pruneNodes(under: node.path) }
             reloadLoadedTree(node)
         } else {
             node.loadChildren()
             nodesByPath[norm(node.path)] = node
+            let liveChildren = Set((node.children ?? []).map { norm($0.path) })
+            let prefix = norm(node.path) == "/" ? "/" : norm(node.path) + "/"
+            for key in Array(nodesByPath.keys) where key.hasPrefix(prefix) {
+                let tail = String(key.dropFirst(prefix.count))
+                let top = tail.split(separator: "/", maxSplits: 1).first.map(String.init) ?? tail
+                if !liveChildren.contains(prefix + top) { nodesByPath.removeValue(forKey: key) }
+            }
         }
         outline.reloadItem(node === root ? nil : node, reloadChildren: true)
     }
@@ -455,15 +476,25 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         let rel = path.dropFirst(root.path.count + 1).split(separator: "/")
         var node = root
         for comp in rel {
-            if node.children == nil { node.loadChildren(); nodesByPath[norm(node.path)] = node }
-            guard let next = node.children?.first(where: { $0.name == String(comp) }) else { return }
-            if next.isDirectory && next !== root { outline.expandItem(next) }
+            let name = String(comp)
+            if node.children == nil {
+                node.loadChildren()
+                nodesByPath[norm(node.path)] = node
+            } else if node.children?.contains(where: { $0.name == name }) != true {
+                node.loadChildren()
+                nodesByPath[norm(node.path)] = node
+                outline.reloadItem(node === root ? nil : node, reloadChildren: true)
+            }
+            guard let next = node.children?.first(where: { $0.name == name }) else { return }
+            if expand && next.isDirectory && next !== root { outline.expandItem(next) }
             node = next
         }
-        let row = outline.row(forItem: node)
-        if row >= 0 {
-            outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            outline.scrollRowToVisible(row)
+        if select {
+            let row = outline.row(forItem: node)
+            if row >= 0 {
+                outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                outline.scrollRowToVisible(row)
+            }
         }
     }
 
@@ -697,8 +728,22 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     @objc private func newFile(_ sender: Any?) { createFile(in: node(for: sender) ?? root) }
 
+    static func isValidEntryName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
+    private func validatedEntryName(_ name: String) -> String? {
+        guard SidebarView.isValidEntryName(name) else {
+            showError(NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError,
+                              userInfo: [NSLocalizedDescriptionKey: "Names can’t be “.”, “..”, or contain “/”."]))
+            return nil
+        }
+        return name
+    }
+
     private func createFile(in node: FileNode?) {
-        guard let dir = targetDirectory(for: node), let name = prompt("New File", "untitled.txt", selectBaseName: true) else { return }
+        guard let dir = targetDirectory(for: node), let raw = prompt("New File", "untitled.txt", selectBaseName: true),
+              let name = validatedEntryName(raw) else { return }
         let url = dir.appendingPathComponent(name)
         do {
             try SidebarView.createNewFile(at: url)
@@ -717,7 +762,8 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     @objc private func newFolder(_ sender: Any?) { createFolder(in: node(for: sender) ?? root) }
 
     private func createFolder(in node: FileNode?) {
-        guard let dir = targetDirectory(for: node), let name = prompt("New Folder", "New Folder") else { return }
+        guard let dir = targetDirectory(for: node), let raw = prompt("New Folder", "New Folder"),
+              let name = validatedEntryName(raw) else { return }
         do {
             try FileManager.default.createDirectory(at: dir.appendingPathComponent(name), withIntermediateDirectories: true)
             reloadDirectory(dir)
@@ -726,7 +772,8 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     @objc private func rename(_ sender: Any?) {
         guard let node = node(for: sender), node !== root,
-              let name = prompt("Rename", node.name, selectBaseName: !node.isDirectory), name != node.name else { return }
+              let raw = prompt("Rename", node.name, selectBaseName: !node.isDirectory), raw != node.name,
+              let name = validatedEntryName(raw) else { return }
         let dest = node.url.deletingLastPathComponent().appendingPathComponent(name)
         do {
             try FileManager.default.moveItem(at: node.url, to: dest)
@@ -766,8 +813,11 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         NSWorkspace.shared.recycle([node.url]) { [weak self] _, error in
-            if let error { self?.showError(error) }
-            self?.reloadDirectory(node.url.deletingLastPathComponent())
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error { self.showError(error) }
+                self.reloadDirectory(node.url.deletingLastPathComponent())
+            }
         }
     }
 

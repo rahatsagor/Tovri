@@ -299,9 +299,10 @@ final class EditorTextView: NSTextView {
 
         if !findMatches.isEmpty { drawFindMatches(in: rect, theme: theme) }
 
+        let docLength = (string as NSString).length
         if !occurrenceRanges.isEmpty {
             theme.wordHighlight.setFill()
-            for r in occurrenceRanges {
+            for r in occurrenceRanges where r.length > 0 && NSMaxRange(r) <= docLength {
                 for box in rects(for: r) where box.intersects(rect) {
                     NSBezierPath(roundedRect: box.insetBy(dx: -1, dy: 1), xRadius: 3, yRadius: 3).fill()
                 }
@@ -311,7 +312,7 @@ final class EditorTextView: NSTextView {
         if !extraSelections.isEmpty {
             let color = window?.isKeyWindow == true ? theme.selection : theme.inactiveSelection
             color.setFill()
-            for r in extraSelections where r.length > 0 {
+            for r in extraSelections where r.length > 0 && NSMaxRange(r) <= docLength {
                 for box in rects(for: r) where box.intersects(rect) { box.fill() }
             }
         }
@@ -320,7 +321,7 @@ final class EditorTextView: NSTextView {
 
         if let (a, b) = bracketPair {
             theme.bracketMatch.setStroke()
-            for i in [a, b] {
+            for i in [a, b] where i >= 0 && i < docLength {
                 guard let box = rects(for: NSRange(location: i, length: 1)).first, box.intersects(rect) else { continue }
                 let path = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 1.5), xRadius: 2, yRadius: 2)
                 path.lineWidth = 1

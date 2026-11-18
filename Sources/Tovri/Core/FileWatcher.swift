@@ -103,7 +103,8 @@ final class ProjectIndex {
         DispatchQueue.global(qos: .utility).async {
             let files = ProjectIndex.enumerate(root: root, excludes: excludes, limit: ProjectIndex.maxFiles)
             let entries = files.map { rel -> Entry in
-                let units = Array(rel.utf16)
+                let normalized = rel.precomposedStringWithCanonicalMapping
+                let units = Array(normalized.utf16)
                 var base = 0
                 if let slash = units.lastIndex(of: 47) { base = slash + 1 }
                 return Entry(relativePath: rel, units: units, basenameStart: base)

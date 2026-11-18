@@ -98,7 +98,9 @@ enum ReplaceInFiles {
         FindState.enumerateMatches(re, in: text, range: NSRange(location: 0, length: (text as NSString).length), isWordChar: isWordChar) { m in
             // Find in Files skips empty matches, so replacing them would change what the preview didn't show.
             guard m.range.length > 0 else { return true }
-            out.append((m.range, o.regex ? re.replacementString(for: m, in: text, offset: 0, template: template) : replacement))
+            let raw = o.regex ? re.replacementString(for: m, in: text, offset: 0, template: template) : replacement
+            let normalized = raw.contains("\r") ? LineEnding.normalize(raw, rawData: nil).0 : raw
+            out.append((m.range, normalized))
             return true
         }
         return out
@@ -460,6 +462,9 @@ extension MainWindowController {
 final class ReplaceInFilesController {
     private weak var controller: MainWindowController?
     private var progressSheet: ReplaceProgressSheet?
+    private var activeSearcher: FileSearcher?
+    private var activeCancel: ReplaceInFiles.Cancellation?
+    private var sessionID = 0
     private(set) var lastBatch: ReplaceBatch?
     private(set) var isBusy = false
     /// Answers the confirmation instead of asking, for tests.
@@ -468,6 +473,17 @@ final class ReplaceInFilesController {
     init(controller: MainWindowController) { self.controller = controller }
 
     var canUndo: Bool { !isBusy && lastBatch.map { !$0.isEmpty } == true }
+
+    func cancel() {
+        sessionID &+= 1
+        activeSearcher?.cancel()
+        activeSearcher = nil
+        activeCancel?.cancel()
+        activeCancel = nil
+        closeProgress()
+        controller?.statusBar.message = nil
+        isBusy = false
+    }
 
     private var allDocuments: [Document] {
         guard let controller else { return [] }
@@ -497,19 +513,23 @@ final class ReplaceInFilesController {
             return
         }
         isBusy = true
+        sessionID &+= 1
+        let gen = sessionID
         let open = ReplaceInFiles.openFiles(under: options.root, in: allDocuments)
         let searcher = FileSearcher()
+        activeSearcher = searcher
         c.statusBar.message = "Searching for “\(options.query)”…"
         let started = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let plan = ReplaceInFiles.plan(options, replacement: replacement, open: open, searcher: searcher)
             let elapsed = Date().timeIntervalSince(started)
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, gen == self.sessionID else { return }
+                self.activeSearcher = nil
                 self.controller?.statusBar.message = nil
                 guard let plan else {
                     self.isBusy = false
-                    NSSound.beep()
+                    if !searcher.isCancelled { NSSound.beep() }
                     completion?()
                     return
                 }
@@ -570,6 +590,8 @@ final class ReplaceInFilesController {
         let openPaths = Set(allDocuments.compactMap { $0.url?.realPathURL.path })
         let disk = plan.diskTargets.count
         let cancel = ReplaceInFiles.Cancellation()
+        activeCancel = cancel
+        let gen = sessionID
         let history = LocalHistory.shared
         var sheet: ReplaceProgressSheet?
         if disk > 0, window != nil {
@@ -578,16 +600,20 @@ final class ReplaceInFilesController {
             progressSheet = s
             // Most replaces finish before a sheet would be noticed.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self, weak s] in
-                guard let self, let s, self.progressSheet === s, let w = self.window else { return }
+                guard let self, gen == self.sessionID, let s, self.progressSheet === s, let w = self.window else { return }
                 w.beginSheet(s.window)
             }
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let onDisk = ReplaceInFiles.applyOnDisk(plan, batch: batch, openPaths: openPaths, history: history, cancel: cancel) { n in
-                DispatchQueue.main.async { sheet?.update(n) }
+                DispatchQueue.main.async {
+                    guard self?.sessionID == gen else { return }
+                    sheet?.update(n)
+                }
             }
             DispatchQueue.main.async {
-                self?.finish(plan, inEditor + onDisk, batch: batch, stopped: cancel.isCancelled, completion: completion)
+                guard let self, gen == self.sessionID else { return }
+                self.finish(plan, inEditor + onDisk, batch: batch, stopped: cancel.isCancelled, completion: completion)
             }
         }
     }
@@ -600,6 +626,7 @@ final class ReplaceInFilesController {
     private func finish(_ plan: ReplaceInFiles.Plan, _ outcomes: [ReplaceInFiles.Outcome], batch: ReplaceBatch, stopped: Bool,
                         completion: (() -> Void)?) {
         closeProgress()
+        activeCancel = nil
         isBusy = false
         if !batch.isEmpty { lastBatch = batch }
         guard let c = controller else { return }
@@ -633,13 +660,18 @@ final class ReplaceInFilesController {
     func undoLast(completion: (() -> Void)? = nil) {
         guard let batch = lastBatch, !isBusy else { NSSound.beep(); return }
         isBusy = true
+        sessionID &+= 1
+        let gen = sessionID
         let dirty = Set(allDocuments.filter(\.isDirty).compactMap { $0.url?.realPathURL.path })
         let editors = batch.edited.map { (edit: $0, ok: batch.canUndo($0)) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let files = batch.saved.map { s -> (ReplaceBatch.Saved, String?) in
                 (s, dirty.contains(s.url.path) ? "It’s open with unsaved edits." : batch.problem(with: s))
             }
-            DispatchQueue.main.async { self?.confirmUndo(batch, files: files, editors: editors, completion: completion) }
+            DispatchQueue.main.async {
+                guard let self, gen == self.sessionID else { return }
+                self.confirmUndo(batch, files: files, editors: editors, completion: completion)
+            }
         }
     }
 
@@ -671,6 +703,7 @@ final class ReplaceInFilesController {
 
     private func performUndo(_ batch: ReplaceBatch, files: [ReplaceBatch.Saved], editors: [ReplaceBatch.Edited],
                              kept: [(String, String)], completion: (() -> Void)?) {
+        let gen = sessionID
         var undone: [String] = []
         var left = kept
         for e in editors {
@@ -684,7 +717,7 @@ final class ReplaceInFilesController {
                 if let problem = batch.restore(s) { failed.append((s.path, problem)) } else { restored.append(s.path) }
             }
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, gen == self.sessionID else { return }
                 self.isBusy = false
                 if self.lastBatch === batch { self.lastBatch = nil }
                 let all = restored + undone

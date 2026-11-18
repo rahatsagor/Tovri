@@ -161,7 +161,9 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         if let m = message ?? flashText {
             let x = messageX(rects)
             let right = StatusBarView.rightItems.compactMap { rects[$0]?.minX }.min() ?? bounds.width - 10
-            drawTruncated(m, x: x, width: right - 10 - x, attrs: attrs)
+            if right - 10 - x > 12 {
+                drawTruncated(m, x: x, width: right - 10 - x, attrs: attrs)
+            }
         }
         for item in StatusBarView.rightItems {
             guard let r = rects[item], let v = values[item] else { continue }

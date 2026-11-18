@@ -54,4 +54,12 @@ extension MainWindowController: QLPreviewPanelDataSource {
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
         quickLookItems[index] as NSURL
     }
+
+    func closeQuickLookIfOwned() {
+        quickLookItems = []
+        guard QLPreviewPanel.sharedPreviewPanelExists(),
+              let panel = QLPreviewPanel.shared(),
+              panel.dataSource === self else { return }
+        panel.close()
+    }
 }

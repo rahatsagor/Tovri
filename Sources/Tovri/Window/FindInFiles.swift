@@ -45,11 +45,17 @@ final class FileSearcher {
     static let maxFiles = 2_000
     static let maxMatchesPerFile = 5_000
 
+    private struct FileID: Hashable {
+        let dev: UInt64
+        let ino: UInt64
+    }
+
     private struct Found {
         var text: String
         var matches: Int
         var truncated: Bool
         var digest: SHA256.Digest?
+        var fileID: FileID?
     }
 
     private let lock = NSLock()
@@ -84,11 +90,110 @@ final class FileSearcher {
     }
 
     static func patterns(_ s: String) -> [String] {
-        s.split(whereSeparator: { $0 == "," || $0 == " " }).map { String($0) }.filter { !$0.isEmpty }
+        // Prefer commas when top-level commas exist so patterns like `My Folder/*.swift, *.md` stay intact;
+        // otherwise split on top-level whitespace outside `{...}` brace groups.
+        var hasTopCommas = false
+        var depth = 0
+        for ch in s {
+            if ch == "{" { depth += 1 }
+            else if ch == "}" && depth > 0 { depth -= 1 }
+            else if ch == "," && depth == 0 { hasTopCommas = true; break }
+        }
+        var raw: [String] = []
+        var cur = ""
+        depth = 0
+        for ch in s {
+            if ch == "{" { depth += 1 }
+            else if ch == "}" && depth > 0 { depth -= 1 }
+            let isSep = depth == 0 && (hasTopCommas ? ch == "," : ch.isWhitespace)
+            if isSep {
+                let t = cur.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { raw.append(t) }
+                cur = ""
+            } else {
+                cur.append(ch)
+            }
+        }
+        let last = cur.trimmingCharacters(in: .whitespaces)
+        if !last.isEmpty { raw.append(last) }
+        return raw.flatMap { expandBraces($0) }.map { p in
+            var cleaned = p
+            while cleaned.hasPrefix("./") { cleaned.removeFirst(2) }
+            return cleaned
+        }.filter { !$0.isEmpty }
+    }
+
+    private static func expandBraces(_ pattern: String, cap: Int = 64) -> [String] {
+        var queue = [pattern]
+        var out: [String] = []
+        while let current = queue.first {
+            queue.removeFirst()
+            guard let open = current.firstIndex(of: "{") else {
+                out.append(current)
+                continue
+            }
+            var depth = 0
+            var close: String.Index?
+            var parts: [String] = []
+            var start = current.index(after: open)
+            var idx = start
+            while idx < current.endIndex {
+                let ch = current[idx]
+                if ch == "{" { depth += 1 }
+                else if ch == "}" {
+                    if depth == 0 {
+                        parts.append(String(current[start..<idx]))
+                        close = idx
+                        break
+                    }
+                    depth -= 1
+                } else if ch == "," && depth == 0 {
+                    parts.append(String(current[start..<idx]))
+                    start = current.index(after: idx)
+                }
+                idx = current.index(after: idx)
+            }
+            guard let close, parts.count > 1 else {
+                out.append(current)
+                continue
+            }
+            let prefix = String(current[..<open])
+            let suffix = String(current[current.index(after: close)...])
+            for part in parts {
+                if out.count + queue.count >= cap { break }
+                queue.append(prefix + part + suffix)
+            }
+        }
+        return out
     }
 
     private static func matches(_ name: String, _ rel: String, _ patterns: [String]) -> Bool {
-        for p in patterns {
+        for rawPattern in patterns {
+            var p = rawPattern
+            while p.hasPrefix("./") { p.removeFirst(2) }
+            guard !p.isEmpty else { continue }
+            if p.hasPrefix("**/") {
+                let sub = String(p.dropFirst(3))
+                if matches(name, rel, [sub]) || fnmatch("*/" + sub, rel, 0) == 0 { return true }
+                continue
+            }
+            if p.hasSuffix("/") {
+                let dir = String(p.dropLast())
+                guard !dir.isEmpty else { continue }
+                if !dir.contains("*") && !dir.contains("?") && !dir.contains("[") {
+                    if rel.hasPrefix(dir + "/") || (!dir.contains("/") && rel.contains("/" + dir + "/")) { return true }
+                } else if dir.contains("/") {
+                    var prefix = rel
+                    while let slash = prefix.lastIndex(of: "/") {
+                        prefix = String(prefix[..<slash])
+                        if fnmatch(dir, prefix, 0) == 0 { return true }
+                    }
+                } else {
+                    let comps = rel.split(separator: "/")
+                    if comps.dropLast().contains(where: { fnmatch(dir, String($0), 0) == 0 }) { return true }
+                }
+                continue
+            }
             let target = p.contains("/") ? rel : name
             if fnmatch(p, target, 0) == 0 { return true }
         }
@@ -167,9 +272,22 @@ final class FileSearcher {
         var fileCount = 0
         var limited = false
         var hits: [Hit] = []
+        var seenInodes: [FileID: String] = [:]
+        func isSymlink(_ path: String) -> Bool {
+            var st = stat()
+            return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK
+        }
         for (i, found) in results.enumerated() {
             guard finished[i / chunk] else { limited = true; break }
             guard let found else { continue }
+            if let fid = found.fileID {
+                let fullPath = root.appendingPathComponent(files[i]).path
+                if let prevPath = seenInodes[fid] {
+                    if isSymlink(fullPath) || isSymlink(prevPath) { continue }
+                } else {
+                    seenInodes[fid] = fullPath
+                }
+            }
             if total >= FileSearcher.maxMatches || fileCount >= FileSearcher.maxFiles { limited = true; break }
             text += found.text
             total += found.matches
@@ -249,6 +367,7 @@ final class FileSearcher {
         guard info.st_size > 0,
               let data = try? Document.readFile(url), !data.isEmpty, data.count < FileSearcher.maxFileSize,
               let s = text(of: data), var found = search(text: s, path: path, re, isWordChar: isWordChar) else { return nil }
+        found.fileID = FileID(dev: UInt64(info.st_dev), ino: info.st_ino)
         if digest { found.digest = SHA256.hash(data: data) }
         return found
     }

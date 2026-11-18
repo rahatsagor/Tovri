@@ -117,7 +117,8 @@ final class KeyBindings: ObservableObject {
             guard let action = item.action, !item.title.isEmpty,
                   !KeyBindings.skippedActions.contains(NSStringFromSelector(action)) else { continue }
             let p = path.joined(separator: " › ")
-            visit(item, p + "/" + item.title, p)
+            let id = item.identifier?.rawValue ?? (p + "/" + item.title)
+            visit(item, id, p)
         }
     }
 
@@ -130,7 +131,8 @@ final class KeyBindings: ObservableObject {
             }
             if item.isHidden && item.allowsKeyEquivalentWhenHidden {
                 let p = path.joined(separator: " › ")
-                visit(item, p + "/" + item.title)
+                let id = item.identifier?.rawValue ?? (p + "/" + item.title)
+                visit(item, id)
             }
         }
     }
@@ -138,6 +140,7 @@ final class KeyBindings: ObservableObject {
     func install(on menu: NSMenu) {
         self.menu = menu
         walk(menu, path: []) { item, id, _ in
+            if item.identifier == nil { item.identifier = NSUserInterfaceItemIdentifier(id) }
             if defaults[id] == nil { defaults[id] = .some(KeyShortcut(item: item)) }
         }
         walkHiddenAlternates(menu, path: []) { item, _ in
@@ -218,6 +221,16 @@ final class ShortcutRecorderField: NSView {
     override var acceptsFirstResponder: Bool { true }
     override var intrinsicContentSize: NSSize { NSSize(width: 130, height: 24) }
 
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+    override func accessibilityLabel() -> String? { "Shortcut" }
+    override func accessibilityValue() -> Any? { recording ? "Recording" : (shortcut?.display ?? "None") }
+    override func accessibilityPerformPress() -> Bool {
+        window?.makeFirstResponder(self)
+        recording = true
+        return true
+    }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         recording = true
@@ -235,7 +248,16 @@ final class ShortcutRecorderField: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard recording else { super.keyDown(with: event); return }
+        guard recording else {
+            let mods = event.modifierFlags.intersection(KeyShortcut.relevant)
+            if (event.keyCode == 49 || event.keyCode == 36 || event.keyCode == 76),
+               !mods.contains(.command), !mods.contains(.option), !mods.contains(.control) {
+                recording = true
+                return
+            }
+            super.keyDown(with: event)
+            return
+        }
         handle(event)
     }
 
