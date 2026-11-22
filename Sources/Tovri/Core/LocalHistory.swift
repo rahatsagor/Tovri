@@ -64,7 +64,7 @@ final class LocalHistory {
         private let taken: Date
         private let newData: Data
         private var fd: Int32
-        private let data: Data?
+        private var data: Data?
         private var consumed = false
 
         init(history: LocalHistory, path: String, modified: Date, taken: Date, newData: Data, fd: Int32, data: Data?) {
@@ -97,6 +97,20 @@ final class LocalHistory {
             }
         }
 
+        /// Reads the old bytes now. An in-place write changes the very file the descriptor points at.
+        func captureNow() {
+            guard !consumed, data == nil else { return }
+            let openFD = fd
+            fd = -1
+            let bytes = LocalHistory.read(openFD, limit: history.limits.maxFileSize)
+            close(openFD)
+            guard let bytes else {
+                consumed = true
+                return
+            }
+            data = bytes
+        }
+
         func discard() {
             guard !consumed else { return }
             consumed = true
@@ -107,6 +121,7 @@ final class LocalHistory {
     /// Captures an open descriptor (or bytes if hard-linked) before overwriting `url`. The caller
     /// must invoke `commit()` after the overwrite succeeds so failed saves never leave snapshots.
     func prepareBeforeOverwrite(of url: URL, with newData: Data) -> PendingSnapshot? {
+        guard Settings.shared.localHistory else { return nil }
         let path = LocalHistory.key(for: url)
         let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return nil }

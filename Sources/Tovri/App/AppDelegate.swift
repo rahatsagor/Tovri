@@ -128,9 +128,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             && URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "req" } == true
     }
 
+    enum CLITempFile {
+        case data(Data)
+        case tooLarge
+        case refused
+    }
+
+    /// Piped text over this size is refused instead of loaded into memory.
+    static let standardInputLimit = 512_000_000
+
     /// Accepts and reads only files the CLI created for this user in its temporary folder using one
-    /// non-following descriptor, eliminating TOCTOU races between checking and reading.
-    private static func readCLITempFile(_ path: String, prefix: String, maxBytes: Int) -> Data? {
+    /// non-following descriptor, eliminating TOCTOU races between checking and reading. Files that
+    /// fail validation are left alone; ones over `maxBytes` are removed so they don't pile up.
+    static func readCLITempFile(_ path: String, prefix: String, maxBytes: Int) -> CLITempFile {
         let file = URL(fileURLWithPath: path).standardizedFileURL
         // The CLI writes to `getconf DARWIN_USER_TEMP_DIR`, which is usually the app's own
         // temporary folder too; both are private to this user.
@@ -140,21 +150,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let allowed = Set(tmpDirs.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
         guard file.lastPathComponent.hasPrefix(prefix),
               allowed.contains(file.deletingLastPathComponent().resolvingSymlinksInPath().path)
-        else { return nil }
+        else { return .refused }
         let fd = open(file.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { return nil }
+        guard fd >= 0 else { return .refused }
         defer { close(fd) }
         var info = stat()
         guard fstat(fd, &info) == 0,
               (info.st_mode & S_IFMT) == S_IFREG,
               info.st_uid == getuid(),
-              info.st_size >= 0,
-              info.st_size <= off_t(maxBytes) else { return nil }
+              info.st_size >= 0 else { return .refused }
+        guard info.st_size <= off_t(maxBytes) else {
+            unlink(file.path)
+            return .tooLarge
+        }
         var data = Data(count: Int(info.st_size) + 1)
         var filled = 0
         while true {
             if filled == data.count {
-                guard data.count <= maxBytes else { return nil }
+                guard data.count <= maxBytes else {
+                    unlink(file.path)
+                    return .tooLarge
+                }
                 data.count += max(1 << 14, data.count / 4)
             }
             let n = data.withUnsafeMutableBytes { raw in
@@ -162,15 +178,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             }
             if n < 0 {
                 if errno == EINTR { continue }
-                return nil
+                return .refused
             }
             if n == 0 { break }
             filled += n
         }
-        guard filled <= maxBytes else { return nil }
+        guard filled <= maxBytes else {
+            unlink(file.path)
+            return .tooLarge
+        }
         data.count = filled
         unlink(file.path)
-        return data
+        return .data(data)
     }
 
     /// Line and column numbers from outside are clamped so arithmetic on them can't overflow.
@@ -186,7 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func takeCommandQuery(from url: URL) -> [String: String]? {
         guard url.host == "open", let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let reqPath = AppDelegate.unhex(comps.queryItems?.first(where: { $0.name == "req" })?.value),
-              let data = AppDelegate.readCLITempFile(reqPath, prefix: "tovri-req.", maxBytes: 1_000_000),
+              case .data(let data) = AppDelegate.readCLITempFile(reqPath, prefix: "tovri-req.", maxBytes: 1_000_000),
               let body = String(data: data, encoding: .utf8),
               let request = URLComponents(string: "tovri://open?" + body.trimmingCharacters(in: .whitespacesAndNewlines))
         else { return nil }
@@ -219,15 +238,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             if let doc { WaitRegistry.shared.register(wait, for: doc) } else { WaitRegistry.shared.release(wait) }
         }
         if let tmp = AppDelegate.unhex(q["stdin"]) {
-            guard let data = AppDelegate.readCLITempFile(tmp, prefix: "tovri-stdin.", maxBytes: 512_000_000) else {
+            switch AppDelegate.readCLITempFile(tmp, prefix: "tovri-stdin.", maxBytes: AppDelegate.standardInputLimit) {
+            case .data(let data):
+                let decoded = AppDelegate.decodeStandardInput(data)
+                let c = target()
+                finish(c.openText(decoded.text, encoding: decoded.encoding))
+                c.window?.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            case .refused:
                 finish(nil)
-                return
+            case .tooLarge:
+                finish(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "The piped text is too large to open."
+                alert.informativeText = "Tovri opens up to \(ByteCountFormatter.string(fromByteCount: Int64(AppDelegate.standardInputLimit), countStyle: .file)) from standard input. Save the text to a file and open the file instead."
+                alert.runModal()
             }
-            let decoded = AppDelegate.decodeStandardInput(data)
-            let c = target()
-            finish(c.openText(decoded.text, encoding: decoded.encoding))
-            c.window?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
             return
         }
         guard let path = AppDelegate.unhex(q["path"]) else {
@@ -415,6 +443,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     var canReopenClosedWindow: Bool { !closedWindows.isEmpty }
+
+    /// Remembers a window closed after its unsaved changes were saved or discarded, so Reopen
+    /// Closed Window and the next launch bring back the files it showed and nothing unsaved.
+    func rememberClosedWindow(_ c: MainWindowController) {
+        let s = c.sessionState(includeUnsaved: false)
+        guard s.folder != nil || s.groups.contains(where: { !$0.tabs.isEmpty }) else { return }
+        recordClosedWindow(s)
+    }
 
     func recordClosedWindow(_ session: WindowSession) {
         var s = session

@@ -69,11 +69,15 @@ a `sudo` command for you to run yourself instead of asking for your password.
 
 ## Your files and unsaved work
 
-- Saving writes a new copy and then replaces the file, so a failed save never
-  leaves a half-written file. Read-only files are never replaced, file and CLI
-  request reads verify a regular file on a single non-blocking (`O_NONBLOCK`)
-  descriptor so FIFOs, devices, or swapped symlinks cannot hang the app, and a
-  file changed by another app since Tovri read it asks before it's overwritten.
+- Tovri normally saves by writing a new copy and renaming it into place, so
+  a failed write does not leave the original half-written. A file with other
+  hard links, or in a folder Tovri can't add files to, is written in place
+  instead. If an in-place save fails, Tovri attempts to restore the old
+  contents, but that recovery can also fail and leave the file partially
+  written. Read-only files are never replaced. File and CLI request reads
+  verify a regular file on a single non-blocking (`O_NONBLOCK`) descriptor
+  so FIFOs, devices, or swapped symlinks cannot hang the app. Tovri asks
+  before overwriting a detected external change.
 - Hot exit keeps unsaved changes in `~/Library/Application Support/Tovri`
   between launches. These files are readable only by your user account, but
   they are not encrypted, so they are as safe as the rest of your home
@@ -82,7 +86,8 @@ a `sudo` command for you to run yourself instead of asking for your password.
 - Local History keeps earlier versions of files you save over, and their
   original paths, only on your Mac, in
   `~/Library/Application Support/Tovri/History`, readable only by your user
-  account. It is never uploaded or shared, and **File → Clear Local
+  account. Turn it off in **Settings → Files** if you edit secrets you don't
+  want copied. It is never uploaded or shared, and **File → Clear Local
   History…** deletes it. Discard Changes in the Changes list moves new files
   and a copy of changed files to the Trash before Git restores them.
 

@@ -127,4 +127,139 @@ final class SessionTests: XCTestCase {
             XCTAssertEqual(controller.activeEditor?.scrollPosition.y, 0)
         }
     }
+
+    // MARK: Reopen Closed Window
+
+    /// Without unsaved buffers a closed window is remembered by the files it showed: untitled and
+    /// not-yet-saved tabs are left out, and no hot-exit buffer is written for a dirty file.
+    func testSessionWithoutUnsavedKeepsOnlyRealFiles() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".txt")
+        try "on disk\n".write(to: fileURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try withController { controller in
+            let fileDoc = try XCTUnwrap(controller.open(url: fileURL))
+            fileDoc.textStorage.replaceCharacters(in: NSRange(location: fileDoc.length, length: 0), with: "edit\n")
+            let untitled = Document()
+            untitled.restoreBuffer("unsaved text\n")
+            controller.activeGroup.add(untitled)
+            _ = controller.openNewFile(at: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".swift"))
+
+            let state = controller.sessionState(includeUnsaved: false)
+            let tabs = state.groups.flatMap(\.tabs)
+            XCTAssertEqual(tabs.count, 1)
+            XCTAssertEqual(tabs[0].path, fileURL.path)
+            XCTAssertNil(tabs[0].buffer)
+        }
+    }
+
+    /// Makes `NSApp.delegate` a fresh AppDelegate, the way SessionExitTests does, and closes every
+    /// window it opened afterwards.
+    private func withAppDelegate(_ body: (AppDelegate) throws -> Void) throws {
+        let application = NSApplication.shared
+        let oldDelegate = application.delegate
+        let app = AppDelegate()
+        application.delegate = app
+        defer {
+            for controller in app.controllers {
+                if let sheet = controller.window?.attachedSheet { controller.window?.endSheet(sheet) }
+                for group in controller.groups { for tab in group.tabs { tab.close() } }
+                controller.teardown()
+                controller.window?.delegate = nil
+                controller.window?.close()
+            }
+            application.delegate = oldDelegate
+        }
+        try body(app)
+    }
+
+    /// Closing one of several windows records it even with hot exit off, so Reopen Closed Window
+    /// brings back the files it showed.
+    func testClosingOneOfTwoWindowsRecordsItForReopen() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".txt")
+        try "contents\n".write(to: fileURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try withAppDelegate { app in
+            let d = AppRuntime.defaults
+            let oldHotExit = d.object(forKey: Settings.Key.hotExit)
+            d.set(false, forKey: Settings.Key.hotExit)
+            Settings.shared.reloadFromDefaults()
+            defer {
+                if let oldHotExit { d.set(oldHotExit, forKey: Settings.Key.hotExit) } else { d.removeObject(forKey: Settings.Key.hotExit) }
+                Settings.shared.reloadFromDefaults()
+            }
+            let first = app.newWindow()
+            _ = first.open(url: fileURL)
+            _ = app.newWindow()
+
+            XCTAssertTrue(first.windowShouldClose(try XCTUnwrap(first.window)))
+            XCTAssertTrue(app.canReopenClosedWindow)
+            first.window?.close()
+
+            let reopened = try XCTUnwrap(app.reopenClosedWindow(nil))
+            XCTAssertEqual(reopened.activeDocument?.url, fileURL)
+        }
+    }
+
+    /// A window with nothing but an empty untitled tab has nothing worth reopening.
+    func testClosingAnEmptyWindowRecordsNothing() throws {
+        try withAppDelegate { app in
+            let d = AppRuntime.defaults
+            let oldHotExit = d.object(forKey: Settings.Key.hotExit)
+            d.set(false, forKey: Settings.Key.hotExit)
+            Settings.shared.reloadFromDefaults()
+            defer {
+                if let oldHotExit { d.set(oldHotExit, forKey: Settings.Key.hotExit) } else { d.removeObject(forKey: Settings.Key.hotExit) }
+                Settings.shared.reloadFromDefaults()
+            }
+            let controller = app.newWindow()
+            XCTAssertTrue(controller.isEmptyWindow)
+            XCTAssertTrue(controller.windowShouldClose(try XCTUnwrap(controller.window)))
+            XCTAssertFalse(app.canReopenClosedWindow)
+            controller.window?.close()
+        }
+    }
+
+    /// A pending Save with Encoding describes the next write, not the bytes on disk: neither the
+    /// retained document's reload nor the closed window's snapshot may decode with it.
+    func testReopenClosedWindowIgnoresDiscardedSaveEncoding() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".txt")
+        let text = "caf\u{00E9}\n"
+        try Data(text.utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try withAppDelegate { app in
+            _ = app.newWindow() // Another window prevents hot exit from skipping the prompt.
+            try autoreleasepool {
+                let first = app.newWindow()
+                let doc = try XCTUnwrap(first.open(url: fileURL))
+                XCTAssertTrue(doc.encodingWasDetected)
+                let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                item.representedObject = TextEncoding.windows1252.rawValue
+                first.setEncoding(item)
+                XCTAssertTrue(doc.isDirty)
+                let window = try XCTUnwrap(first.window)
+                XCTAssertFalse(first.windowShouldClose(window))
+                window.endSheet(try XCTUnwrap(window.attachedSheet), returnCode: .alertThirdButtonReturn)
+                let deadline = Date().addingTimeInterval(3)
+                while (app.controllers.contains { $0 === first } || doc.isDirty) && Date() < deadline {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+                }
+                XCTAssertTrue(app.canReopenClosedWindow)
+                XCTAssertFalse(doc.isDirty)
+                XCTAssertEqual(doc.string as String, text)
+                XCTAssertTrue(doc.encodingWasDetected)
+            }
+            let deadline = Date().addingTimeInterval(3)
+            while DocumentRegistry.shared.existing(for: fileURL) != nil && Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            XCTAssertNil(DocumentRegistry.shared.existing(for: fileURL), "Reopen must read from the closed window snapshot")
+            let reopened = try XCTUnwrap(app.reopenClosedWindow(nil))
+            let doc = try XCTUnwrap(reopened.activeDocument)
+            XCTAssertEqual(doc.string as String, text)
+            XCTAssertEqual(doc.encoding, .utf8)
+            XCTAssertTrue(doc.encodingWasDetected)
+            XCTAssertFalse(doc.isDirty)
+            XCTAssertEqual(try Data(contentsOf: fileURL), Data(text.utf8))
+        }
+    }
 }

@@ -15,6 +15,8 @@ struct TabSession: Codable {
     /// The file as it was when the backup was taken, so a file changed since then is noticed
     /// before the backup is saved over it.
     var diskStamp: DiskStamp? = nil
+    /// Fingerprint of the original on-disk bytes, not of the unsaved buffer.
+    var diskFingerprint: Data? = nil
     /// The document and edit version the tab showed, so an older backup of the same buffer from
     /// another window never replaces newer text.
     var documentID: String? = nil

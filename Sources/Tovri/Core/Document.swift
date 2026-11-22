@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 
 protocol DocumentEditor: AnyObject {
     func documentDidEdit(range: NSRange, delta: Int)
@@ -61,6 +62,24 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// The file's identity, modification time and size when Tovri last read or wrote it.
     private var diskStamp: DiskStamp?
     var lastReadDiskStamp: DiskStamp? { diskStamp }
+    private(set) var lastReadDiskFingerprint: Data?
+    private var restoredDiskConflict = false
+
+    private func setDiskBaseline(_ stamp: DiskStamp?, fingerprint: Data? = nil) {
+        diskStamp = stamp
+        lastReadDiskFingerprint = fingerprint
+        restoredDiskConflict = false
+    }
+
+    func matchesBackupDiskVersion(_ stamp: DiskStamp?, fingerprint: Data?) -> Bool {
+        guard !restoredDiskConflict, let stamp, let current = diskStamp else { return false }
+        // Old sessions can still use an exact stamp; a different mount needs proof of the bytes.
+        if stamp == current && fingerprint == nil { return true }
+        guard let fingerprint, fingerprint == lastReadDiskFingerprint else { return false }
+        return stamp == current || (stamp.device != current.device && stamp.size == current.size
+            && stamp.seconds == current.seconds && stamp.nanoseconds == current.nanoseconds)
+    }
+
     private(set) var fileMissing = false
     private(set) var editVersion = 0
     var languageWasSetManually = false
@@ -76,6 +95,10 @@ final class Document: NSObject, NSTextStorageDelegate {
     private var savedHash: UInt64?
     private var savedLineEnding: LineEnding = .lf
     private var savedEncoding: TextEncoding = .utf8
+    private var savedEncodingWasDetected = false
+    var savedFormat: (encoding: TextEncoding, lineEnding: LineEnding, encodingWasDetected: Bool) {
+        (savedEncoding, savedLineEnding, savedEncodingWasDetected)
+    }
     private var cleanCheckScheduled = false
     private var isBulkLoading = false
     private var wasDirty = false
@@ -247,7 +270,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         encoding = decoded.encoding
         encodingWasDetected = decoded.detected
         lineEnding = ending
-        diskStamp = stamp
+        setDiskBaseline(stamp, fingerprint: Data(SHA256.hash(data: data)))
         fileMissing = false
         let firstLine = text.prefix(200).split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
         if !languageWasSetManually {
@@ -344,15 +367,20 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// Restores an unsaved buffer (hot exit) on top of the file's saved state, keeping the saved
     /// hash so the document reads as dirty only if the buffer actually differs from disk.
     /// `backupStamp` is the file's state when the backup was taken.
-    func restoreBuffer(_ text: String, from source: BackupSource? = nil, diskStamp backupStamp: DiskStamp? = nil) {
+    func restoreBuffer(_ text: String, from source: BackupSource? = nil, diskStamp backupStamp: DiskStamp? = nil,
+                       diskFingerprint backupFingerprint: Data? = nil) {
         setContent(text)
         undoManager.removeAllActions()
         if let source { restoredFrom = (source, editVersion) }
         dirtyFlag = !matchesSavedVersion()
         dirtyOnlyFromDeletion = false
-        // The buffer was edited against an older version of the file. Keeping that version's stamp
-        // makes saving ask before it replaces what another program wrote meanwhile.
-        if dirtyFlag, let backupStamp, let current = diskStamp, backupStamp != current { diskStamp = backupStamp }
+        // Preserve the original baseline for future backups, and flag a conflict even when
+        // the metadata is identical and only the bytes differ.
+        if dirtyFlag, url != nil, let backupStamp, !matchesBackupDiskVersion(backupStamp, fingerprint: backupFingerprint) {
+            diskStamp = backupStamp
+            lastReadDiskFingerprint = backupFingerprint
+            restoredDiskConflict = true
+        }
         allEditors.forEach { $0.documentDidReload() }
         postStateChange(force: true)
     }
@@ -392,7 +420,8 @@ final class Document: NSObject, NSTextStorageDelegate {
     func reload(encoding preferred: TextEncoding? = nil) throws {
         guard let url else { return }
         let wasPopulated = length > 0
-        try load(from: url, encoding: preferred ?? (encodingWasDetected ? nil : encoding), incremental: wasPopulated)
+        // A pending Save with Encoding choice describes the next write, not the bytes on disk.
+        try load(from: url, encoding: preferred ?? (savedEncodingWasDetected ? nil : savedEncoding), incremental: wasPopulated)
         undoManager.removeAllActions()
         if !wasPopulated { allEditors.forEach { $0.documentDidReload() } }
         postStateChange(force: true)
@@ -639,6 +668,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         savedHash = length <= 64_000_000 ? Document.contentHash(string) : nil
         savedLineEnding = lineEnding
         savedEncoding = encoding
+        savedEncodingWasDetected = encodingWasDetected
     }
 
     /// Changes the encoding the next save writes, as an undoable edit without touching disk.
@@ -739,7 +769,8 @@ final class Document: NSObject, NSTextStorageDelegate {
     func checkBeforeSaving(to target: URL? = nil, replacingExternalChanges: Bool = false) throws {
         guard let dest = target ?? url else { return }
         let resolved = Document.resolveDestination(dest)
-        if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved), isNewFile || current != diskStamp {
+        if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved),
+           isNewFile || restoredDiskConflict || current != diskStamp {
             throw DocumentError.modifiedOnDisk
         }
         guard let data = Document.encode(textStorage.mutableString, encoding: encoding, lineEnding: lineEnding) else {
@@ -752,7 +783,8 @@ final class Document: NSObject, NSTextStorageDelegate {
         defer { preflightEncoded = nil }
         guard let dest = target ?? url else { return }
         let resolved = Document.resolveDestination(dest)
-        if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved), isNewFile || current != diskStamp {
+        if target == nil && !replacingExternalChanges, let current = DiskStamp(resolved),
+           isNewFile || restoredDiskConflict || current != diskStamp {
             throw DocumentError.modifiedOnDisk
         }
         let data = try Perf.measure("  encode") { () throws -> Data in
@@ -769,7 +801,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         }
         let pendingHistory = LocalHistory.shared.prepareBeforeOverwrite(of: resolved, with: data)
         do {
-            try Document.writeFile(data, replacing: resolved)
+            try Document.writeFile(data, replacing: resolved) { pendingHistory?.captureNow() }
             pendingHistory?.commit()
         } catch {
             pendingHistory?.discard()
@@ -779,7 +811,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         let wasUntitled = url == nil
         url = dest
         untitledName = dest.lastPathComponent
-        diskStamp = DiskStamp(resolved)
+        setDiskBaseline(DiskStamp(resolved), fingerprint: Data(SHA256.hash(data: data)))
         fileMissing = false
         markClean()
         if nameChanged || isNewFile { startMonitoring() }
@@ -846,8 +878,9 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// Writes beside the destination and renames into place, so a failed write never truncates the
     /// original. The rename would drop the old file's metadata, so mode, ownership, ACL, extended
     /// attributes (Finder tags, quarantine), the hidden flag and creation date are copied onto the
-    /// new file first.
-    static func writeFile(_ data: Data, replacing url: URL) throws {
+    /// new file first. A file with other hard links, or in a folder that can't take the temp
+    /// file, is written in place instead; `willOverwriteInPlace` runs before each such write.
+    static func writeFile(_ data: Data, replacing url: URL, willOverwriteInPlace: (() -> Void)? = nil) throws {
         let path = url.path
         let fm = FileManager.default
         let existing = try? fm.attributesOfItem(atPath: path)
@@ -859,12 +892,24 @@ final class Document: NSObject, NSTextStorageDelegate {
         let hasInfo = existing != nil && stat(path, &info) == 0
         // A new file would split the path from the file's other hard links, which would keep the old text.
         if hasInfo && info.st_nlink > 1 && (info.st_mode & S_IFMT) == S_IFREG {
+            willOverwriteInPlace?()
             try writeInPlace(data, path: path)
             return
         }
-        let temp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tovri-\(UUID().uuidString)").path
+        var temp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tovri-\(UUID().uuidString)").path
         // New files get the usual 0666 & ~umask; replacements stay private until they carry the original mode.
-        let fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, existing == nil ? 0o666 : 0o600)
+        var fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, existing == nil ? 0o666 : 0o600)
+        if fd < 0 && errno == ENAMETOOLONG {
+            // The name plus the temp prefix can pass the 255-byte file name limit.
+            temp = url.deletingLastPathComponent().appendingPathComponent(".tovri-\(UUID().uuidString)").path
+            fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, existing == nil ? 0o666 : 0o600)
+        }
+        if fd < 0 && (errno == EACCES || errno == EPERM) && hasInfo && (info.st_mode & S_IFMT) == S_IFREG {
+            // The folder can't take a temp file. Try to restore the old bytes if the in-place write fails.
+            willOverwriteInPlace?()
+            try writeInPlace(data, path: path)
+            return
+        }
         guard fd >= 0 else { throw writeError(errno, path: path) }
         var failure = writeAll(data, to: fd)
         if failure == 0 && fsync(fd) != 0 { failure = errno }
@@ -892,7 +937,7 @@ final class Document: NSObject, NSTextStorageDelegate {
     }
 
     /// Overwrites a file that has other hard links, so every link sees the new text. The old bytes
-    /// are read first and written back if the write fails partway.
+    /// are read first for a best-effort rollback if the write fails.
     private static func writeInPlace(_ data: Data, path: String) throws {
         let fd = open(path, O_RDWR | O_CLOEXEC)
         guard fd >= 0 else { throw writeError(errno, path: path) }
@@ -1024,14 +1069,19 @@ final class Document: NSObject, NSTextStorageDelegate {
 
     var isGitDiffCurrent: Bool { gitDiffVersion == editVersion }
     private var gitDiffScheduled = false
-    private var gitGeneration = 0
+    private var gitBaselineGeneration = 0
+    private var gitDiffGeneration = 0
 
     /// What the baseline was read from: the file, its encoding and HEAD's commit.
     private var gitBaselineSource: String?
 
     /// Fetches the file's contents at HEAD and recomputes the gutter diff. Running git is skipped
     /// when HEAD still points at the commit the current baseline came from.
-    func refreshGitBaseline() {
+    func refreshGitBaseline(
+        fetchHead: (GitRepository, URL, @escaping (Data?) -> Void) -> Void = {
+            $0.headContents(of: $1, maxBytes: 12_000_000, $2)
+        }
+    ) {
         guard Settings.shared.gitGutter, let url, length < 3_000_000, let repo = GitRepository.find(for: url) else {
             // After Save As outside the repository the old file's HEAD copy no longer applies.
             clearGitBaseline()
@@ -1039,18 +1089,21 @@ final class Document: NSObject, NSTextStorageDelegate {
         }
         let enc = encoding
         let source = repo.headToken.map { "\(url.path)\n\(enc.rawValue)\n\($0)" }
+        // The cached baseline also supersedes a request that hasn't finished yet.
+        gitBaselineGeneration += 1
         if let source, source == gitBaselineSource, gitBaseline != nil {
             scheduleGitDiff(delay: 0)
             return
         }
-        gitGeneration += 1
-        let gen = gitGeneration
-        repo.headContents(of: url, maxBytes: 12_000_000) { [weak self] data in
-            guard let self, self.gitGeneration == gen, self.url == url, self.encoding == enc, Settings.shared.gitGutter else { return }
+        let gen = gitBaselineGeneration
+        fetchHead(repo, url) { [weak self] data in
+            guard let self, self.gitBaselineGeneration == gen, self.url == url, self.encoding == enc, Settings.shared.gitGutter else { return }
             let decoded = data.map { TextEncoding.decode($0, preferred: enc, preferUTF8IfValid: true) }
             guard let decoded, !decoded.isBinary, decoded.text.utf16.count < 3_000_000 else { self.clearGitBaseline(); return }
             self.gitBaseline = LineEnding.normalize(decoded.text, rawData: nil).0
             self.gitBaselineSource = source
+            // A diff still running against the old baseline must not land over the new one.
+            self.gitDiffGeneration += 1
             self.scheduleGitDiff(delay: 0)
         }
     }
@@ -1059,7 +1112,8 @@ final class Document: NSObject, NSTextStorageDelegate {
     func clearGitBaseline() {
         gitBaseline = nil
         gitBaselineSource = nil
-        gitGeneration += 1
+        gitBaselineGeneration += 1
+        gitDiffGeneration += 1
         guard !gitDiff.isEmpty || !gitDiff.hunks.isEmpty else { return }
         gitDiff = LineDiff()
         allEditors.forEach { $0.documentGitDiffDidChange() }
@@ -1086,14 +1140,14 @@ final class Document: NSObject, NSTextStorageDelegate {
                 return
             }
             guard let base = self.gitBaseline else { return }
-            self.gitGeneration += 1
-            let gen = self.gitGeneration
+            self.gitDiffGeneration += 1
+            let gen = self.gitDiffGeneration
             let current = self.string.copy() as! NSString
             let version = self.editVersion
             DispatchQueue.global(qos: .utility).async {
                 let diff = GitRepository.diff(oldText: base, newText: current as String)
                 DispatchQueue.main.async {
-                    guard gen == self.gitGeneration else { return }
+                    guard gen == self.gitDiffGeneration else { return }
                     self.gitDiff = diff
                     self.gitDiffVersion = version
                     self.allEditors.forEach { $0.documentGitDiffDidChange() }
@@ -1170,19 +1224,19 @@ final class Document: NSObject, NSTextStorageDelegate {
         }
         // The watcher can't be re-armed while the file is missing; resume once it is back.
         if monitor == nil { startMonitoring() }
-        return current == diskStamp ? .unchanged : .modified
+        return !restoredDiskConflict && current == diskStamp ? .unchanged : .modified
     }
 
     func acknowledgeDiskVersion() {
         guard let url else { return }
-        diskStamp = DiskStamp(url)
+        setDiskBaseline(DiskStamp(url))
     }
 
     /// Keeps unsaved edits in memory after an explicit Git discard restored the file on disk,
     /// updating `diskStamp` so external-change checks do not raise a contradictory conflict sheet.
     func syncDiskBaselineAfterDiscard() {
         guard let url else { return }
-        diskStamp = DiskStamp(url)
+        setDiskBaseline(DiskStamp(url))
         fileMissing = false
         dirtyOnlyFromDeletion = false
         savedHash = nil

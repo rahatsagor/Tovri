@@ -34,6 +34,20 @@ final class FileSafetyTests: XCTestCase {
         doc.textStorage.replaceCharacters(in: NSRange(location: doc.length, length: 0), with: text)
     }
 
+    /// A copy of `stamp` with fields changed through its JSON form, the way a session stores it.
+    private func alteredStamp(_ stamp: DiskStamp, _ change: (inout [String: Any]) -> Void) throws -> DiskStamp {
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(stamp)) as? [String: Any])
+        change(&object)
+        return try JSONDecoder().decode(DiskStamp.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    /// A document holding unsaved edits, restored with a backup stamp taken on another mount.
+    private func restoredDocument(_ url: URL, diskStamp: DiskStamp, fingerprint: Data? = nil) throws -> Document {
+        let doc = try Document(contentsOf: url)
+        doc.restoreBuffer("disk text\nedit\n", diskStamp: diskStamp, diskFingerprint: fingerprint)
+        return doc
+    }
+
     private func spinRunLoop(_ seconds: TimeInterval) {
         RunLoop.main.run(until: Date().addingTimeInterval(seconds))
     }
@@ -300,19 +314,54 @@ final class FileSafetyTests: XCTestCase {
         XCTAssertFalse(doc.isDirty)
     }
 
-    func testFileInAReadOnlyDirectoryReportsAnErrorAndKeepsTheEdit() throws {
+    func testFileInAReadOnlyDirectoryIsSavedInPlace() throws {
         let folder = directory.appendingPathComponent("locked", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let original = Data("inside locked folder\n".utf8)
         let url = try file("locked/file.txt", original)
         chmod(folder.path, 0o555)
+        defer { chmod(folder.path, 0o755) }
         let doc = try Document(contentsOf: url)
         append("edit\n", to: doc)
-        XCTAssertThrowsError(try doc.save())
-        XCTAssertEqual(try bytes(url), original)
-        XCTAssertTrue(doc.isDirty)
-        XCTAssertEqual(doc.string as String, "inside locked folder\nedit\n")
+        try doc.save()
+        XCTAssertEqual(try bytes(url), Data("inside locked folder\nedit\n".utf8))
+        XCTAssertFalse(doc.isDirty)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["file.txt"])
+
+        // The in-place write went through the same file the history descriptor points at, so the
+        // old bytes had to be captured before overwriting.
+        LocalHistory.shared.waitUntilIdle()
+        let snapshots = LocalHistory.shared.snapshots(for: url)
+        XCTAssertEqual(snapshots.count, 1)
+        XCTAssertEqual(LocalHistory.shared.data(of: try XCTUnwrap(snapshots.first), for: url), original)
+    }
+
+    func testNewFileInAReadOnlyDirectoryStillFails() throws {
+        let folder = directory.appendingPathComponent("locked-new", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        chmod(folder.path, 0o555)
+        defer { chmod(folder.path, 0o755) }
+        let url = folder.appendingPathComponent("created.txt")
+        let doc = Document(newFileAt: url)
+        append("new\n", to: doc)
+        XCTAssertThrowsError(try doc.save())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [])
+        XCTAssertTrue(doc.isDirty)
+    }
+
+    func testFileWithAVeryLongNameSaves() throws {
+        // The usual temp name would be 259 bytes, over the 255-byte file name limit.
+        let name = String(repeating: "a", count: 211) + ".txt"
+        XCTAssertEqual(name.utf8.count, 215)
+        let url = try file(name, Data("long name\n".utf8))
+        let doc = try Document(contentsOf: url)
+        append("edit\n", to: doc)
+        try doc.save()
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "long name\nedit\n")
+        XCTAssertFalse(doc.isDirty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [name],
+                       "A failed temp name must not leave temporary files behind")
     }
 
     // MARK: External changes
@@ -462,6 +511,84 @@ final class FileSafetyTests: XCTestCase {
         try doc.save()
         XCTAssertEqual(try String(contentsOf: moved, encoding: .utf8), "on disk\nnot saved yet\n")
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    // MARK: Restored backups across remounts
+
+    /// A stamp kept from an earlier launch can outlive the mount it was taken on: remounting
+    /// gives the disk a new device number, which must not make an untouched file look modified.
+    func testBackupStampSurvivesARemountedVolume() throws {
+        let url = try file("remounted.txt", Data("disk text\n".utf8))
+        let probe = try Document(contentsOf: url)
+        let stamp = try XCTUnwrap(probe.lastReadDiskStamp)
+        let remounted = try alteredStamp(stamp) { $0["device"] = NSNumber(value: ($0["device"] as! NSNumber).int32Value + 1) }
+        let doc = try restoredDocument(url, diskStamp: remounted, fingerprint: try XCTUnwrap(probe.lastReadDiskFingerprint))
+        XCTAssertTrue(doc.isDirty)
+        XCTAssertEqual(doc.checkDiskStatus(), .unchanged)
+        try doc.save()
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "disk text\nedit\n")
+    }
+
+    /// The inode is only meaningful together with its device, so a remount can pair the stamp
+    /// with an inode number that belongs to a different file entirely.
+    func testBackupStampSurvivesARemountWithADifferentInode() throws {
+        let url = try file("remounted-inode.txt", Data("old text\n".utf8))
+        let probe = try Document(contentsOf: url)
+        probe.textStorage.replaceCharacters(in: NSRange(location: 0, length: probe.length), with: "disk text\n")
+        try probe.save()
+        let stamp = try XCTUnwrap(probe.lastReadDiskStamp)
+        let remounted = try alteredStamp(stamp) {
+            $0["device"] = NSNumber(value: ($0["device"] as! NSNumber).int32Value + 1)
+            $0["inode"] = NSNumber(value: ($0["inode"] as! NSNumber).uint64Value + 1)
+        }
+        let doc = try restoredDocument(url, diskStamp: remounted, fingerprint: try XCTUnwrap(probe.lastReadDiskFingerprint))
+        XCTAssertTrue(doc.isDirty)
+        XCTAssertEqual(doc.checkDiskStatus(), .unchanged)
+        try doc.save()
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "disk text\nedit\n")
+    }
+
+    func testBackupStampStillNoticesAChangedFileAfterARemount() throws {
+        let url = try file("remounted-changed.txt", Data("disk text\n".utf8))
+        let probe = try Document(contentsOf: url)
+        let stamp = try XCTUnwrap(probe.lastReadDiskStamp)
+        let remounted = try alteredStamp(stamp) {
+            $0["device"] = NSNumber(value: ($0["device"] as! NSNumber).int32Value + 1)
+            $0["size"] = NSNumber(value: ($0["size"] as! NSNumber).int64Value + 1)
+        }
+        let doc = try restoredDocument(url, diskStamp: remounted, fingerprint: try XCTUnwrap(probe.lastReadDiskFingerprint))
+        XCTAssertTrue(doc.isDirty)
+        XCTAssertEqual(doc.checkDiskStatus(), .modified)
+        XCTAssertThrowsError(try doc.save()) { error in
+            guard case DocumentError.modifiedOnDisk = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testBackupStampOnTheSameDeviceStillNeedsTheSameInode() throws {
+        let url = try file("same-device.txt", Data("disk text\n".utf8))
+        let probe = try Document(contentsOf: url)
+        let stamp = try XCTUnwrap(probe.lastReadDiskStamp)
+        let relinked = try alteredStamp(stamp) { $0["inode"] = NSNumber(value: ($0["inode"] as! NSNumber).uint64Value + 1) }
+        let doc = try restoredDocument(url, diskStamp: relinked, fingerprint: try XCTUnwrap(probe.lastReadDiskFingerprint))
+        XCTAssertTrue(doc.isDirty)
+        XCTAssertEqual(doc.checkDiskStatus(), .modified)
+        XCTAssertThrowsError(try doc.save()) { error in
+            guard case DocumentError.modifiedOnDisk = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    /// Sessions saved before fingerprints existed keep the exact-stamp shortcut, but a stamp from
+    /// another mount has no proof the bytes are the same, so it asks before overwriting.
+    func testLegacyBackupStampRequiresConfirmationAfterARemount() throws {
+        let url = try file("legacy-remount.txt", Data("disk text\n".utf8))
+        let stamp = try XCTUnwrap(DiskStamp(url))
+        XCTAssertEqual(try restoredDocument(url, diskStamp: stamp).checkDiskStatus(), .unchanged)
+        let remounted = try alteredStamp(stamp) { $0["device"] = NSNumber(value: stamp.device ^ 1) }
+        let doc = try restoredDocument(url, diskStamp: remounted)
+        XCTAssertEqual(doc.checkDiskStatus(), .modified)
+        XCTAssertThrowsError(try doc.checkBeforeSaving()) { error in
+            guard case DocumentError.modifiedOnDisk = error else { return XCTFail("\(error)") }
+        }
     }
 
     // MARK: Monitoring

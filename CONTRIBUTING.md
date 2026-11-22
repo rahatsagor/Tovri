@@ -24,8 +24,9 @@ Report security problems privately, as described in [SECURITY.md](SECURITY.md).
 CI and releases use the newest stable Xcode installed on GitHub's `xcode-27`
 image. That runner image is currently in public preview; beta Xcode compilers
 are excluded. Swift dependencies are pinned in `Package.resolved`, and the
-release tooling uses the committed `scripts/bun.lock`. Action code is pinned
-to verified commits, with Dependabot proposing updates weekly.
+release tooling uses the committed `scripts/bun.lock` and the Bun version in
+`scripts/.bun-version`. Action code is pinned to verified commits, with
+Dependabot proposing updates weekly.
 
 ```sh
 make debug        # build/Debug/Tovri.app
@@ -91,7 +92,8 @@ Sources/Tovri
   After an edit, re-lexing starts at the edited line and stops when the new
   state matches the old one, so the rest of the file stays valid. Lines are
   lexed on demand for the visible region only.
-- **Documents:** files are memory-mapped and decoded once. A gap-buffer
+- **Documents:** files are read in one pass (never memory-mapped, so a file
+  another program truncates can't crash the app) and decoded once. A gap-buffer
   line-start index (`LineIndex`) is updated incrementally on every edit, which
   keeps edits near the top of huge files fast and line lookups O(log n) for the
   gutter, Goto Line and the syntax engine.
@@ -135,6 +137,7 @@ cd ..
 # (leaves build/, dist/, and host Sparkle preferences untouched):
 bun scripts/verify-sparkle-update.ts
 actionlint                    # workflows, if you changed .github/
+shellcheck scripts/*.sh scripts/tovri   # if you changed a shell script
 ```
 
 ## Pull requests

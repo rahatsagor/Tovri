@@ -93,7 +93,7 @@ REQUESTS=()
 umask 077
 add_wait() {
     if [ $WAIT -eq 1 ]; then
-        mkdir -p -m 700 "$WAITDIR"
+        mkdir -p "$WAITDIR"
         local id
         id=$(uuidgen)
         : > "$WAITDIR/$id"

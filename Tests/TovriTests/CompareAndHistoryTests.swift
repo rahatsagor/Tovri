@@ -246,6 +246,31 @@ final class CompareAndHistoryTests: XCTestCase {
         XCTAssertEqual(history.snapshots(for: link), history.snapshots(for: url))
     }
 
+    func testLocalHistoryCanBeTurnedOff() throws {
+        let d = AppRuntime.defaults
+        let old = d.object(forKey: Settings.Key.localHistory)
+        defer {
+            if let old { d.set(old, forKey: Settings.Key.localHistory) } else { d.removeObject(forKey: Settings.Key.localHistory) }
+            Settings.shared.reloadFromDefaults()
+        }
+        let history = LocalHistory.shared
+        let url = try file("off.txt", "one\n")
+
+        d.set(false, forKey: Settings.Key.localHistory)
+        Settings.shared.reloadFromDefaults()
+        history.recordBeforeOverwrite(of: url, with: Data("two\n".utf8))
+        history.waitUntilIdle()
+        XCTAssertEqual(history.snapshots(for: url), [])
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: history.directory.path)) ?? []
+        XCTAssertTrue(entries.isEmpty, "a history folder was created while the setting was off")
+
+        // Reading and clearing stay available; only recording stops.
+        d.set(true, forKey: Settings.Key.localHistory)
+        Settings.shared.reloadFromDefaults()
+        history.recordBeforeOverwrite(of: url, with: Data("two\n".utf8))
+        XCTAssertEqual(kept(history, url), ["one\n"])
+    }
+
     func testFilesAboveTheSizeLimitAndNewFilesAreNotKept() throws {
         var limits = LocalHistory.Limits()
         limits.maxFileSize = 64

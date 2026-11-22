@@ -9,6 +9,34 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Local History can be turned off.** A new **Keep Local History** switch in
+  **Settings → Files** stops Tovri from keeping earlier versions of the files
+  you save, for people who edit secrets. Versions already kept stay until you
+  choose **File → Clear Local History…**.
+
+### Changed
+
+- **Reopen Closed Window** (⌥⇧⌘T) now also brings back a window you closed
+  while other windows were open, or with hot exit turned off, with the files
+  it showed. With **Restore windows and tabs on launch** on, the last window
+  you closed comes back the next time Tovri opens whether or not hot exit is
+  on.
+- A file you can change inside a folder you can't add files to now saves, by
+  writing the file in place.
+
+### Fixed
+
+- Restoring unsaved edits after a disk was remounted no longer mistakes the
+  remount for an external change when the original bytes still match. Backups
+  with only a file stamp still ask before overwriting across mounts.
+- Files with very long names can be saved.
+- Piping more than 512 MB into `tovri` now says the text is too large instead
+  of doing nothing, and no longer leaves a temporary copy behind.
+- Change markers no longer stay out of date when the last commit changes while
+  you are typing.
+
 ## [0.6.2] - 2026-11-18
 
 ### Added

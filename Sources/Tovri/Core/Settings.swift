@@ -84,6 +84,7 @@ final class Settings {
         static let sidebarVisible = "sidebarVisible"
         static let sidebarWidth = "sidebarWidth"
         static let saveOnFocusLost = "saveOnFocusLost"
+        static let localHistory = "localHistory"
         static let gitEnabled = "gitEnabled"
         static let gitGutter = "gitGutter"
         static let gitSidebarStatus = "gitSidebarStatus"
@@ -138,6 +139,7 @@ final class Settings {
         Key.sidebarVisible: true,
         Key.sidebarWidth: 240.0,
         Key.saveOnFocusLost: false,
+        Key.localHistory: true,
         Key.gitEnabled: true,
         Key.gitGutter: true,
         Key.gitSidebarStatus: true,
@@ -339,6 +341,7 @@ final class Settings {
     var sidebarWidth: Double { get { min(max(d.double(forKey: Key.sidebarWidth), 140), 600) } set { d.set(newValue, forKey: Key.sidebarWidth) } }
 
     var saveOnFocusLost: Bool { d.bool(forKey: Key.saveOnFocusLost) }
+    var localHistory: Bool { d.bool(forKey: Key.localHistory) }
     /// Off: Tovri never runs git or reads a .git folder. Each Git feature below also needs this.
     var gitEnabled: Bool { d.bool(forKey: Key.gitEnabled) }
     /// Change markers, the change card and Compare with Last Commit. Off: no committed copies are loaded or diffed.

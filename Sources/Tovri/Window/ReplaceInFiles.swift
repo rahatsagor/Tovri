@@ -275,7 +275,7 @@ enum ReplaceInFiles {
         }
         let pendingHistory = history?.prepareBeforeOverwrite(of: real, with: newData)
         do {
-            try Document.writeFile(newData, replacing: real)
+            try Document.writeFile(newData, replacing: real) { pendingHistory?.captureNow() }
             pendingHistory?.commit()
         } catch {
             pendingHistory?.discard()

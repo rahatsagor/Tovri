@@ -324,6 +324,72 @@ final class FileSafetyRegressionTests2: XCTestCase {
         XCTAssertEqual(try read(unchanged), "let b = 1\n// mine\n")
     }
 
+    func testRestoredBackupsCannotOverwriteChangedBytesWithMatchingMetadata() throws {
+        let original = "a\r\nb\n"
+        let replacement = "a\nb\r\n"
+        let remounted = try file("remounted.txt", original)
+        let inPlace = try file("in-place.txt", original)
+        let urls = [remounted, inPlace]
+        var saved = try withWindow { c in
+            for url in urls {
+                let doc = try XCTUnwrap(c.open(url: url))
+                append("mine\n", to: doc)
+                doc.setLineEnding(.lf)
+            }
+            return try persist([c.sessionState()])
+        }
+        settle(releasing: urls)
+
+        for url in urls {
+            let i = try XCTUnwrap(saved[0].groups[0].tabs.firstIndex { $0.path == url.path })
+            let stamp = try XCTUnwrap(saved[0].groups[0].tabs[i].diskStamp)
+            var info = stat()
+            XCTAssertEqual(stat(url.path, &info), 0)
+            if url == remounted {
+                let temp = try file(".replacement", replacement)
+                XCTAssertEqual(rename(temp.path, url.path), 0)
+                var oldMount = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(stamp)) as? [String: Any])
+                oldMount["device"] = NSNumber(value: stamp.device ^ 1)
+                saved[0].groups[0].tabs[i].diskStamp = try JSONDecoder().decode(DiskStamp.self, from: JSONSerialization.data(withJSONObject: oldMount))
+            } else {
+                let handle = try FileHandle(forWritingTo: url)
+                try handle.write(contentsOf: Data(replacement.utf8))
+                try handle.close()
+            }
+            var times = [info.st_atimespec, info.st_mtimespec]
+            XCTAssertEqual(utimensat(AT_FDCWD, url.path, &times, 0), 0)
+            let current = try XCTUnwrap(DiskStamp(url))
+            if url == remounted {
+                XCTAssertNotEqual(current.inode, stamp.inode)
+                XCTAssertEqual(current.seconds, stamp.seconds)
+                XCTAssertEqual(current.nanoseconds, stamp.nanoseconds)
+                XCTAssertEqual(current.size, stamp.size)
+            } else {
+                XCTAssertEqual(current, stamp)
+            }
+        }
+
+        let restored = relaunch(saved)[0]
+        for url in urls {
+            let doc = try document(restored) { $0.url == url }
+            XCTAssertEqual(doc.string as String, "a\nb\nmine\n")
+            XCTAssertEqual(doc.lineEnding, .crlf)
+            XCTAssertTrue(doc.isDirty)
+            XCTAssertEqual(doc.checkDiskStatus(), .modified)
+            XCTAssertThrowsError(try doc.checkBeforeSaving()) { error in
+                guard case DocumentError.modifiedOnDisk = error else { return XCTFail("\(error)") }
+            }
+            XCTAssertThrowsError(try doc.save()) { error in
+                guard case DocumentError.modifiedOnDisk = error else { return XCTFail("\(error)") }
+            }
+            XCTAssertEqual(try Data(contentsOf: url), Data(replacement.utf8))
+        }
+        let acknowledged = try document(restored) { $0.url == inPlace }
+        acknowledged.acknowledgeDiskVersion()
+        XCTAssertEqual(acknowledged.checkDiskStatus(), .unchanged)
+        XCTAssertNoThrow(try acknowledged.checkBeforeSaving())
+    }
+
     func testOldSessionTabsWithoutAStampStillDecode() throws {
         let json = #"{"path":"/tmp/x.txt","selection":0,"selectionLength":0,"scrollX":0,"scrollY":0,"buffer":"b.txt"}"#
         let tab = try JSONDecoder().decode(TabSession.self, from: Data(json.utf8))

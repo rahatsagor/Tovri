@@ -471,6 +471,44 @@ func testNumstatCountsLinesAndSkipsBinaryFiles() {
         XCTAssertNotEqual(repo.headToken, before)
     }
 
+    func testCachedHeadInvalidatesAPendingBaselineFetch() throws {
+        _ = NSApplication.shared
+        let defaults = AppRuntime.defaults
+        let oldGit = defaults.object(forKey: Settings.Key.gitEnabled)
+        let oldGutter = defaults.object(forKey: Settings.Key.gitGutter)
+        defaults.set(true, forKey: Settings.Key.gitEnabled)
+        defaults.set(true, forKey: Settings.Key.gitGutter)
+        defer {
+            defaults.set(oldGit, forKey: Settings.Key.gitEnabled)
+            defaults.set(oldGutter, forKey: Settings.Key.gitGutter)
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tovri-baseline-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("f.txt")
+        try Data("working\n".utf8).write(to: url)
+        let doc = try Document(contentsOf: url)
+        let dotGit = dir.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(at: dotGit, withIntermediateDirectories: true)
+        let head = dotGit.appendingPathComponent("HEAD")
+        let a = Data(String(repeating: "a", count: 40).utf8)
+        let b = Data(String(repeating: "b", count: 40).utf8)
+
+        try a.write(to: head)
+        doc.refreshGitBaseline { _, _, completion in completion(Data("from A\n".utf8)) }
+        let comparison = try XCTUnwrap(doc.unifiedDiffAgainstHead())
+        XCTAssertTrue(comparison.contains("-from A\n"))
+
+        try b.write(to: head)
+        var pending: ((Data?) -> Void)?
+        doc.refreshGitBaseline { _, _, completion in pending = completion }
+        let finishB = try XCTUnwrap(pending)
+        try a.write(to: head)
+        doc.refreshGitBaseline { _, _, _ in XCTFail("Cached A should not start another fetch") }
+        finishB(Data("from B\n".utf8))
+        XCTAssertEqual(doc.unifiedDiffAgainstHead(), comparison)
+    }
+
     private func shell(_ command: String, in dir: URL) throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")

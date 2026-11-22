@@ -326,6 +326,7 @@ struct FilesSettings: View {
     @AppStorage(Settings.Key.trimTrailingWhitespace) private var trim = false
     @AppStorage(Settings.Key.ensureNewlineAtEOF) private var newline = false
     @AppStorage(Settings.Key.saveOnFocusLost) private var saveOnFocusLost = false
+    @AppStorage(Settings.Key.localHistory) private var localHistory = true
     @AppStorage(Settings.Key.autoSaveDelay) private var autoSaveDelay = 0
     @AppStorage(Settings.Key.showHiddenFiles) private var hidden = true
     @AppStorage(Settings.Key.hiddenPatterns) private var hiddenPatterns = ".git .svn .hg .DS_Store"
@@ -387,6 +388,10 @@ struct FilesSettings: View {
                 } label: {
                     Text("Save changes automatically")
                     Text("Saves files that are already on disk once you stop typing. New files still need Save.")
+                }
+                Toggle(isOn: $localHistory) {
+                    Text("Keep Local History")
+                    Text("Keeps earlier versions of files you save over, on this Mac only. Turn it off if you edit secrets you don’t want copied.")
                 }
             }
             Section("Sidebar & Search") {

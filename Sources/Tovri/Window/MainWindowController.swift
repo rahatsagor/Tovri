@@ -1039,10 +1039,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         if let app = NSApp.delegate as? AppDelegate, app.closingKeepsUnsavedChanges(self) {
             return app.saveSessionBeforeClosingWindow(self)
         }
-        guard !dirtyDocumentsNeedingCloseConfirmation.isEmpty else { return true }
+        guard !dirtyDocumentsNeedingCloseConfirmation.isEmpty else {
+            (NSApp.delegate as? AppDelegate)?.rememberClosedWindow(self)
+            return true
+        }
         confirmCloseAll { [weak self] ok in
             guard ok, let self else { return }
             self.isClosing = true
+            (NSApp.delegate as? AppDelegate)?.rememberClosedWindow(self)
             self.window?.close()
         }
         return false
@@ -2518,34 +2522,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
 
     // MARK: Session
 
-    func sessionState() -> WindowSession {
+    func sessionState(includeUnsaved: Bool = true) -> WindowSession {
         var gs: [GroupSession] = []
         for g in groups {
             var tabs: [TabSession] = []
             var selected = 0
             for t in g.tabs where !t.document.isTransient {
                 let d = t.document
-                var ts = TabSession(path: d.url?.path, untitledName: d.url == nil ? d.displayName : nil, buffer: nil,
+                if !includeUnsaved && (d.url == nil || d.isNewFile) { continue }
+                let buffer = includeUnsaved && Settings.shared.hotExit && (d.isDirty || (d.url == nil && d.length > 0))
+                    ? SessionStore.shared.bufferName(for: d) : nil
+                if buffer == nil && d.url == nil && d.length == 0 { continue }
+                let format = buffer == nil && d.url != nil && !d.isNewFile
+                    ? d.savedFormat : (encoding: d.encoding, lineEnding: d.lineEnding, encodingWasDetected: d.encodingWasDetected)
+                var ts = TabSession(path: d.url?.path, untitledName: d.url == nil ? d.displayName : nil, buffer: buffer,
                                     selection: t.editor?.textView.selectedRange().location ?? t.pendingSelection?.location ?? 0,
                                     selectionLength: t.editor?.textView.selectedRange().length ?? t.pendingSelection?.length ?? 0,
                                     scrollX: Double(t.editor?.scrollPosition.x ?? t.pendingScroll?.x ?? 0),
                                     scrollY: Double(t.editor?.scrollPosition.y ?? t.pendingScroll?.y ?? 0),
                                     language: d.languageWasSetManually ? d.language.id : nil,
-                                    encoding: d.encoding.rawValue, lineEnding: d.lineEnding.rawValue)
+                                    encoding: format.encoding.rawValue, lineEnding: format.lineEnding.rawValue)
                 ts.isNewFile = d.isNewFile ? true : nil
                 ts.documentID = d.backupSource.id.uuidString
                 ts.editVersion = d.backupSource.version
-                ts.encodingDetected = d.url != nil && d.encodingWasDetected ? true : nil
+                ts.encodingDetected = d.url != nil && format.encodingWasDetected ? true : nil
                 ts.bookmarks = d.bookmarks.isEmpty ? nil : d.bookmarks.lines
-                if Settings.shared.hotExit && (d.isDirty || (d.url == nil && d.length > 0)) {
-                    ts.buffer = SessionStore.shared.bufferName(for: d)
-                    if let buf = ts.buffer {
-                        ts.diskStamp = d.lastReadDiskStamp
-                        // Throttled large-buffer saves reuse an earlier written buffer; record its actual version.
-                        if let src = SessionStore.backupSource(ofBufferNamed: buf) { ts.editVersion = src.version }
-                    }
-                } else if d.url == nil && d.length == 0 {
-                    continue
+                if let buffer {
+                    ts.diskStamp = d.lastReadDiskStamp
+                    ts.diskFingerprint = d.lastReadDiskFingerprint
+                    // Throttled large-buffer saves reuse an earlier written buffer; record its actual version.
+                    if let src = SessionStore.backupSource(ofBufferNamed: buffer) { ts.editVersion = src.version }
                 }
                 if t === g.activeTab { selected = tabs.count }
                 tabs.append(ts)
@@ -2598,8 +2604,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                     case .apply:
                         // A line ending changed without saving, recognizable while the file is the one the backup was taken from.
                         if d.url != nil, !d.isNewFile, let le = t.lineEnding.flatMap(LineEnding.init(rawValue:)),
-                           let stamp = t.diskStamp, stamp == d.lastReadDiskStamp { d.lineEnding = le }
-                        d.restoreBuffer(text, from: t.backupSource, diskStamp: t.diskStamp)
+                           d.matchesBackupDiskVersion(t.diskStamp, fingerprint: t.diskFingerprint) { d.lineEnding = le }
+                        d.restoreBuffer(text, from: t.backupSource, diskStamp: t.diskStamp, diskFingerprint: t.diskFingerprint)
                         if t.path != nil && !FileManager.default.fileExists(atPath: t.path!) { d.markDirtyForRestoredBuffer() }
                     case .skip:
                         break

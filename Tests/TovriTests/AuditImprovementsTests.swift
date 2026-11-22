@@ -678,6 +678,51 @@ final class AuditImprovementsTests: XCTestCase {
         XCTAssertEqual(decoded1252.encoding, .windows1252)
     }
 
+    func testPipedInputTempFilesAreReadRemovedOrRefused() throws {
+        let root = NSTemporaryDirectory()
+        var leftovers: [String] = []
+        defer { for path in leftovers { try? FileManager.default.removeItem(atPath: path) } }
+        func cliFile(_ name: String, in folder: String? = nil) throws -> String {
+            let path = ((folder ?? root) as NSString).appendingPathComponent(name)
+            try Data("0123456789".utf8).write(to: URL(fileURLWithPath: path))
+            leftovers.append(path)
+            return path
+        }
+        let exists = { FileManager.default.fileExists(atPath: $0) }
+
+        // Over the limit: reported and removed so it doesn't pile up.
+        let big = try cliFile("tovri-stdin.\(UUID().uuidString)")
+        guard case .tooLarge = AppDelegate.readCLITempFile(big, prefix: "tovri-stdin.", maxBytes: 4) else {
+            return XCTFail("expected .tooLarge")
+        }
+        XCTAssertFalse(exists(big))
+
+        // Within the limit: the bytes come back and the file is removed.
+        let small = try cliFile("tovri-stdin.\(UUID().uuidString)")
+        guard case .data(let data) = AppDelegate.readCLITempFile(small, prefix: "tovri-stdin.", maxBytes: 100) else {
+            return XCTFail("expected .data")
+        }
+        XCTAssertEqual(data, Data("0123456789".utf8))
+        XCTAssertFalse(exists(small))
+
+        // A wrong prefix is refused and left alone.
+        let wrongPrefix = try cliFile("tovri-req.\(UUID().uuidString)")
+        guard case .refused = AppDelegate.readCLITempFile(wrongPrefix, prefix: "tovri-stdin.", maxBytes: 100) else {
+            return XCTFail("expected .refused")
+        }
+        XCTAssertTrue(exists(wrongPrefix))
+
+        // A correctly named file outside the allowed temp folders is refused and left alone.
+        let sub = URL(fileURLWithPath: root).appendingPathComponent("tovri-sub-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sub) }
+        let elsewhere = try cliFile("tovri-stdin.\(UUID().uuidString)", in: sub.path)
+        guard case .refused = AppDelegate.readCLITempFile(elsewhere, prefix: "tovri-stdin.", maxBytes: 100) else {
+            return XCTFail("expected .refused")
+        }
+        XCTAssertTrue(exists(elsewhere))
+    }
+
     // MARK: - Review verification regressions
 
     func testShiftRightKeepsAnchorAfterSmartHomeReversesSelection() {
