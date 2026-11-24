@@ -18,7 +18,7 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         }
     }
     var message: String? { didSet { needsDisplay = true } }
-    private var flashText: String?
+    private(set) var flashText: String?
     private var flashToken = 0
 
     /// Shows a short-lived message (e.g. "Saved") that fades after a moment.

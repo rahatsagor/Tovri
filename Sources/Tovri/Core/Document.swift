@@ -58,6 +58,10 @@ final class Document: NSObject, NSTextStorageDelegate {
     var isTransient = false
     /// For a Changes tab, the document it compares with the last commit.
     weak var changesSource: Document?
+    /// For a History tab, which commit and file (or patch) it shows, so opening it again selects it.
+    var revisionKey: String?
+    /// A History tab a single click reuses, until it is opened pinned.
+    var isHistoryPreview = false
     var isFindResults: Bool { language === LanguageRegistry.shared.findResults }
     /// The file's identity, modification time and size when Tovri last read or wrote it.
     private var diskStamp: DiskStamp?

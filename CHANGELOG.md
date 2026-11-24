@@ -9,6 +9,21 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **History in the sidebar.** The new Git tab has a History view with your
+  repository's commits and branch graph. Search messages, and narrow the list
+  with `author:name` or `path:folder`. Expand a commit to see its files, then
+  open one with its changes marked, as a patch or as it was, or open the whole
+  commit as a patch. It reads commits as you scroll and only when you look at
+  it. Turn it on with **Git tab and file history** in **Settings → Git**.
+
+### Changed
+
+- The sidebar's **Changes** tab is now **Git**, with **Changes** and
+  **History** inside it. In folders that aren't Git repositories, only
+  **Files** is shown. The setting is now called **Git tab and file history**.
+
 ## [0.6.3] - 2026-11-23
 
 ### Added

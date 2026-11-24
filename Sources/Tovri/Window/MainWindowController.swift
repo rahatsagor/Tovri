@@ -777,6 +777,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         rootView.needsLayout = true
         rootView.layoutSubtreeIfNeeded()
         sidebar.setRoot(resolved)
+        sidebar.setRepository(resolved.flatMap { Settings.shared.gitEnabled ? GitRepository.find(for: $0) : nil })
         if let url = resolved {
             projectIndex = ProjectIndex(root: url)
             var pending = false
@@ -816,6 +817,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// Set when `Changes` refreshed without reading untracked or ignored files for the hidden `Files` tree.
     private var sidebarGitNeedsFullRefresh = false
     private var ignoredGeneration = 0
+    var historyOpenGeneration = 0
     private(set) var changedFileCount = 0
 
     /// Runs `git status` only for the features that are on: sidebar colors and the changed count.
@@ -825,6 +827,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         guard s.gitNeedsStatus, let folder = folderURL, let repo = GitRepository.find(for: folder) else {
             sidebarGitNeedsFullRefresh = false
             ignoredGeneration += 1
+            sidebar.setRepository(nil)
             sidebar.setGitStatus([:])
             sidebar.setIgnoredPaths([])
             sidebar.setChangeCount(0)
@@ -834,13 +837,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             }
             return
         }
+        sidebar.setRepository(repo)
         guard !gitStatusPending else { gitStatusRequestedAgain = true; return }
         gitStatusPending = true
         let showingChanges = s.gitChangesAndHistory && sidebar.isShowingChanges
+        let showingGit = s.gitChangesAndHistory && sidebar.isShowingGitTab
         let requestedFilter: ChangeFilter? = showingChanges ? sidebar.changesFilter : nil
         pendingChangesFilter = requestedFilter
         let includeUntracked = s.gitStatusBarChanges || s.gitSidebarStatus || sidebar.changesFilter.includesUntracked
-        let fetchIgnored = s.gitSidebarStatus && !showingChanges
+        let fetchIgnored = s.gitSidebarStatus && !showingGit
         sidebarGitNeedsFullRefresh = !includeUntracked || (s.gitSidebarStatus && !fetchIgnored)
         repo.statusAndChanges(includeUntracked: includeUntracked, changesFilter: requestedFilter) { [weak self] status, entries, changes in
             guard let self else { return }
@@ -877,6 +882,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                     } else {
                         self.sidebar.setChangeCount(statusCount)
                     }
+                    self.sidebar.headMayHaveChanged()
                 }
             }
             if requestedAgain || needsFollowUpFilter {
@@ -2021,7 +2027,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// Lists the commits that changed the active file; choosing one compares the file with it.
     @objc func showFileHistory(_ sender: Any?) {
         guard Settings.shared.gitChangesAndHistory else {
-            statusBar.flash("Turn on Changes and file history in Settings → Git")
+            statusBar.flash("Turn on Git tab and file history in Settings → Git")
             return
         }
         guard let e = activeEditor, let url = e.document.url else { statusBar.flash("Save the file to see its history"); return }
@@ -2054,7 +2060,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         }
     }
 
-    private func compare(_ editor: EditorView, with c: GitRepository.Commit, in repo: GitRepository) {
+    func compare(_ editor: EditorView, with c: GitRepository.Commit, in repo: GitRepository) {
         // The list may have stayed open while the feature was turned off.
         guard Settings.shared.gitChangesAndHistory else { return }
         let doc = editor.document

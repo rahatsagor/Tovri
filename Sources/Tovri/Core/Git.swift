@@ -214,7 +214,7 @@ final class GitRepository {
         q.maxConcurrentOperationCount = 4
         return q
     }()
-    private static func runAsync(_ work: @escaping () -> Void) { queue.addOperation(work) }
+    static func runAsync(_ work: @escaping () -> Void) { queue.addOperation(work) }
 
     /// Maximum bytes read from a committed blob (`headContents` / `contents(of:at:)`).
     static let maxBlobSize = 20_000_000
@@ -475,7 +475,7 @@ final class GitRepository {
         return nil
     }
 
-    private var resolvedDirs: ResolvedGitDirs? {
+    var resolvedDirs: ResolvedGitDirs? {
         GitRepository.resolveGitDir(at: root)
     }
 
@@ -574,12 +574,13 @@ final class GitRepository {
         return env
     }
 
-    private func run(_ args: [String], acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
+    func run(_ args: [String], acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024,
+             cancellation: GitCancellation? = nil) -> Data? {
         guard let overrides = configuredOverrides() else { return nil }
         return rawRun(args, GitRepository.safetySettings
                           + GitRepository.filterSettings(names: overrides.filters)
                           + GitRepository.hookSettings(names: overrides.hooks),
-                      acceptedStatuses: acceptedStatuses, maxOutputBytes: maxOutputBytes)
+                      acceptedStatuses: acceptedStatuses, maxOutputBytes: maxOutputBytes, cancellation: cancellation)
     }
 
     private static let defaultSystemConfigPaths: [URL] = {
@@ -789,7 +790,7 @@ final class GitRepository {
     }
 
     private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0],
-                        maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
+                        maxOutputBytes: Int? = 64 * 1024 * 1024, cancellation: GitCancellation? = nil) -> Data? {
         guard let git = GitRepository.executable,
               let dirs = resolvedDirs else { return nil }
         // Canonical `--git-dir` and `--work-tree` bind git to the validated targets, preventing
@@ -797,7 +798,7 @@ final class GitRepository {
         return GitRepository.runProcess(URL(fileURLWithPath: git),
                                         ["--git-dir=" + dirs.gitDir.path, "--work-tree=" + dirs.workTree.path, "-C", dirs.workTree.path] + args,
                                         environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses,
-                                        maxOutputBytes: maxOutputBytes)
+                                        maxOutputBytes: maxOutputBytes, cancellation: cancellation)
     }
 
     /// Longest a git command may run before it is stopped.
@@ -807,7 +808,8 @@ final class GitRepository {
     /// exceeded `maxOutputBytes`, or ran past `timeout`. The output is read on another thread, so a
     /// stalled network volume, or a child process that keeps the pipe open, can't hold the caller past the timeout.
     static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout,
-                           acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024) -> Data? {
+                           acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024,
+                           cancellation: GitCancellation? = nil) -> Data? {
         final class Output: @unchecked Sendable {
             var data = Data()
             var failed = false
@@ -824,7 +826,14 @@ final class GitRepository {
         // timeout, so the exit is signaled by the termination handler instead.
         let exited = DispatchSemaphore(value: 0)
         p.terminationHandler = { _ in exited.signal() }
+        if cancellation?.isCancelled == true { return nil }
         do { try p.run() } catch { return nil }
+        defer { cancellation?.detach() }
+        guard cancellation?.attach(p) ?? true else {
+            p.terminate()
+            try? out.fileHandleForReading.close()
+            return nil
+        }
         let output = Output()
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
@@ -858,7 +867,7 @@ final class GitRepository {
             }
             return nil
         }
-        if output.failed { return nil }
+        if output.failed || cancellation?.isCancelled == true { return nil }
         return p.terminationReason == .exit && acceptedStatuses.contains(p.terminationStatus) ? output.data : nil
     }
 

@@ -310,8 +310,8 @@ struct GitSettings: View {
             .disabled(!enabled)
             Section("More") {
                 Toggle(isOn: $history) {
-                    Text("Changes and file history")
-                    Text("A Changes list in the sidebar, and File History (⇧⌥⌘H) to compare a file with any earlier commit. Runs git only while you use them.")
+                    Text("Git tab and file history")
+                    Text("A Git tab in the sidebar with your Changes and the repository’s History, and File History (⇧⌥⌘H) to compare a file with any earlier commit. Runs git only while you use them.")
                 }
             }
             .disabled(!enabled)

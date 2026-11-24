@@ -6,9 +6,9 @@ enum SidebarChangeAction { case open(focus: Bool), compare, history }
 /// What the Changes list asks the window to do with the selected files.
 enum ChangeListAction { case stage, unstage, discard, patch, reveal }
 
-/// Files / Changes switcher at the top of the sidebar, shown only with Changes and file history on.
+/// Files / Git switcher at the top of the sidebar, shown only with the Git tab on and inside a repository.
 final class SidebarTabs: NSView {
-    enum Tab: Int { case files, changes }
+    enum Tab: Int { case files, git }
     var selected: Tab = .files { didSet { needsDisplay = true } }
     var changeCount = 0 { didSet { if oldValue != changeCount { needsDisplay = true } } }
     var onSelect: ((Tab) -> Void)?
@@ -34,7 +34,7 @@ final class SidebarTabs: NSView {
         return NSRect(x: inner.minX + (tab == .files ? 0 : w + 4), y: inner.minY, width: w, height: inner.height)
     }
 
-    private func tab(at p: NSPoint) -> Tab? { [.files, .changes].first { rect($0).contains(p) } }
+    private func tab(at p: NSPoint) -> Tab? { [.files, .git].first { rect($0).contains(p) } }
 
     private var ownTrackingArea: NSTrackingArea?
     override func updateTrackingAreas() {
@@ -56,16 +56,16 @@ final class SidebarTabs: NSView {
         onSelect?(t)
     }
 
-    override func accessibilityValue() -> Any? { selected == .files ? "Files" : "Changes" }
+    override func accessibilityValue() -> Any? { selected == .files ? "Files" : "Git" }
     override func accessibilityPerformPress() -> Bool {
-        selected = selected == .files ? .changes : .files
+        selected = selected == .files ? .git : .files
         onSelect?(selected)
         return true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         let theme = ThemeManager.shared.active
-        for t in [Tab.files, .changes] {
+        for t in [Tab.files, .git] {
             let r = rect(t)
             if t == selected {
                 theme.sidebarSelection.setFill()
@@ -75,11 +75,11 @@ final class SidebarTabs: NSView {
                 NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6).fill()
             }
             let color = t == selected ? theme.chromeForeground : theme.chromeSecondary
-            let title = (t == .files ? "Files" : "Changes") as NSString
+            let title = (t == .files ? "Files" : "Git") as NSString
             let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
             let ts = title.size(withAttributes: attrs)
             var badge: (NSString, NSSize, [NSAttributedString.Key: Any])?
-            if t == .changes && changeCount > 0 {
+            if t == .git && changeCount > 0 {
                 let s = (changeCount > 999 ? "999+" : "\(changeCount)") as NSString
                 let a: [NSAttributedString.Key: Any] = [.font: countFont, .foregroundColor: theme.color(.changed) ?? .systemOrange]
                 badge = (s, s.size(withAttributes: a), a)
@@ -89,6 +89,95 @@ final class SidebarTabs: NSView {
             title.draw(at: NSPoint(x: x, y: round(r.midY - ts.height / 2)), withAttributes: attrs)
             x += ts.width + 6
             if let (s, size, a) = badge { s.draw(at: NSPoint(x: x, y: round(r.midY - size.height / 2)), withAttributes: a) }
+        }
+    }
+}
+
+/// Changes / History switcher under the Git tab, as two underlined labels.
+final class GitViewTabs: NSView {
+    enum View: Int { case changes, history }
+    var selected: View = .changes { didSet { needsDisplay = true } }
+    var changeCount = 0 { didSet { if oldValue != changeCount { needsDisplay = true } } }
+    var onSelect: ((View) -> Void)?
+    private var hover: View?
+    private let font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+    private let plainFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+    private let countFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    init() {
+        super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.radioGroup)
+        setAccessibilityLabel("Git view")
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func rect(_ view: View) -> NSRect {
+        let inner = bounds.insetBy(dx: 10, dy: 0)
+        let w = floor(inner.width / 2)
+        return NSRect(x: inner.minX + (view == .changes ? 0 : w), y: inner.minY, width: w, height: inner.height)
+    }
+
+    private func view(at p: NSPoint) -> View? { [.changes, .history].first { rect($0).contains(p) } }
+
+    private var ownTrackingArea: NSTrackingArea?
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = ownTrackingArea { removeTrackingArea(a) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        ownTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let v = view(at: convert(event.locationInWindow, from: nil))
+        if v != hover { hover = v; needsDisplay = true }
+    }
+    override func mouseExited(with event: NSEvent) { hover = nil; needsDisplay = true }
+    override func mouseDown(with event: NSEvent) {
+        guard let v = view(at: convert(event.locationInWindow, from: nil)), v != selected else { return }
+        selected = v
+        onSelect?(v)
+    }
+
+    override func accessibilityValue() -> Any? { selected == .changes ? "Changes" : "History" }
+    override func accessibilityPerformPress() -> Bool {
+        selected = selected == .changes ? .history : .changes
+        onSelect?(selected)
+        return true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let theme = ThemeManager.shared.active
+        for v in [View.changes, .history] {
+            let r = rect(v)
+            if v != selected && v == hover {
+                theme.tabHoverBackground.setFill()
+                NSBezierPath(roundedRect: r.insetBy(dx: 2, dy: 2), xRadius: 5, yRadius: 5).fill()
+            }
+            let color = v == selected ? theme.chromeForeground : theme.chromeSecondary
+            let title = (v == .changes ? "Changes" : "History") as NSString
+            let attrs: [NSAttributedString.Key: Any] = [.font: v == selected ? font : plainFont, .foregroundColor: color]
+            let ts = title.size(withAttributes: attrs)
+            var badge: (NSString, NSSize, [NSAttributedString.Key: Any])?
+            if v == .changes && changeCount > 0 {
+                let s = (changeCount > 999 ? "999+" : "\(changeCount)") as NSString
+                let a: [NSAttributedString.Key: Any] = [.font: countFont, .foregroundColor: theme.color(.changed) ?? .systemOrange]
+                badge = (s, s.size(withAttributes: a), a)
+            }
+            let total = ts.width + (badge.map { $0.1.width + 6 } ?? 0)
+            var x = round(r.midX - total / 2)
+            title.draw(at: NSPoint(x: x, y: round(r.midY - ts.height / 2) - 1), withAttributes: attrs)
+            x += ts.width + 6
+            if let (s, size, a) = badge { s.draw(at: NSPoint(x: x, y: round(r.midY - size.height / 2) - 1), withAttributes: a) }
+            if v == selected {
+                theme.accent.setFill()
+                NSRect(x: r.minX + 6, y: r.maxY - 2, width: r.width - 12, height: 2).fill()
+            }
         }
     }
 }
@@ -611,7 +700,9 @@ private final class ChangeSectionCell: NSTableCellView {
     }
 }
 
-private final class ChangeCell: NSTableCellView {
+final class ChangeCell: NSTableCellView {
+    /// Room kept free at the left, e.g. for the History graph column.
+    var leadingInset: CGFloat = 0
     private let icon = NSImageView()
     private let name = NSTextField(labelWithString: "")
     private let dir = NSTextField(labelWithString: "")
@@ -661,13 +752,13 @@ private final class ChangeCell: NSTableCellView {
     override func layout() {
         super.layout()
         let h = bounds.height
-        icon.frame = NSRect(x: 12, y: (h - 16) / 2, width: 16, height: 16)
+        icon.frame = NSRect(x: 12 + leadingInset, y: (h - 16) / 2, width: 16, height: 16)
         // Labels inset their text slightly, so a frame of exactly the text's width cuts off the end.
         let cw = ceil(counts.attributedStringValue.size().width) + 8
         counts.frame = NSRect(x: bounds.width - 10 - cw, y: (h - 15) / 2, width: cw, height: 15)
         let right = counts.frame.minX - 8
-        let nw = min(ceil(name.attributedStringValue.size().width) + 4, max(0, right - 33))
-        name.frame = NSRect(x: 33, y: (h - 17) / 2, width: nw, height: 17)
+        let nw = min(ceil(name.attributedStringValue.size().width) + 4, max(0, right - 33 - leadingInset))
+        name.frame = NSRect(x: 33 + leadingInset, y: (h - 17) / 2, width: nw, height: 17)
         let dx = name.frame.maxX + 6
         dir.frame = NSRect(x: dx, y: (h - 14) / 2 + 0.5, width: max(0, right - dx), height: 14)
     }

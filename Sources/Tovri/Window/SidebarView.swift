@@ -91,11 +91,14 @@ protocol SidebarDelegate: AnyObject {
     func sidebarDidShowFiles(_ sidebar: SidebarView)
     func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction)
     func sidebar(_ sidebar: SidebarView, changes: [GitRepository.ChangedFile], action: ChangeListAction)
+    /// A commit, or a file of one, was chosen in History. `detail` is nil until the commit was expanded.
+    func sidebar(_ sidebar: SidebarView, commit: LogCommit, detail: GitRepository.CommitDetail?, action: HistoryAction)
 }
 
 extension SidebarDelegate {
     func sidebarChangesFilterDidChange(_ sidebar: SidebarView) {}
     func sidebarDidShowFiles(_ sidebar: SidebarView) {}
+    func sidebar(_ sidebar: SidebarView, commit: LogCommit, detail: GitRepository.CommitDetail?, action: HistoryAction) {}
 }
 
 final class SidebarOutlineView: NSOutlineView {
@@ -152,7 +155,11 @@ final class SidebarOutlineView: NSOutlineView {
         return menuProvider?(row)
     }
 
+    /// For lists that expand rows by clicking them, without a disclosure triangle.
+    var hidesDisclosure = false
+
     override func frameOfOutlineCell(atRow row: Int) -> NSRect {
+        if hidesDisclosure { return .zero }
         var f = super.frameOfOutlineCell(atRow: row)
         f.origin.x += 4
         return f
@@ -179,70 +186,148 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     private var nodesByPath: [String: FileNode] = [:]
     static let topInset: CGFloat = TabBarView.height
 
-    // MARK: Changes view
+    // MARK: Git tab
 
     private let tabs = SidebarTabs()
+    private let gitTabs = GitViewTabs()
     /// Created the first time the Changes list is shown, and dropped when the feature is turned off.
     private var changesView: ChangesView?
+    /// Created the first time History is shown, and dropped with the Changes list.
+    private var historyView: HistoryView?
+    private(set) var repository: GitRepository?
     private(set) var fetchedFilter: ChangeFilter?
-    var isShowingChanges: Bool { showsTabs && tabs.selected == .changes }
+    var isShowingGitTab: Bool { showsTabs && tabs.selected == .git }
+    var isShowingChanges: Bool { isShowingGitTab && gitTabs.selected == .changes }
+    var isShowingHistory: Bool { isShowingGitTab && gitTabs.selected == .history }
     var changesFilter: ChangeFilter { changesView?.filter ?? Settings.shared.gitChangesFilter }
-    private var showsTabs: Bool { Settings.shared.gitChangesAndHistory && root != nil }
+    private var showsTabs: Bool { Settings.shared.gitChangesAndHistory && root != nil && repository != nil }
 
     func hasChanges(covering filter: ChangeFilter) -> Bool {
         fetchedFilter?.covers(filter) == true
     }
 
-    func setChangeCount(_ n: Int) { tabs.changeCount = n }
+    func setChangeCount(_ n: Int) {
+        tabs.changeCount = n
+        gitTabs.changeCount = n
+    }
 
     func setChanges(_ files: [GitRepository.ChangedFile], filter: ChangeFilter = .all, stagedPaths: Set<String>? = nil,
                     root: URL? = nil, totalCount: Int? = nil) {
         if let v = changesView, !filter.covers(v.filter) {
-            if let totalCount { tabs.changeCount = totalCount }
+            if let totalCount { setChangeCount(totalCount) }
             delegate?.sidebarNeedsChanges(self)
             return
         }
         fetchedFilter = filter
         changesView?.setFiles(files, stagedPaths: stagedPaths, root: root)
         // A file with staged and unstaged changes is listed twice but counts once.
-        tabs.changeCount = totalCount ?? Set(files.map(\.path)).count
+        setChangeCount(totalCount ?? Set(files.map(\.path)).count)
     }
 
     func updateLiveChangeCounts(_ live: [String: (Int, Int)], root: URL) {
         changesView?.updateLiveCounts(live, root: root)
     }
 
-    func showChanges(_ on: Bool) {
-        guard showsTabs || !on else { return }
-        tabs.selected = on ? .changes : .files
-        selectTab(tabs.selected)
-    }
-
-    private func selectTab(_ tab: SidebarTabs.Tab) {
-        if tab == .changes && changesView == nil {
-            let v = ChangesView()
-            v.onAction = { [weak self] f, action in
-                guard let self else { return }
-                self.delegate?.sidebar(self, change: f, action: action)
+    /// The repository the Git tab shows; nil outside a repository, which leaves only Files.
+    func setRepository(_ new: GitRepository?) {
+        guard new !== repository else { return }
+        repository = new
+        historyView?.setRepository(new)
+        if new == nil {
+            dropGitViews()
+            if tabs.selected != .files {
+                tabs.selected = .files
+                fetchedFilter = nil
             }
-            v.onListAction = { [weak self] files, action in
-                guard let self else { return }
-                self.delegate?.sidebar(self, changes: files, action: action)
-            }
-            v.onFilterChange = { [weak self] _ in
-                guard let self else { return }
-                self.delegate?.sidebarChangesFilterDidChange(self)
-            }
-            addSubview(v)
-            changesView = v
         }
         updatePlaceholder()
         needsLayout = true
-        if tab == .changes {
-            delegate?.sidebarNeedsChanges(self)
+    }
+
+    private func dropGitViews() {
+        fetchedFilter = nil
+        changesView?.removeFromSuperview()
+        changesView = nil
+        dropHistoryView()
+    }
+
+    private func dropHistoryView() {
+        historyView?.teardown()
+        historyView?.removeFromSuperview()
+        historyView = nil
+    }
+
+    /// HEAD may have moved: History reloads now if it is showing, or when it is next shown.
+    func headMayHaveChanged() {
+        historyView?.headMayHaveChanged(visible: isShowingHistory)
+    }
+
+    func showChanges(_ on: Bool) {
+        guard showsTabs || !on else { return }
+        if on { gitTabs.selected = .changes }
+        tabs.selected = on ? .git : .files
+        selectTab(tabs.selected)
+    }
+
+    func showHistory() {
+        guard showsTabs else { return }
+        gitTabs.selected = .history
+        tabs.selected = .git
+        selectTab(.git)
+    }
+
+    private func selectTab(_ tab: SidebarTabs.Tab) {
+        if tab == .git {
+            showGitView()
         } else {
             fetchedFilter = nil
-            delegate?.sidebarDidShowFiles(self)
+        }
+        updatePlaceholder()
+        needsLayout = true
+        if tab == .files { delegate?.sidebarDidShowFiles(self) }
+    }
+
+    private func selectGitView(_ view: GitViewTabs.View) {
+        showGitView()
+        updatePlaceholder()
+        needsLayout = true
+    }
+
+    /// Makes the view for the selected Git sub-tab, and asks for what it shows.
+    private func showGitView() {
+        if gitTabs.selected == .changes {
+            if changesView == nil {
+                let v = ChangesView()
+                v.onAction = { [weak self] f, action in
+                    guard let self else { return }
+                    self.delegate?.sidebar(self, change: f, action: action)
+                }
+                v.onListAction = { [weak self] files, action in
+                    guard let self else { return }
+                    self.delegate?.sidebar(self, changes: files, action: action)
+                }
+                v.onFilterChange = { [weak self] _ in
+                    guard let self else { return }
+                    self.delegate?.sidebarChangesFilterDidChange(self)
+                }
+                addSubview(v)
+                changesView = v
+            }
+            updatePlaceholder()
+            delegate?.sidebarNeedsChanges(self)
+        } else {
+            if historyView == nil {
+                let v = HistoryView()
+                v.onAction = { [weak self] commit, detail, action in
+                    guard let self else { return }
+                    self.delegate?.sidebar(self, commit: commit, detail: detail, action: action)
+                }
+                v.setRepository(repository)
+                addSubview(v)
+                historyView = v
+            }
+            updatePlaceholder()
+            historyView?.show()
         }
     }
 
@@ -297,6 +382,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         addSubview(openButton)
         tabs.onSelect = { [weak self] t in self?.selectTab(t) }
         addSubview(tabs)
+        gitTabs.onSelect = { [weak self] v in self?.selectGitView(v) }
+        gitTabs.isHidden = true
+        addSubview(gitTabs)
 
         NotificationCenter.default.addObserver(self, selector: #selector(applyTheme), name: .themeDidChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: .settingsDidChange, object: nil)
@@ -315,18 +403,18 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         titleLabel.textColor = theme.chromeSecondary
         placeholder.textColor = theme.chromeSecondary
         tabs.needsDisplay = true
+        gitTabs.needsDisplay = true
         changesView?.applyTheme()
+        historyView?.applyTheme()
         needsDisplay = true
         outline.reloadData()
         openButton.needsDisplay = true
     }
 
     @objc private func settingsChanged() {
-        if !Settings.shared.gitChangesAndHistory, changesView != nil || tabs.selected != .files {
+        if !Settings.shared.gitChangesAndHistory, changesView != nil || historyView != nil || tabs.selected != .files {
             tabs.selected = .files
-            fetchedFilter = nil
-            changesView?.removeFromSuperview()
-            changesView = nil
+            dropGitViews()
         } else {
             changesView?.syncSettings()
         }
@@ -354,13 +442,19 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         titleLabel.frame = NSRect(x: 16, y: top + 6, width: max(40, bx - 22), height: 16)
         var contentTop = top + 28
         tabs.isHidden = !showsTabs
+        gitTabs.isHidden = !isShowingGitTab
         if showsTabs {
             tabs.frame = NSRect(x: 0, y: contentTop, width: bounds.width - 1, height: 30)
             contentTop += 34
+            if isShowingGitTab {
+                gitTabs.frame = NSRect(x: 0, y: contentTop, width: bounds.width - 1, height: 26)
+                contentTop += 28
+            }
         }
         let content = NSRect(x: 0, y: contentTop, width: bounds.width - 1, height: max(0, bounds.height - contentTop))
         scroll.frame = content
         changesView?.frame = content
+        historyView?.frame = content
         outline.tableColumns.first?.width = scroll.contentSize.width - 4
         placeholder.frame = NSRect(x: 10, y: top + 60, width: bounds.width - 20, height: 18)
         let w = openButton.intrinsicWidth + 12
@@ -369,15 +463,17 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     private func updatePlaceholder() {
         let none = root == nil
-        let changes = isShowingChanges
+        let git = isShowingGitTab
         for (i, b) in headerButtons.enumerated() {
-            // In the Changes list only Refresh applies.
-            b.isHidden = none || (changes && i != 2)
+            // In the Git tab only Refresh applies.
+            b.isHidden = none || (git && i != 2)
         }
         placeholder.isHidden = !none
         openButton.isHidden = !none
-        scroll.isHidden = none || changes
-        changesView?.isHidden = none || !changes
+        scroll.isHidden = none || git
+        changesView?.isHidden = none || !isShowingChanges
+        historyView?.isHidden = none || !isShowingHistory
+        gitTabs.isHidden = !git
         needsLayout = true
         titleLabel.stringValue = (root?.name ?? "Explorer").uppercased()
     }
@@ -389,9 +485,10 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         gitStatus = [:]
         changedDirectories = []
         ignoredPaths = []
-        fetchedFilter = nil
-        tabs.changeCount = 0
-        changesView?.setFiles([])
+        setChangeCount(0)
+        repository = nil
+        tabs.selected = .files
+        dropGitViews()
         if let url {
             let node = FileNode(url: url, isDirectory: true, parent: nil)
             node.loadChildren()
@@ -631,7 +728,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 
     func focusTree() {
-        if isShowingChanges, let v = changesView { v.focus() } else { window?.makeFirstResponder(outline) }
+        if isShowingChanges, let v = changesView { v.focus() }
+        else if isShowingHistory, let v = historyView { v.focus() }
+        else { window?.makeFirstResponder(outline) }
     }
 
     private func contextMenu(row: Int) -> NSMenu? {
@@ -866,6 +965,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
 
     @objc private func refreshMenu() {
         if isShowingChanges { delegate?.sidebarNeedsChanges(self); return }
+        if isShowingHistory { historyView?.reload(); return }
         refreshTree()
     }
     private func reloadDirectory(_ url: URL) {
@@ -876,7 +976,7 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
 }
 
-final class HoverRowView: ThemedRowView {
+class HoverRowView: ThemedRowView {
     var hovered = false { didSet { if oldValue != hovered { needsDisplay = true } } }
 
     override func drawBackground(in dirtyRect: NSRect) {
