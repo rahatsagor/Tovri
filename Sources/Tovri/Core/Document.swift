@@ -68,12 +68,39 @@ final class Document: NSObject, NSTextStorageDelegate {
     /// The file's identity, modification time and size when Tovri last read or wrote it.
     private var diskStamp: DiskStamp?
     var lastReadDiskStamp: DiskStamp? { diskStamp }
-    private(set) var lastReadDiskFingerprint: Data?
+    private var storedDiskFingerprint: Data?
+    private var pendingDiskFingerprint: PendingFingerprint?
+    /// A hash of the bytes Tovri last read or wrote. A large file's hash is computed in the background,
+    /// and reading this waits for it, so nothing ever sees a missing fingerprint.
+    private(set) var lastReadDiskFingerprint: Data? {
+        get {
+            if let pending = pendingDiskFingerprint {
+                storedDiskFingerprint = pending.value
+                pendingDiskFingerprint = nil
+            }
+            return storedDiskFingerprint
+        }
+        set {
+            pendingDiskFingerprint = nil
+            storedDiskFingerprint = newValue
+        }
+    }
     private var restoredDiskConflict = false
 
     private func setDiskBaseline(_ stamp: DiskStamp?, fingerprint: Data? = nil) {
         diskStamp = stamp
         lastReadDiskFingerprint = fingerprint
+        restoredDiskConflict = false
+    }
+
+    private func setDiskBaseline(_ stamp: DiskStamp?, hashing data: Data) {
+        diskStamp = stamp
+        if data.count < PendingFingerprint.backgroundThreshold {
+            lastReadDiskFingerprint = Data(SHA256.hash(data: data))
+        } else {
+            lastReadDiskFingerprint = nil
+            pendingDiskFingerprint = PendingFingerprint(data)
+        }
         restoredDiskConflict = false
     }
 
@@ -276,7 +303,7 @@ final class Document: NSObject, NSTextStorageDelegate {
         encoding = decoded.encoding
         encodingWasDetected = decoded.detected
         lineEnding = ending
-        setDiskBaseline(stamp, fingerprint: Data(SHA256.hash(data: data)))
+        setDiskBaseline(stamp, hashing: data)
         fileMissing = false
         let firstLine = text.prefix(200).split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
         if !languageWasSetManually {
@@ -305,7 +332,9 @@ final class Document: NSObject, NSTextStorageDelegate {
         textStorage.setAttributes(baseAttributes, range: NSRange(location: 0, length: textStorage.length))
         textStorage.endEditing()
         isBulkLoading = false
-        Perf.measure("  line index") { lines.rebuild(from: textStorage.mutableString) }
+        Perf.measure("  line index") {
+            if !lines.rebuild(fromASCII: text) { lines.rebuild(from: textStorage.mutableString) }
+        }
         bookmarks.clamp(lineCount: lines.count)
         syntax.reset(language: language, lineCount: lines.count)
         editVersion += 1
@@ -1631,5 +1660,25 @@ extension Document {
         }
         symbolCache = (editVersion, language.id, out)
         return out
+    }
+}
+
+/// The SHA-256 of a large file's bytes, computed on a background queue while the file opens.
+final class PendingFingerprint: @unchecked Sendable {
+    static let backgroundThreshold = 8 << 20
+    private let group = DispatchGroup()
+    private var result = Data()
+
+    init(_ data: Data) {
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            result = Data(SHA256.hash(data: data))
+            group.leave()
+        }
+    }
+
+    var value: Data {
+        group.wait()
+        return result
     }
 }

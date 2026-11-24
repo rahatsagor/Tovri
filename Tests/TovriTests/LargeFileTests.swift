@@ -1,8 +1,38 @@
 import AppKit
+import CryptoKit
 import XCTest
 @testable import Tovri
 
 final class LargeFileTests: XCTestCase {
+    func testASCIILineIndexMatchesTheGeneralScan() {
+        for text in ["", "one", "one\n", "\n\nthree\n", "a\nbb\nccc\ndddd", String(repeating: "x = 1\n", count: 5_000) + "tail"] {
+            let fast = LineIndex(), slow = LineIndex()
+            XCTAssertTrue(fast.rebuild(fromASCII: text))
+            slow.rebuild(from: text as NSString)
+            XCTAssertEqual(fast.starts, slow.starts, text.prefix(20).debugDescription)
+        }
+        let index = LineIndex()
+        index.rebuild(from: "keep\nme" as NSString)
+        XCTAssertFalse(index.rebuild(fromASCII: "café\nnaïve\n"), "text beyond ASCII uses the general scan")
+        XCTAssertFalse(index.rebuild(fromASCII: "emoji 😀\n"))
+        XCTAssertEqual(index.starts, [0, 5], "a refused rebuild leaves the index alone")
+    }
+
+    func testALargeFilesFingerprintIsTheHashOfItsBytesEvenWhenComputedInTheBackground() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tovri-fp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for (name, bytes) in [("big.log", PendingFingerprint.backgroundThreshold + 4096), ("small.log", 4096)] {
+            let url = dir.appendingPathComponent(name)
+            let data = Data(String(repeating: "14:00:01 INFO line\n", count: bytes / 19 + 1).utf8)
+            try data.write(to: url)
+            let doc = try Document(contentsOf: url)
+            XCTAssertEqual(doc.lastReadDiskFingerprint, Data(SHA256.hash(data: data)), name)
+            XCTAssertEqual(doc.lines.count, bytes / 19 + 2, name)
+            XCTAssertTrue(doc.matchesBackupDiskVersion(doc.lastReadDiskStamp, fingerprint: Data(SHA256.hash(data: data))), name)
+        }
+    }
+
     private func withLargeEditor(_ text: String, _ body: (EditorView) throws -> Void) rethrows {
         _ = NSApplication.shared
         let doc = Document(text: text, name: "Large.d.ts", language: LanguageRegistry.shared.plain)

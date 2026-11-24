@@ -31,6 +31,31 @@ final class LineIndex {
         gapDelta = 0
     }
 
+    /// Rebuilds from ASCII text, where UTF-8 and UTF-16 offsets agree, by searching the bytes directly.
+    /// Returns false, leaving the index alone, when the text isn't ASCII.
+    @discardableResult
+    func rebuild(fromASCII text: String) -> Bool {
+        var text = text
+        guard text.utf8.count == text.utf16.count else { return false }
+        var result: [Int] = [0]
+        result.reserveCapacity(max(16, text.utf8.count / 40))
+        text.withUTF8 { bytes in
+            guard let base = bytes.baseAddress else { return }
+            let raw = UnsafeRawPointer(base)
+            var pos = 0
+            while pos < bytes.count, let hit = memchr(raw + pos, 10, bytes.count - pos) {
+                let offset = UnsafeRawPointer(hit) - raw
+                result.append(offset + 1)
+                pos = offset + 1
+            }
+        }
+        buf = result
+        gapStart = result.count
+        gapEnd = result.count
+        gapDelta = 0
+        return true
+    }
+
     /// Index of the line containing `location` (the last line if past the end).
     func line(containing location: Int) -> Int {
         let total = count
