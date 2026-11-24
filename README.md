@@ -70,9 +70,9 @@ can use Tovri.
 <td width="50%" valign="top">
 
 #### Fast, even on huge files
-A 93 MB log with 2 million lines opens and is highlighted in about a third of
-a second. Tovri lays out only what's on screen, and an empty window uses
-about 32 MB of memory.
+A 93 MB log with 2 million lines opens and is highlighted in about a quarter
+of a second. Tovri lays out only what's on screen, and an empty window uses
+under 50 MB of memory.
 
 </td>
 <td width="50%" valign="top">
