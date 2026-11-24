@@ -283,7 +283,7 @@ struct GitSettings: View {
     @AppStorage(Settings.Key.gitGutter) private var gutter = true
     @AppStorage(Settings.Key.gitSidebarStatus) private var sidebar = true
     @AppStorage(Settings.Key.gitStatusBarChanges) private var statusBar = true
-    @AppStorage(Settings.Key.gitChangesAndHistory) private var history = false
+    @AppStorage(Settings.Key.gitChangesAndHistory) private var history = true
 
     var body: some View {
         Form {

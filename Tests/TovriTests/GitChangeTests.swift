@@ -300,7 +300,10 @@ func testNumstatCountsLinesAndSkipsBinaryFiles() {
             controller.setFolder(URL(fileURLWithPath: dir.path, isDirectory: true))
             let doc = try XCTUnwrap(controller.open(url: dir.appendingPathComponent("f.txt")))
             controller.rootView.layoutSubtreeIfNeeded()
-            // Off by default: no switcher, no list, and File History does nothing.
+            // On by default; turned off, there is no switcher or list, and File History does nothing.
+            XCTAssertTrue(Settings.shared.gitChangesAndHistory)
+            d.set(false, forKey: Settings.Key.gitChangesAndHistory)
+            NotificationCenter.default.post(name: .settingsDidChange, object: nil)
             XCTAssertFalse(Settings.shared.gitChangesAndHistory)
             controller.sidebar.showChanges(true)
             XCTAssertFalse(controller.sidebar.isShowingChanges)

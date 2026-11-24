@@ -16,8 +16,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
   with `author:name` or `path:folder`. Expand a commit to see its files, then
   open one with its changes marked, as a patch or as it was, or open the whole
   commit as a patch. It reads commits as you scroll and only when you look at
-  it. Turn it on with **Git tab, file history and branches** in
-  **Settings → Git**.
+  it.
 - **Switch branches.** Click the branch in the status bar, or choose
   **Go → Switch Branch…**, to switch to another branch, check out a remote
   branch, or create a new one. Tovri refuses when the switch would replace
@@ -31,6 +30,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   **History** inside it. In folders that aren't Git repositories, only
   **Files** is shown. The setting is now called **Git tab, file history and
   branches**.
+- The Git tab and file history are now on by default whenever Git is on.
+  Turn them off with **Git tab, file history and branches** in
+  **Settings → Git**.
 
 ## [0.6.3] - 2026-11-23
 

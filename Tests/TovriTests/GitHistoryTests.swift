@@ -525,9 +525,12 @@ final class GitHistoryTests: XCTestCase {
             controller.window?.close()
         }
         let tabs = { controller.sidebar.subviews.compactMap { $0 as? SidebarTabs }.first }
+        XCTAssertTrue(Settings.shared.gitChangesAndHistory, "on by default")
+        d.set(false, forKey: Settings.Key.gitChangesAndHistory)
+        NotificationCenter.default.post(name: .settingsDidChange, object: nil)
         controller.setFolder(URL(fileURLWithPath: dir.path, isDirectory: true))
         controller.rootView.layoutSubtreeIfNeeded()
-        XCTAssertEqual(tabs()?.isHidden, true, "off by default")
+        XCTAssertEqual(tabs()?.isHidden, true, "turned off")
         controller.sidebar.showChanges(true)
         XCTAssertFalse(controller.sidebar.isShowingChanges)
 
