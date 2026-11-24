@@ -148,6 +148,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         }
         view.onShowPatch = { [weak self] index in self?.showPatch(ofFile: index) }
         commitOverview = view
+        textView.lineBands = model.bandLines
         showsCommitOverview = true
         addSubview(view)
         gutter.isHidden = true
@@ -318,6 +319,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     func applySettings() {
         let s = Settings.shared
         textView.applyFontMetrics()
+        commitOverview?.applyTheme()
         layoutManager.showInvisibles = s.showInvisibles
         textView.scrollPastEnd = s.scrollPastEnd
         if comparisonLabel == nil ? !s.gitGutter : comparisonUsesGit && !s.gitChangesAndHistory { setComparing(false) }

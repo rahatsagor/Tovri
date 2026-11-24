@@ -813,7 +813,7 @@ final class GitHistoryTests: XCTestCase {
         }
     }
 
-    func testClickingAFileShowsItsSectionOfThePatchAtTheTop() throws {
+    func testShowInPatchLandsOnTheFilesSection() throws {
         try historyWithRenameBinaryAndDelete()
         try withWindow { c in
             let view = try showHistory(c, commits: 2)
@@ -821,16 +821,14 @@ final class GitHistoryTests: XCTestCase {
             let editor = try XCTUnwrap(c.activeEditor)
             let doc = try XCTUnwrap(c.activeDocument)
             let index = 2
-            ov.selectFile(index)
-            XCTAssertEqual(ov.selectedFileIndex, index)
-            ov.table.onReturn?(false)
+            let item = try XCTUnwrap(ov.makeMenu(for: index, full: false).items.first { $0.title == "Show in Patch" })
+            XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
             XCTAssertFalse(editor.showsCommitOverview)
             XCTAssertTrue(ov.isHidden)
             let start = doc.lines.start(of: ov.model.patchLines[index])
             XCTAssertTrue(NSLocationInRange(start, editor.textView.visibleCharacterRange), "the file's section should be on screen")
             XCTAssertLessThanOrEqual(editor.textView.visibleCharacterRange.location, start)
             XCTAssertEqual(editor.topVisibleLine, ov.model.patchLines[index], accuracy: 1)
-            // The tab bar's Overview button goes back.
             toolButton(c, startingWith: "Overview")?.onClick?()
             XCTAssertTrue(editor.showsCommitOverview)
         }
@@ -1011,8 +1009,8 @@ final class GitHistoryTests: XCTestCase {
         XCTAssertEqual(view.rows.count, 2 + d.files.count)
         var shown: Int?
         view.onShowPatch = { shown = $0 }
-        view.selectFile(1)
-        view.table.onReturn?(false)
+        let item = try XCTUnwrap(view.makeMenu(for: 1, full: false).items.first { $0.title == "Show in Patch" })
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
         XCTAssertEqual(shown, 1)
     }
 
@@ -1077,6 +1075,265 @@ final class GitHistoryTests: XCTestCase {
         XCTAssertEqual(AvatarView.initials(name: "", email: "zed@x"), "Z")
         XCTAssertEqual(AvatarView.stableIndex("Ann@X.com", count: 8), AvatarView.stableIndex("ann@x.com", count: 8))
         XCTAssertTrue((0..<8).contains(AvatarView.stableIndex("whoever@example.com", count: 8)))
+    }
+
+    // MARK: - File sections
+
+    private static let samplePatch = """
+    commit abc
+    Author: t <t@example.com>
+
+        message
+
+    diff --git a/a.txt b/a.txt
+    index 1111111..2222222 100644
+    --- a/a.txt
+    +++ b/a.txt
+    @@ -1,3 +1,4 @@ func foo
+     one
+    -two
+    +TWO
+    +three
+     four
+    @@ -10,2 +11,2 @@
+    -x
+    +y
+    \\ No newline at end of file
+    diff --git a/bin.dat b/bin.dat
+    index 1111111..2222222 100644
+    Binary files a/bin.dat and b/bin.dat differ
+    diff --git a/old.txt b/new.txt
+    similarity index 100%
+    rename from old.txt
+    rename to new.txt
+    diff --git a/m.sh b/m.sh
+    old mode 100644
+    new mode 100755
+    diff --git a/e.txt b/e.txt
+    new file mode 100644
+    index 0000000..e69de29
+    diff --git "a/tab\\tname.txt" "b/tab\\tname.txt"
+    index 1111111..2222222 100644
+    --- "a/tab\\tname.txt"
+    +++ "b/tab\\tname.txt"
+    @@ -1 +1 @@
+    -a
+    +b
+
+    """
+
+    func testThePatchParserReadsHunksNumbersNotesAndHeaders() throws {
+        let text = String(GitHistoryTests.samplePatch.dropFirst(0))
+        let files = PatchFile.parse(text)
+        XCTAssertEqual(files.count, 6)
+        let ns = text as NSString
+        let a = files[0]
+        XCTAssertEqual(a.hunks.count, 2)
+        XCTAssertEqual(a.hunks[0].oldStart, 1)
+        XCTAssertEqual(a.hunks[0].newStart, 1)
+        XCTAssertEqual(ns.substring(with: a.hunks[0].header), "@@ -1,3 +1,4 @@ func foo")
+        XCTAssertEqual(a.hunks[0].lines.map(\.kind), [.context, .removed, .added, .added, .context])
+        XCTAssertEqual(a.hunks[0].lines.map(\.oldNumber), [1, 2, 0, 0, 3])
+        XCTAssertEqual(a.hunks[0].lines.map(\.newNumber), [1, 0, 2, 3, 4])
+        XCTAssertEqual(a.hunks[0].lines.map { ns.substring(with: $0.range) }, ["one", "two", "TWO", "three", "four"])
+        XCTAssertEqual(a.hunks[1].oldStart, 10)
+        XCTAssertEqual(a.hunks[1].newStart, 11)
+        XCTAssertEqual(a.hunks[1].lines.map(\.kind), [.removed, .added, .note])
+        XCTAssertEqual(a.hunks[1].lines[1].newNumber, 11)
+        XCTAssertEqual(ns.substring(with: a.hunks[1].lines[2].range), "\\ No newline at end of file")
+        XCTAssertEqual(a.unifiedRowCount, 2 + 5 + 3)
+        XCTAssertNil(a.note)
+        // The header block runs from the diff line to the +++ line.
+        XCTAssertEqual(ns.substring(with: ns.lineRange(for: NSRange(location: 0, length: 0))), "commit abc\n")
+        let lines = text.components(separatedBy: "\n")
+        XCTAssertTrue(lines[a.headerLine].hasPrefix("diff --git a/a.txt"))
+        XCTAssertTrue(lines[a.headerEndLine].hasPrefix("+++ b/a.txt"))
+        XCTAssertEqual(files[1].note, "Binary file. Not shown.")
+        XCTAssertTrue(files[1].hunks.isEmpty)
+        XCTAssertTrue(lines[files[1].headerEndLine].hasPrefix("Binary files"), "a file without hunks ends at its last header line")
+        XCTAssertEqual(files[2].note, "Renamed from old.txt without changes")
+        XCTAssertEqual(files[3].note, "File mode changed 100644 → 100755")
+        XCTAssertEqual(files[4].note, "Empty file added")
+        XCTAssertEqual(files[5].hunks.count, 1)
+        XCTAssertTrue(lines[files[5].headerLine].hasPrefix("diff --git \"a/tab"))
+        XCTAssertEqual(files.map(\.headerLine), (0..<6).map { i in lines.firstIndex { $0.hasPrefix("diff --git") && lines.firstIndex(of: $0) != nil } .map { _ in files[i].headerLine }! })
+        let detail = GitRepository.CommitDetail(sha: "a", parents: [], authorName: "", authorEmail: "", authorDate: Date(), committerName: "",
+                                                commitDate: Date(), message: "", files: [], hiddenFileCount: 0)
+        let model = CommitOverviewModel(repoRoot: dir, commit: fake("a"), detail: detail, diffs: files)
+        XCTAssertTrue(model.bandLines.contains(files[0].headerLine))
+        XCTAssertFalse(model.bandLines.contains(files[0].headerEndLine + 1), "the hunk is not part of the band")
+        XCTAssertEqual(model.bandLines.count, files.reduce(0) { $0 + $1.headerEndLine - $1.headerLine + 1 })
+    }
+
+    func testSideBySideRowsZipRemovedAndAddedRuns() throws {
+        let text = """
+        diff --git a/f b/f
+        --- a/f
+        +++ b/f
+        @@ -1,6 +1,5 @@
+         ctx
+        -a
+        -b
+        -c
+        +A
+        +B
+         mid
+        +tail
+        """ + "\n"
+        let file = try XCTUnwrap(PatchFile.parse(text).first)
+        let rows = file.rows(split: true, limit: .max)
+        XCTAssertEqual(rows.count, file.splitRowCount)
+        XCTAssertEqual(rows.map(\.kind), [.hunk, .line, .line, .line, .line, .line, .line])
+        let lines = file.hunks[0].lines
+        let ns = text as NSString
+        func name(_ i: Int32) -> String { i < 0 ? "-" : ns.substring(with: lines[Int(i)].range) }
+        XCTAssertEqual(rows.dropFirst().map { "\(name($0.left))|\(name($0.right))" }, ["ctx|ctx", "a|A", "b|B", "c|-", "mid|mid", "-|tail"])
+        XCTAssertEqual(lines[Int(rows[2].left)].oldNumber, 2)
+        XCTAssertEqual(lines[Int(rows[2].right)].newNumber, 2)
+        XCTAssertEqual(file.rows(split: false, limit: .max).count, file.unifiedRowCount)
+        XCTAssertEqual(file.rows(split: true, limit: 3).count, 3)
+    }
+
+    func testOnlyTheFirstThreeFilesOpenInALargeCommit() {
+        let small = (0..<5).map { PatchFile(headerLine: $0, headerEndLine: $0) }
+        XCTAssertEqual(PatchFile.defaultExpansion(small, count: 5), [true, true, true, true, true])
+        let many = (0..<40).map { PatchFile(headerLine: $0, headerEndLine: $0) }
+        XCTAssertEqual(PatchFile.defaultExpansion(many, count: 40).filter { $0 }.count, 3)
+        var long = PatchFile(headerLine: 0, headerEndLine: 0)
+        long.hunks = [PatchHunk(header: NSRange(), oldStart: 1, newStart: 1, lines: Array(repeating: PatchLine(kind: .context, oldNumber: 1, newNumber: 1, range: NSRange()), count: 2_500))]
+        XCTAssertEqual(PatchFile.defaultExpansion([long, long], count: 2), [true, true], "by rows only the first three open; 2 files fit in 3")
+        XCTAssertEqual(PatchFile.defaultExpansion([long] + small, count: 6).filter { $0 }.count, 3)
+    }
+
+    private func sectionCell(_ ov: CommitOverviewView, _ path: String) throws -> FileSectionCell {
+        let i = try fileIndex(ov, path)
+        return try XCTUnwrap(ov.table.view(atColumn: 0, row: 2 + i, makeIfNecessary: true) as? FileSectionCell)
+    }
+
+    func testEachFileIsASectionThatOpensToItsOwnChanges() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertEqual(ov.model.expanded, Array(repeating: true, count: ov.model.detail.files.count), "a small commit opens every file")
+            let cell = try sectionCell(ov, "new.txt")
+            let body = cell.body
+            XCTAssertFalse(body.isHidden)
+            let tv = try XCTUnwrap(body.codeViews.first)
+            let lines = (tv.string as String).split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            XCTAssertTrue(lines.contains("line five"), "\(lines)")
+            XCTAssertTrue(lines.contains("line 5"), "the removed line is there, without a prefix")
+            XCTAssertFalse(lines.contains { $0.hasPrefix("+line") || $0.hasPrefix("-line") })
+            // Select all and copy gives the code.
+            tv.selectAll(nil)
+            tv.copy(nil)
+            let copied = try XCTUnwrap(AppRuntime.pasteboard.string(forType: .string))
+            XCTAssertTrue(copied.contains("line five\n") && copied.contains("line 2\n"), copied)
+            XCTAssertFalse(copied.contains("@@"))
+
+            // Clicking the header toggles.
+            let index = try fileIndex(ov, "new.txt")
+            let open = ov.table.rect(ofRow: 2 + index).height
+            ov.toggle(index)
+            XCTAssertFalse(ov.isExpanded(index))
+            XCTAssertLessThan(ov.table.rect(ofRow: 2 + index).height, open)
+            XCTAssertEqual(ov.table.rect(ofRow: 2 + index).height, CommitOverviewView.sectionHeaderHeight + CommitOverviewView.sectionGap)
+            ov.toggle(index)
+            XCTAssertTrue(ov.isExpanded(index))
+            XCTAssertEqual(ov.table.rect(ofRow: 2 + index).height, open)
+            ov.setAllExpanded(false)
+            XCTAssertTrue(ov.model.expanded.allSatisfy { !$0 })
+            XCTAssertFalse(ov.allExpanded)
+            ov.setAllExpanded(true)
+            XCTAssertTrue(ov.allExpanded)
+
+            // The binary file and the deleted file get a note or their removed lines.
+            let bin = try sectionCell(ov, "bin.dat")
+            XCTAssertTrue(bin.body.codeViews.isEmpty)
+            XCTAssertEqual(ov.model.diff(try fileIndex(ov, "bin.dat"))?.note, "Binary file. Not shown.")
+            XCTAssertFalse(try sectionCell(ov, "del.txt").body.codeViews.isEmpty)
+        }
+    }
+
+    func testSwitchingToSideBySideChangesTheColumnsAndHeightsAndIsSaved() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertFalse(Settings.shared.gitDiffLayoutIsSplit)
+            let index = try fileIndex(ov, "new.txt")
+            XCTAssertEqual(try sectionCell(ov, "new.txt").body.codeViews.count, 1)
+            let unified = ov.table.rect(ofRow: 2 + index).height
+            ov.setSplit(true)
+            XCTAssertTrue(Settings.shared.gitDiffLayoutIsSplit)
+            let cell = try sectionCell(ov, "new.txt")
+            XCTAssertEqual(cell.body.codeViews.count, 2)
+            XCTAssertTrue((cell.body.codeViews[0].string as String).contains("line 5\n"))
+            XCTAssertTrue((cell.body.codeViews[1].string as String).contains("line five\n"))
+            XCTAssertLessThan(ov.table.rect(ofRow: 2 + index).height, unified, "one removed line pairs with one added line")
+            ov.setSplit(false)
+            XCTAssertFalse(Settings.shared.gitDiffLayoutIsSplit)
+            XCTAssertEqual(ov.table.rect(ofRow: 2 + index).height, unified)
+            Settings.shared.gitDiffLayoutIsSplit = true
+            let next = try openCommit(c, view, "root")
+            XCTAssertTrue(next.model.isSplit, "a new commit tab starts with the saved layout")
+        }
+    }
+
+    func testShowMoreLinesOpensTheRestOfALongFile() throws {
+        try write((1...1_500).map { "row \($0)" }.joined(separator: "\n") + "\n", "long.txt")
+        try shell("git add -A && \(commit) -m 'long file'")
+        try withWindow { c in
+            let view = try showHistory(c, commits: 1)
+            let ov = try openCommit(c, view, "long file")
+            c.rootView.layoutSubtreeIfNeeded()
+            let cell = try sectionCell(ov, "long.txt")
+            // A hunk header row and 999 lines.
+            XCTAssertEqual((cell.body.codeViews[0].string as String).split(separator: "\n", omittingEmptySubsequences: false).count - 1, CommitOverviewModel.initialRowLimit)
+            let before = ov.table.rect(ofRow: 2).height
+            cell.onShowMore?()
+            let after = try sectionCell(ov, "long.txt")
+            XCTAssertEqual((after.body.codeViews[0].string as String).split(separator: "\n", omittingEmptySubsequences: false).count - 1, 1_501)
+            XCTAssertGreaterThan(ov.table.rect(ofRow: 2).height, before)
+        }
+    }
+
+    func testTheHeaderButtonOpensTheInlineChangesAndKeepsTheCommitTab() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            let commitDoc = try XCTUnwrap(c.activeDocument)
+            try sectionCell(ov, "new.txt").onOpenChanges?()
+            spin { c.activeEditor?.inlineDiff != nil && c.activeDocument?.revisionKey?.hasSuffix(":new.txt:changes") == true }
+            XCTAssertEqual(c.activeDocument?.revisionKey?.hasSuffix(":new.txt:changes"), true)
+            XCTAssertFalse(commitDoc.isHistoryPreview)
+            XCTAssertEqual(c.activeEditor?.comparisonSource, .commit)
+        }
+    }
+
+    func testPatchModeMarksEachFilesHeaderBlock() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            let editor = try XCTUnwrap(c.activeEditor)
+            XCTAssertEqual(editor.textView.lineBands, ov.model.bandLines)
+            XCTAssertFalse(ov.model.bandLines.isEmpty)
+            let doc = try XCTUnwrap(c.activeDocument)
+            for (i, file) in ov.model.diffs.enumerated() {
+                XCTAssertTrue(ov.model.bandLines.contains(file.headerLine), "file \(i)")
+                let end = doc.lines.range(of: file.headerEndLine, textLength: doc.length)
+                let last = (doc.string as NSString).substring(with: end)
+                XCTAssertTrue(file.hunks.isEmpty ? true : last.hasPrefix("+++ "), last)
+            }
+            XCTAssertEqual(ov.model.bandLines.count, ov.model.diffs.reduce(0) { $0 + $1.headerEndLine - $1.headerLine + 1 })
+            editor.setShowsCommitOverview(false)
+            c.rootView.layoutSubtreeIfNeeded()
+            editor.textView.display()
+        }
     }
 
     func testCommitPatchHeaderMarksMerges() {
@@ -1196,6 +1453,32 @@ final class GitHistoryBenchmarkTests: XCTestCase {
         print(String(format: "[history-bench] open a 1,000-file commit tab (detail + patch + model): %.1f ms", (CFAbsoluteTimeGetCurrent() - opened) * 1000))
         XCTAssertEqual(model.detail.files.count, 1_000)
         XCTAssertEqual(model.patchLines.count, 1_000)
+
+        try shell("mkdir lines && for i in $(seq 1 1000); do seq 1 50 > lines/g$i.txt; done && git add -A && git -c user.email=t@example.com -c user.name=t -c core.hooksPath=/dev/null commit -q -m 'fifty thousand lines'")
+        let wide = page(repo, limit: 1, topo: false)[0]
+        var wideDetail: GitRepository.CommitDetail?
+        var widePatch: String?
+        let loaded = expectation(description: "load wide commit")
+        loaded.expectedFulfillmentCount = 2
+        repo.commitDetail(sha: wide.sha, parents: wide.parents) { wideDetail = $0; loaded.fulfill() }
+        repo.commitPatch(sha: wide.sha, parent: wide.parents.first, paths: nil) { widePatch = $0; loaded.fulfill() }
+        wait(for: [loaded], timeout: 60)
+        let built0 = CFAbsoluteTimeGetCurrent()
+        let wideBuilt = MainWindowController.commitText(detail: try XCTUnwrap(wideDetail), patch: widePatch)
+        let wideModel = CommitOverviewModel(repoRoot: repo.root, commit: wide, detail: try XCTUnwrap(wideDetail), patchLines: wideBuilt.patchLines,
+                                            diffs: wideBuilt.files)
+        print(String(format: "[history-bench] build the model of a 1,000-file, 50,000-line commit (text + parse): %.1f ms", (CFAbsoluteTimeGetCurrent() - built0) * 1000))
+        XCTAssertEqual(wideModel.diffs.count, 1_000)
+        XCTAssertEqual(wideModel.expanded.filter { $0 }.count, 3)
+        _ = NSApplication.shared
+        let doc = Document(text: wideBuilt.text, name: "wide", language: LanguageRegistry.shared.plain)
+        wideModel.textSource = { [weak doc] in doc?.string }
+        let laid0 = CFAbsoluteTimeGetCurrent()
+        let overview = CommitOverviewView(model: wideModel)
+        overview.frame = NSRect(x: 0, y: 0, width: 1000, height: 800)
+        overview.layoutSubtreeIfNeeded()
+        for row in 0..<8 { _ = overview.table.view(atColumn: 0, row: row, makeIfNecessary: true) }
+        print(String(format: "[history-bench] first overview layout with 3 files expanded: %.1f ms", (CFAbsoluteTimeGetCurrent() - laid0) * 1000))
 
         let target = five[2_500]
         time("commitDetail") {

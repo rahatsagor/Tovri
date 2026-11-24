@@ -8,6 +8,7 @@ final class ToolButton: NSView {
     var symbol: String? { didSet { needsDisplay = true } }
     var title: String? { didSet { needsDisplay = true } }
     var symbolSize: CGFloat = 12
+    var isEnabled = true { didSet { needsDisplay = true } }
     var titleFont: NSFont = .systemFont(ofSize: 11.5, weight: .medium)
     private var hovering = false
     private var pressed = false
@@ -42,7 +43,7 @@ final class ToolButton: NSView {
     override func mouseUp(with event: NSEvent) {
         pressed = false
         needsDisplay = true
-        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+        if isEnabled, bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     /// Only keyboard navigation (Tab) focuses a button. A click must leave focus where it was, so
@@ -97,7 +98,7 @@ final class ToolButton: NSView {
             ring.lineWidth = 2
             ring.stroke()
         }
-        let color = isOn ? theme.accent.mix(theme.foreground, 0.25) : theme.chromeForeground.withAlphaComponent(0.85)
+        let color = isOn ? theme.accent.mix(theme.foreground, 0.25) : theme.chromeForeground.withAlphaComponent(isEnabled ? 0.85 : 0.35)
         if let name = symbol, let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: symbolSize, weight: .medium).applying(.init(paletteColors: [color]))) {
             let s = img.size

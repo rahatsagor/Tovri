@@ -91,6 +91,7 @@ final class Settings {
         static let gitStatusBarChanges = "gitStatusBarChanges"
         static let gitChangesAndHistory = "gitChangesAndHistory"
         static let gitChangesFilter = "gitChangesFilter"
+        static let gitDiffLayout = "gitDiffLayout"
         static let gitChangesSort = "gitChangesSort"
         static let quitWhenLastWindowCloses = "quitWhenLastWindowCloses"
         static let revealActiveFile = "revealActiveFile"
@@ -146,6 +147,7 @@ final class Settings {
         Key.gitStatusBarChanges: true,
         Key.gitChangesAndHistory: true,
         Key.gitChangesFilter: ChangeFilter.all.rawValue,
+        Key.gitDiffLayout: "unified",
         Key.gitChangesSort: ChangeSort.path.rawValue,
         Key.quitWhenLastWindowCloses: false,
         Key.revealActiveFile: true,
@@ -353,6 +355,11 @@ final class Settings {
     var gitChangesFilter: ChangeFilter {
         get { ChangeFilter(rawValue: d.string(forKey: Key.gitChangesFilter) ?? "") ?? .all }
         set { d.set(newValue.rawValue, forKey: Key.gitChangesFilter) }
+    }
+    /// Whether a commit's file diffs show old and new side by side. Saved when it is changed in a commit tab.
+    var gitDiffLayoutIsSplit: Bool {
+        get { d.string(forKey: Key.gitDiffLayout) == "split" }
+        set { d.set(newValue ? "split" : "unified", forKey: Key.gitDiffLayout) }
     }
     var gitChangesSort: ChangeSort {
         get { ChangeSort(rawValue: d.string(forKey: Key.gitChangesSort) ?? "") ?? .path }

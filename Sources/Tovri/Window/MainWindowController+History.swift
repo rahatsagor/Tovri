@@ -272,8 +272,10 @@ extension MainWindowController {
                     let subject = commit.subject.count > 40 ? String(commit.subject.prefix(39)) + "…" : commit.subject
                     let name = subject.isEmpty ? "\(commit.shortSHA) — Commit" : "\(commit.shortSHA) — \(subject)"
                     let doc = self.makeHistoryDocument(built.text, name: name, key: key, language: self.diffLanguage)
-                    doc.commitOverview = CommitOverviewModel(repoRoot: repo.root, commit: commit, detail: detail,
-                                                             patchLines: built.patchLines, patchTooLarge: built.tooLarge)
+                    let model = CommitOverviewModel(repoRoot: repo.root, commit: commit, detail: detail, patchLines: built.patchLines,
+                                                    patchTooLarge: built.tooLarge, diffs: built.files, isSplit: Settings.shared.gitDiffLayoutIsSplit)
+                    model.textSource = { [weak doc] in doc?.string }
+                    doc.commitOverview = model
                     self.showHistoryDocument(doc, pinned: pinned)
                 }
             }
@@ -282,14 +284,15 @@ extension MainWindowController {
 
     /// The commit tab's text: the `git show` header and the patch, or a notice when the patch is over
     /// the size limit, and where each file's section starts.
-    static func commitText(detail: GitRepository.CommitDetail, patch: String?) -> (text: String, patchLines: [Int], tooLarge: Bool) {
+    static func commitText(detail: GitRepository.CommitDetail, patch: String?) -> (text: String, patchLines: [Int], tooLarge: Bool, files: [PatchFile]) {
         let header = commitPatchHeader(detail)
         guard let patch else {
             let limit = GitRepository.maxBlobSize / 1_000_000
-            return (header + "The patch for this commit is too large to show here (over \(limit) MB).\n", [], true)
+            return (header + "The patch for this commit is too large to show here (over \(limit) MB).\n", [], true, [])
         }
         let text = LineEnding.normalize(header + patch, rawData: nil).0
-        return (text, CommitOverviewModel.sectionLines(in: text), false)
+        let files = PatchFile.parse(text)
+        return (text, files.map(\.headerLine), false, files)
     }
 
     /// The top of `git show`: the commit, its parents when it is a merge, the author, date and message.

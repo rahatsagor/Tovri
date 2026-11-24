@@ -14,10 +14,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - **History in the sidebar.** The new Git tab has a History view with your
   repository's commits and branch graph. Search messages, and narrow the list
   with `author:name` or `path:folder`. Click a commit, or move through them
-  with the arrow keys, to open it in a tab with an overview of its message and
-  changed files. Switch the tab to Patch to read every change, click a file to
-  jump to it, or open a file with its changes marked inline or as it was. It
-  reads commits as you scroll and only when you look at it.
+  with the arrow keys, to open it in a tab. Its overview shows the message and
+  each changed file as its own section with that file's changes, in one column
+  or side by side, and you can collapse any of them. Switch the tab to Patch
+  to read the raw patch, with each file clearly marked, or open a file's
+  changes marked inline, as a patch or as it was. It reads commits as you
+  scroll and only when you look at it.
 - **Switch branches.** Click the branch in the status bar, or choose
   **Go → Switch Branch…**, to switch to another branch, check out a remote
   branch, or create a new one. Tovri refuses when the switch would replace

@@ -340,33 +340,39 @@ final class CommitOverviewModel {
     /// The 0-based line of each file's `diff --git ` section, in the order of `detail.files`.
     var patchLines: [Int]
     var patchTooLarge: Bool
+    /// Each file's diff, parsed from the patch, in the order of `detail.files`.
+    var diffs: [PatchFile]
+    /// The document lines of every file's header block, which Patch mode draws as a band.
+    var bandLines: IndexSet
+    /// Which files show their changes, kept per tab so the page can be redrawn without losing it.
+    var expanded: [Bool]
+    var isSplit: Bool
+    /// How many rows of each file are shown before "Show more lines".
+    var rowLimits: [Int]
+    /// The patch text the diffs' ranges point into.
+    var textSource: (() -> NSString?)?
 
-    init(repoRoot: URL, commit: LogCommit, detail: GitRepository.CommitDetail, patchLines: [Int] = [], patchTooLarge: Bool = false) {
+    static let initialRowLimit = 1_000
+    static let maxRowLimit = 20_000
+
+    init(repoRoot: URL, commit: LogCommit, detail: GitRepository.CommitDetail, patchLines: [Int] = [], patchTooLarge: Bool = false,
+         diffs: [PatchFile] = [], isSplit: Bool = false) {
         self.repoRoot = repoRoot
         self.commit = commit
         self.detail = detail
         self.patchLines = patchLines
         self.patchTooLarge = patchTooLarge
+        self.diffs = diffs
+        self.isSplit = isSplit
+        var bands = IndexSet()
+        for f in diffs where f.headerEndLine >= f.headerLine { bands.insert(integersIn: f.headerLine...f.headerEndLine) }
+        bandLines = bands
+        expanded = PatchFile.defaultExpansion(diffs, count: detail.files.count)
+        rowLimits = Array(repeating: CommitOverviewModel.initialRowLimit, count: detail.files.count)
     }
 
-    /// The 0-based lines of `diff --git ` at the start of a line in `text`.
-    static func sectionLines(in text: String) -> [Int] {
-        var lines: [Int] = []
-        var line = 0
-        let marker = Array("diff --git ".utf8)
-        var utf8 = text
-        utf8.withUTF8 { buf in
-            var i = 0
-            let n = buf.count
-            while i < n {
-                if i + marker.count <= n, buf[i] == marker[0], buf[i..<i + marker.count].elementsEqual(marker) { lines.append(line) }
-                while i < n, buf[i] != 0x0A { i += 1 }
-                i += 1
-                line += 1
-            }
-        }
-        return lines
-    }
+    /// The diff of file `index`, when the patch had a section for it.
+    func diff(_ index: Int) -> PatchFile? { index < diffs.count ? diffs[index] : nil }
 }
 
 /// Recently read commit details, so reopening a commit tab doesn't run git again. Commits never change.

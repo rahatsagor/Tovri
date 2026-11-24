@@ -262,11 +262,36 @@ final class EditorTextView: NSTextView {
 
     // MARK: Drawing
 
+    /// Document lines drawn as a full-width band, with a rule along the top of each block. Only commit
+    /// tabs set this, to mark where each file's header starts in the patch.
+    var lineBands: IndexSet? { didSet { needsDisplay = true } }
+
+    private func drawLineBands(_ bands: IndexSet, in rect: NSRect, theme: Theme) {
+        let lines = document.lines
+        guard lines.count > 0, document.length > 0 else { return }
+        let top = textContainerOrigin.y
+        let first = lines.line(containing: characterIndexForInsertion(at: NSPoint(x: 0, y: max(0, rect.minY - top))))
+        let last = lines.line(containing: characterIndexForInsertion(at: NSPoint(x: 0, y: rect.maxY - top)))
+        guard first <= last else { return }
+        for line in bands.intersection(IndexSet(integersIn: first...last)) {
+            let r = lineRect(forCharacter: lines.start(of: line))
+            let band = NSRect(x: rect.minX, y: r.minY, width: rect.width, height: r.height)
+            // A tint of the text color shows on any theme, including translucent ones whose chrome is clear.
+            theme.foreground.withAlphaComponent(0.07).setFill()
+            band.fill()
+            if !bands.contains(line - 1) {
+                theme.foreground.withAlphaComponent(0.2).setFill()
+                NSRect(x: rect.minX, y: r.minY, width: rect.width, height: 1).fill()
+            }
+        }
+    }
+
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
         guard layoutManager != nil, textContainer != nil else { return }
         let theme = ThemeManager.shared.active
         let settings = Settings.shared
+        if let bands = lineBands { drawLineBands(bands, in: rect, theme: theme) }
 
         if settings.highlightCurrentLine {
             theme.lineHighlight.setFill()
