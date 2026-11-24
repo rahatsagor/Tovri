@@ -18,6 +18,15 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         }
     }
     var message: String? { didSet { needsDisplay = true } }
+    /// Whether clicking the branch switches branches; otherwise it is plain text.
+    var branchIsClickable = false {
+        didSet {
+            guard oldValue != branchIsClickable else { return }
+            if !branchIsClickable, hover == .branch { hover = nil }
+            needsDisplay = true
+            NSAccessibility.post(element: self, notification: .layoutChanged)
+        }
+    }
     private(set) var flashText: String?
     private var flashToken = 0
 
@@ -49,7 +58,11 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
     ]
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
-        tooltipTags[tag].flatMap { StatusBarView.help[$0] } ?? ""
+        tooltipTags[tag].flatMap { help(for: $0) } ?? ""
+    }
+
+    private func help(for item: Item) -> String? {
+        item == .branch && branchIsClickable ? "Current Git branch. Click to switch branches." : StatusBarView.help[item]
     }
 
     private func updateToolTips() {
@@ -194,7 +207,7 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
 
     override func mouseMoved(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        let h = rects.first(where: { $0.value.contains(p) })?.key
+        let h = rects.first(where: { $0.value.contains(p) && ($0.key != .branch || branchIsClickable) })?.key
         if h != hover { hover = h; needsDisplay = true }
     }
 
@@ -202,24 +215,25 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        guard let (item, rect) = rects.first(where: { $0.value.contains(p) }) else { return }
+        guard let (item, rect) = rects.first(where: { $0.value.contains(p) && ($0.key != .branch || branchIsClickable) }) else { return }
         delegate?.statusBar(self, clicked: item, at: rect)
     }
 
     // MARK: Accessibility
 
     private lazy var itemElements: [Item: DrawnAccessibilityElement] = Dictionary(uniqueKeysWithValues: Item.allCases.map { item in
-        // Clicking the branch does nothing, so it is read as text rather than offered as a button.
         let e = DrawnAccessibilityElement(in: self, role: item == .branch ? .staticText : .button) { [weak self] in self?.itemRects()[item] }
-        if item != .branch {
-            e.onPress = { [weak self] in
-                guard let self, let r = self.itemRects()[item] else { return }
-                self.delegate?.statusBar(self, clicked: item, at: r)
-            }
-        }
+        if item != .branch { e.onPress = pressHandler(for: item) }
         e.setAccessibilityHelp(StatusBarView.help[item])
         return (item, e)
     })
+
+    private func pressHandler(for item: Item) -> () -> Void {
+        { [weak self] in
+            guard let self, let r = self.itemRects()[item] else { return }
+            self.delegate?.statusBar(self, clicked: item, at: r)
+        }
+    }
 
     private lazy var messageElement = DrawnAccessibilityElement(in: self, role: .staticText) { [weak self] in
         guard let self else { return nil }
@@ -236,6 +250,12 @@ final class StatusBarView: NSView, NSViewToolTipOwner {
         for item in Item.allCases {
             if let v = values[item], !v.isEmpty, let e = itemElements[item] {
                 e.setAccessibilityLabel("\(StatusBarView.names[item] ?? ""): \(v)")
+                if item == .branch {
+                    // Only a button while a click switches branches; otherwise it is read as text.
+                    e.setAccessibilityRole(branchIsClickable ? .button : .staticText)
+                    e.onPress = branchIsClickable ? pressHandler(for: .branch) : nil
+                    e.setAccessibilityHelp(help(for: .branch))
+                }
                 result.append(e)
             }
             if item == .changes, let m = message ?? flashText {

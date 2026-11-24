@@ -30,7 +30,10 @@ Only the latest release receives fixes.
   or a script. Web and email links open in your default browser or mail app.
 - **Git.** Tovri reads the branch, file status, history and committed copies
   of files, and from the Changes list it can stage, unstage and discard
-  changes when you ask. It never commits, pushes or fetches. A repository's
+  changes, and switch branches, when you ask. It never commits, pushes or
+  fetches. Before switching branches, Tovri checks that no file with
+  uncommitted or unsaved changes, no untracked or ignored file, and no file
+  that uses a filter would be replaced. A repository's
   own configuration can name programs for Git to run, so Tovri runs Git with
   hooks (including Git 2.54+ `hook.*` entries), `core.fsmonitor`,
   `submodule.recurse`, signature checking and every network transport turned

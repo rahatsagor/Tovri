@@ -16,13 +16,21 @@ and versions follow [Semantic Versioning](https://semver.org/).
   with `author:name` or `path:folder`. Expand a commit to see its files, then
   open one with its changes marked, as a patch or as it was, or open the whole
   commit as a patch. It reads commits as you scroll and only when you look at
-  it. Turn it on with **Git tab and file history** in **Settings → Git**.
+  it. Turn it on with **Git tab, file history and branches** in
+  **Settings → Git**.
+- **Switch branches.** Click the branch in the status bar, or choose
+  **Go → Switch Branch…**, to switch to another branch, check out a remote
+  branch, or create a new one. Tovri refuses when the switch would replace
+  unsaved or uncommitted work, untracked or ignored files, or files that use a
+  filter such as Git LFS, and tells you which files are in the way. Open files
+  that the switch changed reload right away.
 
 ### Changed
 
 - The sidebar's **Changes** tab is now **Git**, with **Changes** and
   **History** inside it. In folders that aren't Git repositories, only
-  **Files** is shown. The setting is now called **Git tab and file history**.
+  **Files** is shown. The setting is now called **Git tab, file history and
+  branches**.
 
 ## [0.6.3] - 2026-11-23
 

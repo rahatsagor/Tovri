@@ -267,6 +267,7 @@ enum MainMenu {
         add(go, "Previous Change", #selector(MainWindowController.previousChange(_:)), f5, [.option, .shift])
         add(go, "Changed Files…", #selector(MainWindowController.showChangedFiles(_:)), "g", [.command, .option, .shift])
         add(go, "File History…", #selector(MainWindowController.showFileHistory(_:)), "h", [.command, .option, .shift])
+        add(go, "Switch Branch…", #selector(MainWindowController.showBranches(_:)))
         go.addItem(.separator())
         add(go, "Next Tab", #selector(MainWindowController.selectNextTabCommand(_:)), right, [.command, .option])
         add(go, "Previous Tab", #selector(MainWindowController.selectPreviousTabCommand(_:)), left, [.command, .option])

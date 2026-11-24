@@ -70,6 +70,7 @@ final class PaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSou
     private var mode: Mode = .files
     private var source: [PaletteItem] = []
     private var results: [PaletteItem] = []
+    var shownItems: [PaletteItem] { results }
     private var onCancel: (() -> Void)?
     private var restore: (editor: EditorView, selection: NSRange, scroll: CGPoint)?
     private var didPreview = false

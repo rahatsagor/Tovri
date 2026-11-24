@@ -412,6 +412,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 if Settings.shared.gitGutter { doc.refreshGitBaseline() } else { doc.clearGitBaseline() }
             }
             groups.forEach { $0.refreshAccessories() }
+            if !Settings.shared.gitChangesAndHistory, palette.listTag == MainWindowController.branchesListTag {
+                palette.close(cancelled: true)
+            }
             if !Settings.shared.gitChangesAndHistory, palette.listTag == MainWindowController.historyListTag {
                 palette.close(cancelled: true)
             }
@@ -505,6 +508,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
                 .changes: Settings.shared.gitStatusBarChanges && changedFileCount > 0 ? "\(changedFileCount) changed" : "",
                 .theme: ThemeManager.shared.current.name,
             ]
+            updateBranchClickable()
             return
         }
         let doc = e.document
@@ -537,19 +541,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
             .theme: ThemeManager.shared.current.name,
             .language: doc.language.name,
         ]
+        updateBranchClickable()
     }
 
     /// The repository and branch for the status bar, looked up once per folder rather than on
     /// every caret move. Cleared whenever Git status is refreshed.
     private var gitContext: (key: String, branch: String)?
 
-    private func gitBranch(for doc: Document?) -> String {
+    func gitBranch(for doc: Document?) -> String {
         guard Settings.shared.gitEnabled, let base = doc?.url ?? folderURL else { return "" }
         let key = base.hasDirectoryPath ? base.path : base.deletingLastPathComponent().path
         if let c = gitContext, c.key == key { return c.branch }
         let branch = GitRepository.find(for: base)?.branch ?? ""
         gitContext = (key, branch)
         return branch
+    }
+
+    private func updateBranchClickable() {
+        statusBar.branchIsClickable = Settings.shared.gitChangesAndHistory && statusBar.values[.branch]?.isEmpty == false
     }
 
     // MARK: EditorViewDelegate
@@ -818,6 +827,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     private var sidebarGitNeedsFullRefresh = false
     private var ignoredGeneration = 0
     var historyOpenGeneration = 0
+    var isSwitchingBranch = false
     private(set) var changedFileCount = 0
 
     /// Runs `git status` only for the features that are on: sidebar colors and the changed count.
@@ -2027,7 +2037,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     /// Lists the commits that changed the active file; choosing one compares the file with it.
     @objc func showFileHistory(_ sender: Any?) {
         guard Settings.shared.gitChangesAndHistory else {
-            statusBar.flash("Turn on Git tab and file history in Settings → Git")
+            statusBar.flash("Turn on Git tab, file history and branches in Settings → Git")
             return
         }
         guard let e = activeEditor, let url = e.document.url else { statusBar.flash("Save the file to see its history"); return }
@@ -2280,6 +2290,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         switch item {
         case .changes: showChangedFiles(nil); return
         case .theme: showThemePicker(nil); return
+        case .branch where bar.branchIsClickable: showBranches(nil); return
         default: break
         }
         guard let doc = activeDocument else { return }
@@ -2510,6 +2521,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
         case #selector(showChangedFiles(_:)): return s.gitEnabled
         case #selector(undoReplaceInFiles(_:)): return replaceInFiles.canUndo
         case #selector(showFileHistory(_:)): return s.gitChangesAndHistory && activeDocument?.url != nil
+        case #selector(showBranches(_:)): return s.gitChangesAndHistory && !gitBranch(for: activeDocument).isEmpty
         case #selector(reopenClosedTab(_:)): return closedTabs.last { FileManager.default.fileExists(atPath: $0.path) } != nil
         case #selector(toggleMarkdownPreview(_:)):
             menuItem.state = activeEditor?.previewMode == .full ? .on : .off

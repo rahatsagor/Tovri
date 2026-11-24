@@ -575,12 +575,13 @@ final class GitRepository {
     }
 
     func run(_ args: [String], acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024,
-             cancellation: GitCancellation? = nil) -> Data? {
+             cancellation: GitCancellation? = nil, standardError: GitErrorCapture? = nil) -> Data? {
         guard let overrides = configuredOverrides() else { return nil }
         return rawRun(args, GitRepository.safetySettings
                           + GitRepository.filterSettings(names: overrides.filters)
                           + GitRepository.hookSettings(names: overrides.hooks),
-                      acceptedStatuses: acceptedStatuses, maxOutputBytes: maxOutputBytes, cancellation: cancellation)
+                      acceptedStatuses: acceptedStatuses, maxOutputBytes: maxOutputBytes, cancellation: cancellation,
+                      standardError: standardError)
     }
 
     private static let defaultSystemConfigPaths: [URL] = {
@@ -653,7 +654,7 @@ final class GitRepository {
     /// Names of filter drivers and Git 2.54+ hooks in the repository's and user's config. Also tracks
     /// `[include]` / `[includeIf]` file origins and targets in the cache stamp so repos with included
     /// configs stay cached until an included file changes or conditional branch context changes.
-    private func configuredOverrides() -> (filters: Set<String>, hooks: Set<String>)? {
+    func configuredOverrides() -> (filters: Set<String>, hooks: Set<String>)? {
         let now = Date.timeIntervalSinceReferenceDate
         filterLock.lock()
         let hit = cachedFilters
@@ -790,7 +791,8 @@ final class GitRepository {
     }
 
     private func rawRun(_ args: [String], _ settings: [ConfigSetting], acceptedStatuses: Set<Int32> = [0],
-                        maxOutputBytes: Int? = 64 * 1024 * 1024, cancellation: GitCancellation? = nil) -> Data? {
+                        maxOutputBytes: Int? = 64 * 1024 * 1024, cancellation: GitCancellation? = nil,
+                        standardError: GitErrorCapture? = nil) -> Data? {
         guard let git = GitRepository.executable,
               let dirs = resolvedDirs else { return nil }
         // Canonical `--git-dir` and `--work-tree` bind git to the validated targets, preventing
@@ -798,7 +800,7 @@ final class GitRepository {
         return GitRepository.runProcess(URL(fileURLWithPath: git),
                                         ["--git-dir=" + dirs.gitDir.path, "--work-tree=" + dirs.workTree.path, "-C", dirs.workTree.path] + args,
                                         environment: GitRepository.environment(settings), acceptedStatuses: acceptedStatuses,
-                                        maxOutputBytes: maxOutputBytes, cancellation: cancellation)
+                                        maxOutputBytes: maxOutputBytes, cancellation: cancellation, standardError: standardError)
     }
 
     /// Longest a git command may run before it is stopped.
@@ -809,7 +811,7 @@ final class GitRepository {
     /// stalled network volume, or a child process that keeps the pipe open, can't hold the caller past the timeout.
     static func runProcess(_ executable: URL, _ args: [String], environment: [String: String], timeout: TimeInterval = GitRepository.timeout,
                            acceptedStatuses: Set<Int32> = [0], maxOutputBytes: Int? = 64 * 1024 * 1024,
-                           cancellation: GitCancellation? = nil) -> Data? {
+                           cancellation: GitCancellation? = nil, standardError: GitErrorCapture? = nil) -> Data? {
         final class Output: @unchecked Sendable {
             var data = Data()
             var failed = false
@@ -820,7 +822,8 @@ final class GitRepository {
         p.environment = environment
         let out = Pipe()
         p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
+        let err = standardError.map { _ in Pipe() }
+        p.standardError = err ?? (FileHandle.nullDevice as Any)
         p.standardInput = FileHandle.nullDevice
         // waitUntilExit() on a background thread can miss the exit and wait out the whole
         // timeout, so the exit is signaled by the termination handler instead.
@@ -833,6 +836,15 @@ final class GitRepository {
             p.terminate()
             try? out.fileHandleForReading.close()
             return nil
+        }
+        let errDone = DispatchSemaphore(value: 0)
+        if let err, let standardError {
+            // The write end was inherited by the child; closing ours lets the read end see EOF.
+            try? err.fileHandleForWriting.close()
+            DispatchQueue.global(qos: .utility).async {
+                standardError.drain(err.fileHandleForReading)
+                errDone.signal()
+            }
         }
         let output = Output()
         let done = DispatchSemaphore(value: 0)
@@ -867,6 +879,7 @@ final class GitRepository {
             }
             return nil
         }
+        if err != nil { _ = errDone.wait(timeout: .now() + 5) }
         if output.failed || cancellation?.isCancelled == true { return nil }
         return p.terminationReason == .exit && acceptedStatuses.contains(p.terminationStatus) ? output.data : nil
     }
@@ -1216,7 +1229,7 @@ final class GitRepository {
     }
 
     /// Stage, unstage and discard each take git's index lock, so they run one at a time.
-    private static let actionQueue = DispatchQueue(label: "app.tovri.git-actions", qos: .userInitiated)
+    static let actionQueue = DispatchQueue(label: "app.tovri.git-actions", qos: .userInitiated)
 
     func perform(_ action: @escaping (GitRepository) -> ActionResult, completion: @escaping (ActionResult) -> Void) {
         GitRepository.actionQueue.async {
