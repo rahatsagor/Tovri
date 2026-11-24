@@ -194,7 +194,7 @@ final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
         case .added: return (theme.color(.inserted) ?? .systemGreen).withAlphaComponent(0.14)
         case .removed: return (theme.color(.deleted) ?? .systemRed).withAlphaComponent(0.14)
         case .hunk: return theme.foreground.withAlphaComponent(0.06)
-        case .filler: return theme.chromeBackground.withAlphaComponent(0.5)
+        case .filler: return theme.foreground.withAlphaComponent(0.035)
         case .context, .note: return nil
         }
     }

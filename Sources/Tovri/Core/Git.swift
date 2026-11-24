@@ -492,6 +492,21 @@ final class GitRepository {
         return !ref.split(separator: "/").contains("..")
     }
 
+    /// Stamps of the files `headToken` reads: HEAD, the branch's ref file and packed-refs. While they are
+    /// unchanged, HEAD hasn't moved, and `headToken` (which may scan a large packed-refs) needn't be read.
+    var headStamps: [DiskStamp?]? {
+        guard let dirs = resolvedDirs else { return nil }
+        var roots = [dirs.gitDir]
+        if dirs.commonDir.path != dirs.gitDir.path { roots.append(dirs.commonDir) }
+        var urls = [dirs.gitDir.appendingPathComponent("HEAD")]
+        if let head = GitRepository.readSmallText(urls[0])?.trimmingCharacters(in: .whitespacesAndNewlines), head.hasPrefix("ref: ") {
+            let ref = String(head.dropFirst(5))
+            if GitRepository.isValidRefPath(ref) { urls += roots.map { $0.appendingPathComponent(ref) } }
+        }
+        urls += roots.map { $0.appendingPathComponent("packed-refs") }
+        return urls.map { DiskStamp($0) }
+    }
+
     /// Identifies the commit HEAD points at by reading .git directly, without running git. Nil when
     /// it can't be worked out cheaply; callers then treat HEAD as changed.
     var headToken: String? {

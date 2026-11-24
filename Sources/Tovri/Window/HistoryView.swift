@@ -152,6 +152,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     private var reachedEnd = false
     private var pageFailed = false
     private var loadedToken: String?
+    private var loadedStamps: [DiskStamp?]?
     private var needsReload = true
     private var searchDebounce: DispatchWorkItem?
     private var openDebounce: DispatchWorkItem?
@@ -170,7 +171,10 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         return f
     }()
 
-    static func relativeDate(_ date: Date) -> String { relativeFormatter.localizedString(for: date, relativeTo: Date()) }
+    static func relativeDate(_ date: Date) -> String {
+        // A commit made a moment ago reads "in 0s" with the formatter, so say what it means.
+        abs(date.timeIntervalSinceNow) < 45 ? "just now" : relativeFormatter.localizedString(for: date, relativeTo: Date())
+    }
     static func absoluteDate(_ date: Date) -> String { absoluteFormatter.string(from: date) }
 
     var commits: [LogCommit] { commitItems.compactMap(\.commit) }
@@ -216,6 +220,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         list.action = #selector(clicked)
         list.doubleAction = #selector(doubleClicked)
         list.onReturn = { [weak self] in self?.returnPressed() }
+        list.onCopy = { [weak self] in self?.copySelectedSHA() }
         list.onSlash = { [weak self] in self?.focusSearch() }
         list.menuProvider = { [weak self] row in self?.menu(row: row) }
         list.setAccessibilityLabel("Commits")
@@ -248,6 +253,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         guard new !== repository else { return }
         repository = new
         loadedToken = nil
+        loadedStamps = nil
         needsReload = true
         dropRows()
     }
@@ -269,7 +275,11 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
 
     /// The window saw git change. Reloads at once while showing, otherwise on the next `show()`.
     func headMayHaveChanged(visible: Bool) {
-        guard !needsReload, let repository, repository.headToken != loadedToken else { return }
+        guard !needsReload, let repository else { return }
+        let stamps = repository.headStamps
+        guard stamps != loadedStamps else { return }
+        loadedStamps = stamps
+        guard repository.headToken != loadedToken else { return }
         if visible { reload() } else { needsReload = true }
     }
 
@@ -297,6 +307,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         query = HistoryQuery(searchField.stringValue)
         style.showsGraph = query.isEmpty
         guard let repo = repository else { setEmpty("Couldn’t read the history"); return }
+        loadedStamps = repo.headStamps
         loadedToken = repo.headToken
         if repo.isUnborn { setEmpty("No commits yet"); return }
         tip = repo.headCommitSHA ?? "HEAD"
@@ -500,6 +511,13 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         open(item, pinned: true)
     }
 
+    private func copySelectedSHA() {
+        let row = list.selectedRow
+        guard row >= 0, let commit = (list.item(atRow: row) as? HistoryItem)?.commit else { return }
+        copy(commit.sha)
+        (window?.windowController as? MainWindowController)?.statusBar.flash("Copied \(commit.shortSHA)")
+    }
+
     private func returnPressed() {
         let row = list.selectedRow
         guard row >= 0, let item = list.item(atRow: row) as? HistoryItem else { return }
@@ -551,9 +569,9 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
 
     @objc private func menuCopyMessage(_ sender: Any?) {
         guard let commit = menuItem(sender)?.commit else { return }
-        repository?.commitDetail(sha: commit.sha, parents: commit.parents) { [weak self] detail in
-            guard let detail else { return }
-            self?.copy(detail.message)
+        repository?.commitMessage(sha: commit.sha) { [weak self] message in
+            guard let message else { return }
+            self?.copy(message)
         }
     }
 
@@ -629,7 +647,7 @@ final class HistoryCommitCell: NSTableCellView {
         commit = c
         graph = style.showsGraph ? item.graph : nil
         meta = "\(c.author) · \(item.relativeDate)"
-        toolTip = HistoryView.absoluteDate(c.date)
+        toolTip = "\(CommitCardCell.subjectText(c))\n\(c.author) · \(HistoryView.absoluteDate(c.date)) · \(c.shortSHA)"
         let refs = c.refs.map(\.name)
         setAccessibilityLabel([c.subject.isEmpty ? "No message" : c.subject, c.author, item.relativeDate, "commit \(c.shortSHA)"]
             .joined(separator: ", ") + (refs.isEmpty ? "" : ", " + refs.joined(separator: ", ")))

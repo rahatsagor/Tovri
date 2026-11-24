@@ -25,6 +25,7 @@ final class GitHistoryTests: XCTestCase {
     }
 
     override func tearDown() {
+        AppRuntime.defaults.removeObject(forKey: Settings.Key.gitDiffLayout)
         AppRuntime.defaults.removeObject(forKey: Settings.Key.gitChangesAndHistory)
         NotificationCenter.default.post(name: .settingsDidChange, object: nil)
         GitRepository.userEnvironment = savedEnvironment
@@ -1194,15 +1195,12 @@ final class GitHistoryTests: XCTestCase {
         XCTAssertEqual(file.rows(split: true, limit: 3).count, 3)
     }
 
-    func testOnlyTheFirstThreeFilesOpenInALargeCommit() {
-        let small = (0..<5).map { PatchFile(headerLine: $0, headerEndLine: $0) }
-        XCTAssertEqual(PatchFile.defaultExpansion(small, count: 5), [true, true, true, true, true])
-        let many = (0..<40).map { PatchFile(headerLine: $0, headerEndLine: $0) }
-        XCTAssertEqual(PatchFile.defaultExpansion(many, count: 40).filter { $0 }.count, 3)
-        var long = PatchFile(headerLine: 0, headerEndLine: 0)
-        long.hunks = [PatchHunk(header: NSRange(), oldStart: 1, newStart: 1, lines: Array(repeating: PatchLine(kind: .context, oldNumber: 1, newNumber: 1, range: NSRange()), count: 2_500))]
-        XCTAssertEqual(PatchFile.defaultExpansion([long, long], count: 2), [true, true], "by rows only the first three open; 2 files fit in 3")
-        XCTAssertEqual(PatchFile.defaultExpansion([long] + small, count: 6).filter { $0 }.count, 3)
+    func testFilesStartCollapsedExceptWhenThereIsOnlyOne() {
+        let five = (0..<5).map { PatchFile(headerLine: $0, headerEndLine: $0) }
+        XCTAssertEqual(PatchFile.defaultExpansion(five, count: 5), Array(repeating: false, count: 5))
+        XCTAssertEqual(PatchFile.defaultExpansion(Array(five.prefix(1)), count: 1), [true])
+        XCTAssertEqual(PatchFile.defaultExpansion([], count: 0), [])
+        XCTAssertEqual(PatchFile.defaultExpansion(five, count: 40).filter { $0 }.count, 0)
     }
 
     private func sectionCell(_ ov: CommitOverviewView, _ path: String) throws -> FileSectionCell {
@@ -1216,7 +1214,10 @@ final class GitHistoryTests: XCTestCase {
             let view = try showHistory(c, commits: 2)
             let ov = try openCommit(c, view, "rename and more")
             c.rootView.layoutSubtreeIfNeeded()
-            XCTAssertEqual(ov.model.expanded, Array(repeating: true, count: ov.model.detail.files.count), "a small commit opens every file")
+            XCTAssertEqual(ov.model.expanded, Array(repeating: false, count: ov.model.detail.files.count), "files start collapsed")
+            XCTAssertEqual(ov.renderCount, 0, "opening a commit builds no diff")
+            ov.setAllExpanded(true)
+            c.rootView.layoutSubtreeIfNeeded()
             let cell = try sectionCell(ov, "new.txt")
             let body = cell.body
             XCTAssertFalse(body.isHidden)
@@ -1261,6 +1262,7 @@ final class GitHistoryTests: XCTestCase {
         try withWindow { c in
             let view = try showHistory(c, commits: 2)
             let ov = try openCommit(c, view, "rename and more")
+            ov.setAllExpanded(true)
             c.rootView.layoutSubtreeIfNeeded()
             XCTAssertFalse(Settings.shared.gitDiffLayoutIsSplit)
             let index = try fileIndex(ov, "new.txt")
@@ -1336,6 +1338,164 @@ final class GitHistoryTests: XCTestCase {
         }
     }
 
+    func testExpandingEveryFileOnlyBuildsTheVisibleOnes() throws {
+        try write("base\n", "keep.txt")
+        for i in 1...80 { try write("file \(i)\n", "many/f\(i).txt") }
+        try shell("git add -A && \(commit) -m 'many files'")
+        try withWindow { c in
+            let view = try showHistory(c, commits: 1)
+            let ov = try openCommit(c, view, "many files")
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertEqual(ov.renderCount, 0)
+            ov.setAllExpanded(true)
+            c.rootView.layoutSubtreeIfNeeded()
+            let visible = ov.table.rows(in: ov.table.visibleRect)
+            XCTAssertGreaterThan(ov.model.detail.files.count, 40)
+            XCTAssertLessThanOrEqual(ov.renderCount, visible.length, "only rows that are showing are drawn")
+            XCTAssertLessThan(ov.renderCount, ov.model.detail.files.count)
+            XCTAssertGreaterThan(ov.renderCount, 0)
+        }
+    }
+
+    func testASingleFileCommitOpensItsChangesAndEmptyCommitsSayWhy() throws {
+        try write("x\n", "only.txt")
+        try shell("git add -A && \(commit) -m 'one file'")
+        try shell("\(commit) --allow-empty -m 'nothing here'")
+        try shell("git switch -q -c side HEAD~1 && echo s > s.txt && git add -A && \(commit) -m side && git switch -q main && git merge -q --no-ff -s ours side -m 'Merge side, no changes'")
+        try withWindow { c in
+            let view = try showHistory(c, commits: 4)
+            let one = try openCommit(c, view, "one file")
+            XCTAssertEqual(one.model.expanded, [true])
+            let empty = try openCommit(c, view, "nothing here")
+            XCTAssertEqual(empty.rows.count, 2)
+            guard case .empty(let message) = empty.rows[1] else { return XCTFail("expected the empty row") }
+            XCTAssertEqual(message, "This commit doesn’t change any files.")
+            let merge = try openCommit(c, view, "Merge side, no changes")
+            XCTAssertEqual(merge.model.commit.parents.count, 2)
+            guard case .empty(let text) = merge.rows[1] else { return XCTFail("expected the empty row") }
+            XCTAssertEqual(text, "No changes compared with the first parent.")
+        }
+    }
+
+    func testSideBySideFallsBackToOneColumnWhenNarrow() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            ov.setAllExpanded(true)
+            ov.setSplit(true)
+            c.window?.setContentSize(NSSize(width: 1240, height: 800))
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertTrue(ov.effectiveSplit)
+            let index = try fileIndex(ov, "new.txt")
+            let wide = ov.table.rect(ofRow: 2 + index).height
+            XCTAssertEqual(try sectionCell(ov, "new.txt").body.codeViews.count, 2)
+            c.window?.setContentSize(NSSize(width: 760, height: 800))
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertTrue(ov.model.isSplit, "the choice is kept")
+            XCTAssertFalse(ov.effectiveSplit)
+            XCTAssertEqual(try sectionCell(ov, "new.txt").body.codeViews.count, 1)
+            XCTAssertGreaterThan(ov.table.rect(ofRow: 2 + index).height, wide, "heights follow the layout actually shown")
+            c.window?.setContentSize(NSSize(width: 1240, height: 800))
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertTrue(ov.effectiveSplit)
+            XCTAssertEqual(ov.table.rect(ofRow: 2 + index).height, wide)
+        }
+    }
+
+    func testTabOpensWithTheFirstFileSelectedWhenFocused() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more", pinned: true)
+            XCTAssertEqual(ov.selectedFileIndex, 0)
+        }
+    }
+
+    func testCopyingInHistoryPutsTheFullSHAOnThePasteboard() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let item = try commitItem(view, "rename and more")
+            view.list.selectRowIndexes(IndexSet(integer: view.list.row(forItem: item)), byExtendingSelection: false)
+            XCTAssertTrue(view.list.validateUserInterfaceItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "")))
+            view.list.copy(nil)
+            let commit = try XCTUnwrap(item.commit)
+            XCTAssertEqual(AppRuntime.pasteboard.string(forType: .string), commit.sha)
+            XCTAssertEqual(c.statusBar.flashText, "Copied \(commit.shortSHA)")
+            let cell = try XCTUnwrap(view.list.view(atColumn: 0, row: view.list.row(forItem: item), makeIfNecessary: true))
+            let lines = (cell.toolTip ?? "").split(separator: "\n").map(String.init)
+            XCTAssertEqual(lines.first, "rename and more")
+            XCTAssertTrue(lines.last?.hasSuffix(" · \(commit.shortSHA)") == true && lines.last?.hasPrefix("t · ") == true, cell.toolTip ?? "")
+        }
+    }
+
+    func testHeaderCountsHideZerosShowBinaryAndExposeState() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            let cell = try sectionCell(ov, "new.txt")
+            XCTAssertEqual(cell.accessibilityValue() as? String, "collapsed")
+            ov.toggle(try fileIndex(ov, "new.txt"))
+            XCTAssertEqual(try sectionCell(ov, "new.txt").accessibilityValue() as? String, "expanded")
+            XCTAssertNil(ov.model.detail.files[try fileIndex(ov, "bin.dat")].added)
+        }
+    }
+
+    func testLineCountsFromThePatchMatchNumstatAndBinaryStaysEmpty() throws {
+        try historyWithRenameBinaryAndDelete()
+        let repo = try repo()
+        let all = log(repo)
+        let reference = try XCTUnwrap(detail(repo, all[0]))
+        var opened: GitRepository.OpenedCommit?
+        let done = expectation(description: "open")
+        repo.openCommit(sha: all[0].sha, parents: all[0].parents, cached: nil) { opened = $0; done.fulfill() }
+        wait(for: [done], timeout: 30)
+        let result = try XCTUnwrap(opened)
+        XCTAssertFalse(result.hasCounts)
+        XCTAssertEqual(result.detail.files.map(\.path), reference.files.map(\.path))
+        XCTAssertEqual(result.detail.message, reference.message)
+        let files = PatchFile.parse(MainWindowController.commitPatchHeader(result.detail) + (result.patch ?? ""))
+        for (i, f) in reference.files.enumerated() {
+            let counts = files[i].lineCounts
+            XCTAssertEqual(counts?.added, f.added, f.path)
+            XCTAssertEqual(counts?.removed, f.removed, f.path)
+        }
+        var message: String?
+        let got = expectation(description: "message")
+        repo.commitMessage(sha: all[0].sha) { message = $0; got.fulfill() }
+        wait(for: [got], timeout: 30)
+        XCTAssertEqual(message, "rename and more")
+    }
+
+    func testClosingACommitTabReleasesEverything() throws {
+        try historyWithRenameBinaryAndDelete()
+        weak var weakDoc: Document?
+        weak var weakEditor: EditorView?
+        weak var weakOverview: CommitOverviewView?
+        weak var weakModel: CommitOverviewModel?
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            autoreleasepool {
+                _ = try? openCommit(c, view, "rename and more", pinned: true)
+                weakDoc = c.activeDocument
+                weakEditor = c.activeEditor
+                weakOverview = c.activeEditor?.commitOverview
+                weakModel = c.activeDocument?.commitOverview
+                weakOverview?.setAllExpanded(true)
+                c.rootView.layoutSubtreeIfNeeded()
+                let g = c.activeGroup
+                if let i = g.tabs.firstIndex(where: { $0.document === weakDoc }) { c.closeTab(in: g, at: i) }
+            }
+            for _ in 0..<5 { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }
+            XCTAssertNil(weakDoc, "the Document leaked")
+            XCTAssertNil(weakEditor, "the EditorView leaked")
+            XCTAssertNil(weakOverview, "the overview leaked")
+            XCTAssertNil(weakModel, "the model leaked")
+        }
+    }
+
     func testCommitPatchHeaderMarksMerges() {
         let detail = GitRepository.CommitDetail(sha: String(repeating: "a", count: 40), parents: ["1234567890", "abcdefabcdef"], authorName: "Ann",
                                                 authorEmail: "ann@x", authorDate: Date(timeIntervalSince1970: 0), committerName: "Ann",
@@ -1349,6 +1509,16 @@ final class GitHistoryTests: XCTestCase {
 
 /// Opt-in: `TOVRI_RUN_BENCHMARKS=1 swift test -c release --filter GitHistoryBenchmark`.
 final class GitHistoryBenchmarkTests: XCTestCase {
+    /// Reads what a commit tab needs and parses it; returns the file count.
+    private func openCommitCost(_ repo: GitRepository, _ commit: LogCommit) -> (files: Int, ms: Double) {
+        var opened: GitRepository.OpenedCommit?
+        let done = expectation(description: "open commit")
+        repo.openCommit(sha: commit.sha, parents: commit.parents, cached: nil) { opened = $0; done.fulfill() }
+        wait(for: [done], timeout: 60)
+        let built = MainWindowController.commitText(detail: opened!.detail, patch: opened!.patch)
+        return (built.files.count, 0)
+    }
+
     func testHistoryReadsOnALargeRepository() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["TOVRI_RUN_BENCHMARKS"] == "1",
                           "Set TOVRI_RUN_BENCHMARKS=1 to run the History benchmarks")
@@ -1441,16 +1611,13 @@ final class GitHistoryBenchmarkTests: XCTestCase {
         try shell("mkdir many && for i in $(seq 1 1000); do echo $i > many/f$i.txt; done && git add -A && git -c user.email=t@example.com -c user.name=t -c core.hooksPath=/dev/null commit -q -m 'a thousand files'")
         let big = page(repo, limit: 1, topo: false)[0]
         let opened = CFAbsoluteTimeGetCurrent()
-        var detail: GitRepository.CommitDetail?
-        var patch: String?
+        var opened1000: GitRepository.OpenedCommit?
         let both = expectation(description: "open commit")
-        both.expectedFulfillmentCount = 2
-        repo.commitDetail(sha: big.sha, parents: big.parents) { detail = $0; both.fulfill() }
-        repo.commitPatch(sha: big.sha, parent: big.parents.first, paths: nil) { patch = $0; both.fulfill() }
+        repo.openCommit(sha: big.sha, parents: big.parents, cached: nil) { opened1000 = $0; both.fulfill() }
         wait(for: [both], timeout: 60)
-        let built = MainWindowController.commitText(detail: try XCTUnwrap(detail), patch: patch)
-        let model = CommitOverviewModel(repoRoot: repo.root, commit: big, detail: try XCTUnwrap(detail), patchLines: built.patchLines)
-        print(String(format: "[history-bench] open a 1,000-file commit tab (detail + patch + model): %.1f ms", (CFAbsoluteTimeGetCurrent() - opened) * 1000))
+        let built = MainWindowController.commitText(detail: try XCTUnwrap(opened1000).detail, patch: opened1000?.patch)
+        let model = CommitOverviewModel(repoRoot: repo.root, commit: big, detail: try XCTUnwrap(opened1000).detail, patchLines: built.patchLines)
+        print(String(format: "[history-bench] open a 1,000-file commit tab (read + parse): %.1f ms", (CFAbsoluteTimeGetCurrent() - opened) * 1000))
         XCTAssertEqual(model.detail.files.count, 1_000)
         XCTAssertEqual(model.patchLines.count, 1_000)
 
@@ -1469,7 +1636,8 @@ final class GitHistoryBenchmarkTests: XCTestCase {
                                             diffs: wideBuilt.files)
         print(String(format: "[history-bench] build the model of a 1,000-file, 50,000-line commit (text + parse): %.1f ms", (CFAbsoluteTimeGetCurrent() - built0) * 1000))
         XCTAssertEqual(wideModel.diffs.count, 1_000)
-        XCTAssertEqual(wideModel.expanded.filter { $0 }.count, 3)
+        XCTAssertEqual(wideModel.expanded.filter { $0 }.count, 0, "files start collapsed")
+        for i in 0..<3 { wideModel.expanded[i] = true }
         _ = NSApplication.shared
         let doc = Document(text: wideBuilt.text, name: "wide", language: LanguageRegistry.shared.plain)
         wideModel.textSource = { [weak doc] in doc?.string }
@@ -1479,6 +1647,33 @@ final class GitHistoryBenchmarkTests: XCTestCase {
         overview.layoutSubtreeIfNeeded()
         for row in 0..<8 { _ = overview.table.view(atColumn: 0, row: row, makeIfNecessary: true) }
         print(String(format: "[history-bench] first overview layout with 3 files expanded: %.1f ms", (CFAbsoluteTimeGetCurrent() - laid0) * 1000))
+
+        try shell("for i in 1 2 3 4 5; do echo more >> many/f$i.txt; done && git add -A && git -c user.email=t@example.com -c user.name=t -c core.hooksPath=/dev/null commit -q -m 'five files'")
+        let small = page(repo, limit: 1, topo: false)[0]
+        for round in 1...3 {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let open = openCommitCost(repo, small)
+            XCTAssertEqual(open.files, 5)
+            if round == 3 { print(String(format: "[history-bench] open a 5-file commit tab (read + parse): %.1f ms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)) }
+        }
+
+        // The cost of noticing that HEAD moved, with 50,000 tags in packed-refs.
+        let sha = try XCTUnwrap(repo.headCommitSHA)
+        var packed = "# pack-refs with: peeled fully-peeled sorted \n"
+        for i in 0..<50_000 { packed += "\(sha) refs/tags/t\(String(format: "%05d", i))\n" }
+        try packed.write(to: dir.appendingPathComponent(".git/packed-refs"), atomically: true, encoding: .utf8)
+        func headCost(_ label: String) {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<20 { _ = repo.headToken }
+            print(String(format: "[history-bench] headToken, \(label): %.3f ms per call", (CFAbsoluteTimeGetCurrent() - t0) * 1000 / 20))
+            let t1 = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<20 { _ = repo.headStamps }
+            print(String(format: "[history-bench] headStamps, \(label): %.3f ms per call", (CFAbsoluteTimeGetCurrent() - t1) * 1000 / 20))
+        }
+        headCost("branch in a loose ref")
+        try shell("rm -f .git/refs/heads/main && git update-ref -d refs/heads/nothing; true")
+        try shell("printf '\\n%s refs/heads/main\\n' '\(sha)' >> .git/packed-refs")
+        headCost("branch only in packed-refs")
 
         let target = five[2_500]
         time("commitDetail") {

@@ -4,7 +4,7 @@ import AppKit
 /// parents, then each changed file as a section that opens to show its own changes. One virtualized
 /// table, so a commit with a thousand files scrolls as smoothly as one with five.
 final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelegate {
-    enum Row { case card, filesHeader, file(Int), more }
+    enum Row { case card, filesHeader, file(Int), more, empty(String) }
 
     let model: CommitOverviewModel
     /// A file or the commit was acted on (open changes, open the file, compare).
@@ -19,6 +19,8 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
     private var columnWidth: CGFloat = 0
     private var cardHeights: (width: CGFloat, height: CGFloat)?
     private(set) var metrics = DiffMetrics.current()
+    /// How many file diffs were built; collapsed files cost nothing.
+    private(set) var renderCount = 0
     private var renderCache = DiffRenderCache()
     private var bodyHeights: [Int: CGFloat] = [:]
 
@@ -38,7 +40,11 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
     init(model: CommitOverviewModel) {
         self.model = model
         super.init(frame: .zero)
-        rows = [.card, .filesHeader] + model.detail.files.indices.map { Row.file($0) } + (model.detail.hiddenFileCount > 0 ? [.more] : [])
+        if model.detail.files.isEmpty && model.detail.hiddenFileCount == 0 {
+            rows = [.card, .empty(model.commit.parents.count > 1 ? "No changes compared with the first parent." : "This commit doesn’t change any files.")]
+        } else {
+            rows = [.card, .filesHeader] + model.detail.files.indices.map { Row.file($0) } + (model.detail.hiddenFileCount > 0 ? [.more] : [])
+        }
         let col = NSTableColumn(identifier: .init("overview"))
         col.resizingMask = .autoresizingMask
         table.addTableColumn(col)
@@ -78,7 +84,16 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
 
     // MARK: Public
 
-    func focus() { window?.makeFirstResponder(table) }
+    func focus() {
+        window?.makeFirstResponder(table)
+        if table.selectedRow < 0, let first = model.detail.files.indices.first { selectFile(first) }
+    }
+
+    /// Side by side needs room for two columns; narrower than that, one column shows.
+    static let minSplitWidth: CGFloat = 760
+
+    var effectiveSplit: Bool { model.isSplit && CommitOverviewView.column(in: columnWidth).width - 2 >= CommitOverviewView.minSplitWidth }
+    private var isNarrowForSplit: Bool { model.isSplit && !effectiveSplit }
 
     var selectedFileIndex: Int? {
         let r = table.selectedRow
@@ -121,9 +136,12 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
         let width = scroll.contentSize.width
         table.tableColumns.first?.width = width
         if abs(width - columnWidth) > 0.5 {
+            let before = effectiveSplit
             columnWidth = width
             cardHeights = nil
+            if before != effectiveSplit { bodyHeights = [:] }
             reload()
+            if before != effectiveSplit { table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<rows.count)) }
         }
     }
 
@@ -169,7 +187,7 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
         updateSelection()
     }
 
-    private func total(_ index: Int) -> Int { model.diff(index)?.rowCount(split: model.isSplit) ?? 0 }
+    private func total(_ index: Int) -> Int { model.diff(index)?.rowCount(split: effectiveSplit) ?? 0 }
 
     private func hasDiffRows(_ index: Int) -> Bool { !(model.diff(index)?.hunks.isEmpty ?? true) }
 
@@ -191,12 +209,14 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
     private func render(_ index: Int) -> (render: DiffRender, hidden: Int)? {
         guard let diff = model.diff(index), !diff.hunks.isEmpty, let text = model.textSource?() else { return nil }
         let limit = model.rowLimits[index]
-        let key = DiffRenderCache.Key(file: index, split: model.isSplit, limit: limit)
-        let total = diff.rowCount(split: model.isSplit)
+        let split = effectiveSplit
+        let key = DiffRenderCache.Key(file: index, split: split, limit: limit)
+        let total = diff.rowCount(split: split)
         if let r = renderCache.render(for: key) { return (r, max(0, total - limit)) }
         let name = ((model.detail.files[index].path) as NSString).lastPathComponent
         let first = diff.hunks.first.flatMap { $0.lines.first }.map { text.substring(with: $0.range) }
-        let r = DiffRenderer.render(file: diff, text: text, split: model.isSplit, limit: limit,
+        renderCount += 1
+        let r = DiffRenderer.render(file: diff, text: text, split: split, limit: limit,
                                     language: LanguageRegistry.shared.language(forFileName: name, firstLine: first),
                                     theme: ThemeManager.shared.active, metrics: metrics)
         renderCache.insert(r, for: key)
@@ -292,6 +312,7 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
         case .file(let i):
             return CommitOverviewView.sectionHeaderHeight + (isExpanded(i) ? bodyHeight(i) : 0) + CommitOverviewView.sectionGap
         case .more: return 36
+        case .empty: return 60
         }
     }
 
@@ -326,7 +347,7 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
                 guard let self else { return }
                 self.setAllExpanded(!self.allExpanded)
             }
-            cell.configure(model.detail, column: col, isSplit: model.isSplit, allExpanded: allExpanded)
+            cell.configure(model.detail, column: col, isSplit: model.isSplit, narrow: isNarrowForSplit, allExpanded: allExpanded)
             return cell
         case .file(let i):
             let id = NSUserInterfaceItemIdentifier("overviewFile")
@@ -349,6 +370,12 @@ final class CommitOverviewView: NSView, NSTableViewDataSource, NSTableViewDelega
                            render: shown?.render, note: diff?.note ?? (hasDiffRows(i) ? nil : "No changes to show."), hiddenRows: hiddenRows,
                            limitReached: model.rowLimits[i] >= CommitOverviewModel.maxRowLimit)
             cell.isSelectedSection = row == table.selectedRow
+            return cell
+        case .empty(let message):
+            let id = NSUserInterfaceItemIdentifier("overviewMore")
+            let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? HistoryInfoCell) ?? HistoryInfoCell()
+            cell.identifier = id
+            cell.configure(message, left: col.x + 12)
             return cell
         case .more:
             let id = NSUserInterfaceItemIdentifier("overviewMore")
@@ -403,7 +430,7 @@ final class FileSectionCell: NSTableCellView {
 
     private let openChanges = ToolButton(symbol: "plus.forwardslash.minus", tooltip: "Open Changes\nThe file with its changes marked in the editor.")
     private let openFile = ToolButton(symbol: "doc.text", tooltip: "Open File\nThe file as it was at this commit.")
-    private let more = ToolButton(symbol: "ellipsis", tooltip: "More")
+    private let more = ToolButton(symbol: "ellipsis", tooltip: "More\nShow in Patch, Open as Patch, Compare with Current File and Copy Path.")
     let body = DiffBodyView()
     private var file: GitRepository.CommitFile?
     private var column: (x: CGFloat, width: CGFloat) = (0, 0)
@@ -446,6 +473,7 @@ final class FileSectionCell: NSTableCellView {
         let counts = file.added.map { "\($0) added, \(file.removed ?? 0) removed" } ?? "binary"
         setAccessibilityLabel("\(file.path), \(file.status.label), \(counts)")
         setAccessibilityValue(expanded ? "expanded" : "collapsed")
+        setAccessibilityHelp(expanded ? "Press to hide this file's changes" : "Press to show this file's changes")
         toolTip = file.originalPath.map { "\($0) → \(file.path)" } ?? file.path
         needsLayout = true
         needsDisplay = true
@@ -522,7 +550,9 @@ final class FileSectionCell: NSTableCellView {
         var nameAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: color]
         if file.status == .deleted { nameAttrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         let counts = NSMutableAttributedString()
-        if let added = file.added {
+        if file.added == nil {
+            counts.append(NSAttributedString(string: "Binary", attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: theme.chromeSecondary]))
+        } else if let added = file.added, added > 0 || (file.removed ?? 0) > 0 {
             let digits = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
             counts.append(NSAttributedString(string: "+\(added)", attributes: [.font: digits, .foregroundColor: theme.color(.inserted) ?? .systemGreen]))
             counts.append(NSAttributedString(string: " −\(file.removed ?? 0)", attributes: [.font: digits, .foregroundColor: theme.color(.deleted) ?? .systemRed]))
@@ -574,12 +604,15 @@ final class CommitFilesHeaderCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(_ detail: GitRepository.CommitDetail, column: (x: CGFloat, width: CGFloat), isSplit: Bool, allExpanded: Bool) {
+    func configure(_ detail: GitRepository.CommitDetail, column: (x: CGFloat, width: CGFloat), isSplit: Bool, narrow: Bool, allExpanded: Bool) {
         self.detail = detail
         self.column = column
         unified.isOn = !isSplit
         split.isOn = isSplit
+        split.toolTip = narrow ? "Split\nSide by side needs a wider window; showing one column until there’s room."
+                               : "Split\nShow the old and new file side by side."
         all.title = allExpanded ? "Collapse All" : "Expand All"
+        all.toolTip = allExpanded ? "Collapse All\nHide every file's changes." : "Expand All\nShow every file's changes."
         needsLayout = true
         needsDisplay = true
     }

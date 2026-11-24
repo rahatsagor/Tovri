@@ -132,6 +132,16 @@ final class SidebarOutlineView: NSOutlineView {
             (rowView(atRow: i, makeIfNecessary: false) as? HoverRowView)?.hovered = i == r
         }
     }
+    var onCopy: (() -> Void)?
+
+    /// Copy, when a list sets `onCopy`.
+    @objc func copy(_ sender: Any?) { onCopy?() }
+
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(copy(_:)) { return onCopy != nil && selectedRow >= 0 }
+        return super.validateUserInterfaceItem(item)
+    }
+
     var onDelete: (() -> Void)?
     var onSlash: (() -> Void)?
     var menuProvider: ((Int) -> NSMenu?)?

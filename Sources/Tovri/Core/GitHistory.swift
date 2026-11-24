@@ -255,32 +255,112 @@ extension GitRepository {
         }
     }
 
-    private func loadCommitDetail(sha: String, parents: [String]) -> CommitDetail? {
+    /// Everything about a commit except its files.
+    private struct CommitHeader {
+        var authorName: String, authorEmail: String, authorDate: Date
+        var committerName: String, commitDate: Date, message: String
+    }
+
+    private func readHeader(sha: String) -> CommitHeader? {
         guard let header = run(["log", "-1", "--no-show-signature", "--no-color",
                                 "--format=%an%x1f%ae%x1f%at%x1f%cn%x1f%ct%x1f%B", sha, "--"]) else { return nil }
         let f = header.split(separator: 0x1f, maxSplits: 5, omittingEmptySubsequences: false)
         guard f.count == 6, let authored = TimeInterval(String(decoding: f[2], as: UTF8.self)),
               let committed = TimeInterval(String(decoding: f[4], as: UTF8.self)) else { return nil }
-        let tree = GitRepository.diffTreeArguments(sha: sha, parent: parents.first)
-        guard let names = run(["diff-tree", "-r", "-z", "--no-commit-id", "--name-status", "-M",
-                               "--no-ext-diff", "--no-textconv"] + tree),
-              let counts = run(["diff-tree", "-r", "-z", "--no-commit-id", "--numstat", "-M",
-                                "--no-ext-diff", "--no-textconv"] + tree) else { return nil }
+        return CommitHeader(authorName: String(decoding: f[0], as: UTF8.self), authorEmail: String(decoding: f[1], as: UTF8.self),
+                            authorDate: Date(timeIntervalSince1970: authored), committerName: String(decoding: f[3], as: UTF8.self),
+                            commitDate: Date(timeIntervalSince1970: committed),
+                            message: String(decoding: f[5], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func readFiles(sha: String, parents: [String]) -> (files: [CommitFile], hidden: Int)? {
+        guard let names = run(["diff-tree", "-r", "-z", "--no-commit-id", "--name-status", "-M", "--no-ext-diff", "--no-textconv"]
+                              + GitRepository.diffTreeArguments(sha: sha, parent: parents.first)) else { return nil }
         var files = GitRepository.parseNameStatus(names)
         let hidden = max(0, files.count - GitRepository.maxCommitFiles)
         if hidden > 0 { files.removeLast(hidden) }
-        let numbers = GitRepository.parseNumstat(counts)
-        for i in files.indices {
-            if let n = numbers[files[i].path] { (files[i].added, files[i].removed) = (n.added, n.removed) }
+        return (files, hidden)
+    }
+
+    private func readCounts(sha: String, parents: [String]) -> [String: (added: Int, removed: Int)]? {
+        run(["diff-tree", "-r", "-z", "--no-commit-id", "--numstat", "-M", "--no-ext-diff", "--no-textconv"]
+            + GitRepository.diffTreeArguments(sha: sha, parent: parents.first)).map(GitRepository.parseNumstat)
+    }
+
+    /// The commit's message alone, for copying it.
+    func commitMessage(sha: String, _ completion: @escaping (String?) -> Void) {
+        GitRepository.runAsync {
+            let text = self.run(["log", "-1", "--no-show-signature", "--no-color", "--format=%B", sha, "--"])
+                .map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
+            DispatchQueue.main.async { completion(text) }
         }
-        let message = String(decoding: f[5], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        return CommitDetail(sha: sha, parents: parents,
-                            authorName: String(decoding: f[0], as: UTF8.self),
-                            authorEmail: String(decoding: f[1], as: UTF8.self),
-                            authorDate: Date(timeIntervalSince1970: authored),
-                            committerName: String(decoding: f[3], as: UTF8.self),
-                            commitDate: Date(timeIntervalSince1970: committed),
-                            message: message, files: files, hiddenFileCount: hidden)
+    }
+
+    /// What a commit tab needs: the details and the patch, read at the same time. Line counts come from the
+    /// patch itself once it is parsed, so `numstat` only runs when the patch is too large to read.
+    struct OpenedCommit {
+        var detail: CommitDetail
+        var patch: String?
+        /// False when the counts still have to be taken from the parsed patch.
+        var hasCounts: Bool
+    }
+
+    func openCommit(sha: String, parents: [String], cached: CommitDetail?, _ completion: @escaping (OpenedCommit?) -> Void) {
+        final class Box: @unchecked Sendable {
+            let lock = NSLock()
+            var header: CommitHeader?
+            var files: (files: [CommitFile], hidden: Int)?
+            var patch: String?
+            var counts: [String: (added: Int, removed: Int)]?
+        }
+        let box = Box()
+        let group = DispatchGroup()
+        func job(_ work: @escaping () -> Void) {
+            group.enter()
+            GitRepository.runAsync {
+                work()
+                group.leave()
+            }
+        }
+        if cached == nil {
+            job { let h = self.readHeader(sha: sha); box.lock.lock(); box.header = h; box.lock.unlock() }
+            job { let f = self.readFiles(sha: sha, parents: parents); box.lock.lock(); box.files = f; box.lock.unlock() }
+        }
+        job {
+            let args = ["diff-tree", "-p", "-r", "-M", "--no-commit-id", "--no-ext-diff", "--no-textconv", "--no-color"]
+                + GitRepository.diffTreeArguments(sha: sha, parent: parents.first)
+            let patch = self.run(args, maxOutputBytes: GitRepository.maxBlobSize).map { String(decoding: $0, as: UTF8.self) }
+            let counts = patch == nil && cached == nil ? self.readCounts(sha: sha, parents: parents) : nil
+            box.lock.lock()
+            box.patch = patch
+            box.counts = counts
+            box.lock.unlock()
+        }
+        group.notify(queue: .main) {
+            if let cached {
+                completion(OpenedCommit(detail: cached, patch: box.patch, hasCounts: true))
+                return
+            }
+            guard let h = box.header, var f = box.files else { completion(nil); return }
+            if let counts = box.counts {
+                for i in f.files.indices { if let n = counts[f.files[i].path] { (f.files[i].added, f.files[i].removed) = (n.added, n.removed) } }
+            }
+            let detail = CommitDetail(sha: sha, parents: parents, authorName: h.authorName, authorEmail: h.authorEmail,
+                                      authorDate: h.authorDate, committerName: h.committerName, commitDate: h.commitDate,
+                                      message: h.message, files: f.files, hiddenFileCount: f.hidden)
+            completion(OpenedCommit(detail: detail, patch: box.patch, hasCounts: box.counts != nil))
+        }
+    }
+
+    private func loadCommitDetail(sha: String, parents: [String]) -> CommitDetail? {
+        guard let h = readHeader(sha: sha) else { return nil }
+        guard var found = readFiles(sha: sha, parents: parents), let numbers = readCounts(sha: sha, parents: parents) else { return nil }
+        for i in found.files.indices {
+            if let n = numbers[found.files[i].path] { (found.files[i].added, found.files[i].removed) = (n.added, n.removed) }
+        }
+        return CommitDetail(sha: sha, parents: parents, authorName: h.authorName, authorEmail: h.authorEmail,
+                            authorDate: h.authorDate, committerName: h.committerName, commitDate: h.commitDate,
+                            message: h.message, files: found.files, hiddenFileCount: found.hidden)
     }
 
     private static func diffTreeArguments(sha: String, parent: String?) -> [String] {

@@ -252,23 +252,21 @@ extension MainWindowController {
         let key = "\(commit.sha)::commit"
         if selectHistoryTab(withKey: key, pinned: pinned) { return }
         let token = beginHistoryOpen(pinned: pinned)
-        var detail = commitDetailCache.detail(for: commit.sha)
-        var patch: String?
-        let group = DispatchGroup()
-        if detail == nil {
-            group.enter()
-            repo.commitDetail(sha: commit.sha, parents: commit.parents) { detail = $0; group.leave() }
-        }
-        group.enter()
-        repo.commitPatch(sha: commit.sha, parent: commit.parents.first, paths: nil) { patch = $0; group.leave() }
-        group.notify(queue: .main) { [weak self] in
+        repo.openCommit(sha: commit.sha, parents: commit.parents, cached: commitDetailCache.detail(for: commit.sha)) { [weak self] opened in
             guard let self, self.isCurrentHistoryOpen(token, pinned: pinned) else { return }
-            guard let detail else { self.statusBar.flash("Couldn’t read commit \(commit.shortSHA)"); return }
-            self.commitDetailCache.insert(detail)
+            guard let opened else { self.statusBar.flash("Couldn’t read commit \(commit.shortSHA)"); return }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let built = MainWindowController.commitText(detail: detail, patch: patch)
+                let built = MainWindowController.commitText(detail: opened.detail, patch: opened.patch)
+                var detail = opened.detail
+                if !opened.hasCounts {
+                    for i in detail.files.indices where i < built.files.count {
+                        let c = built.files[i].lineCounts
+                        (detail.files[i].added, detail.files[i].removed) = (c?.added, c?.removed)
+                    }
+                }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.isCurrentHistoryOpen(token, pinned: pinned) else { return }
+                    self.commitDetailCache.insert(detail)
                     let subject = commit.subject.count > 40 ? String(commit.subject.prefix(39)) + "…" : commit.subject
                     let name = subject.isEmpty ? "\(commit.shortSHA) — Commit" : "\(commit.shortSHA) — \(subject)"
                     let doc = self.makeHistoryDocument(built.text, name: name, key: key, language: self.diffLanguage)

@@ -39,6 +39,19 @@ struct PatchFile: Equatable {
     var hunks: [PatchHunk] = []
     /// Shown instead of a diff: "Binary file. Not shown.", a rename without changes, a mode change.
     var note: String?
+    var isBinary = false
+
+    /// Lines added and removed, as `numstat` counts them; nil for a binary file.
+    var lineCounts: (added: Int, removed: Int)? {
+        if isBinary { return nil }
+        var added = 0, removed = 0
+        for h in hunks { for l in h.lines { if l.kind == .added { added += 1 } else if l.kind == .removed { removed += 1 } } }
+        return (added, removed)
+    }
+
+    static func == (a: PatchFile, b: PatchFile) -> Bool {
+        a.headerLine == b.headerLine && a.headerEndLine == b.headerEndLine && a.hunks == b.hunks && a.note == b.note && a.isBinary == b.isBinary
+    }
 
     var unifiedRowCount: Int { hunks.reduce(0) { $0 + 1 + $1.lines.count } }
 
@@ -142,6 +155,7 @@ struct PatchFile: Equatable {
         func finishFile() {
             guard var f = file else { return }
             if let h = hunk { f.hunks.append(h) }
+            f.isBinary = isBinary
             if f.hunks.isEmpty {
                 if isBinary { f.note = "Binary file. Not shown." }
                 else if let from = renameFrom { f.note = "Renamed from \(from) without changes" }
@@ -215,10 +229,8 @@ struct PatchFile: Equatable {
         return files
     }
 
-    /// Expand every file of a small commit, or only the first few of a large one.
+    /// Files start collapsed, so opening a commit draws nothing but headers. A commit with one file opens it.
     static func defaultExpansion(_ files: [PatchFile], count: Int) -> [Bool] {
-        let rows = files.reduce(0) { $0 + $1.unifiedRowCount }
-        let all = count <= 30 && rows <= 2_000
-        return (0..<count).map { all || $0 < 3 }
+        Array(repeating: count == 1, count: count)
     }
 }
