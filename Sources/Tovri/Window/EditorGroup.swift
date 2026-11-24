@@ -44,6 +44,16 @@ final class EditorGroup: NSObject, TabBarDelegate {
         e.toggleMarkdownPreviewSplit()
         self.refreshAccessories()
     }
+    private lazy var overviewButton: ToolButton = ToolButton(symbol: "list.bullet.rectangle", tooltip: "Overview\nThe commit’s message and changed files.") { [weak self] in
+        guard let self, let e = self.activeEditor else { return }
+        e.setShowsCommitOverview(true)
+        self.refreshAccessories()
+    }
+    private lazy var patchButton: ToolButton = ToolButton(symbol: "plus.forwardslash.minus", tooltip: "Patch\nEvery change in this commit. Find and copy work here.") { [weak self] in
+        guard let self, let e = self.activeEditor else { return }
+        e.setShowsCommitOverview(false)
+        self.refreshAccessories()
+    }
     private static let compareTip = "Compare with Last Commit (⇧⌥⌘D)\nShow removed lines and tint changed ones in the editor. Press ⎋ to stop."
     private lazy var compareButton: ToolButton = ToolButton(symbol: "plus.forwardslash.minus", tooltip: EditorGroup.compareTip) { [weak self] in
         guard let self else { return }
@@ -66,6 +76,10 @@ final class EditorGroup: NSObject, TabBarDelegate {
         container.addSubview(previewButton)
         container.addSubview(splitPreviewButton)
         container.addSubview(compareButton)
+        container.addSubview(overviewButton)
+        container.addSubview(patchButton)
+        overviewButton.isHidden = true
+        patchButton.isHidden = true
         previewButton.isHidden = true
         splitPreviewButton.isHidden = true
         compareButton.isHidden = true
@@ -93,7 +107,9 @@ final class EditorGroup: NSObject, TabBarDelegate {
         tabBar.frame = NSRect(x: 0, y: 0, width: b.width, height: TabBarView.height)
         previewButton.frame = NSRect(x: b.width - 34, y: 8, width: 26, height: 24)
         splitPreviewButton.frame = NSRect(x: b.width - 62, y: 8, width: 26, height: 24)
-        let markdown = !previewButton.isHidden
+        patchButton.frame = previewButton.frame
+        overviewButton.frame = splitPreviewButton.frame
+        let markdown = !previewButton.isHidden || !patchButton.isHidden
         compareButton.frame = NSRect(x: b.width - (markdown ? 90 : 34), y: 8, width: 26, height: 24)
         let content = NSRect(x: 0, y: TabBarView.height, width: b.width, height: max(0, b.height - TabBarView.height))
         emptyView.frame = content
@@ -206,6 +222,10 @@ final class EditorGroup: NSObject, TabBarDelegate {
             if counts[d.displayName, default: 0] > 1, let url = d.url { detail = url.deletingLastPathComponent().lastPathComponent }
             let icon: NSImage? = d.isFindResults ? FileIcons.image("magnifyingglass", color: theme.chromeSecondary, size: 10.5)
                 : FileIcons.image(forFileName: d.url?.lastPathComponent ?? (d.language === LanguageRegistry.shared.plain ? "file.txt" : "file." + (d.language.extensions.first ?? "txt")), theme: theme, size: 10.5)
+            if let model = d.commitOverview {
+                return TabItem(title: d.displayName, icon: FileIcons.image("circle.circle", color: theme.accent, size: 10.5), detail: nil,
+                               dirty: false, missing: false, tooltip: "\(model.commit.sha)\n\(model.commit.subject)")
+            }
             return TabItem(title: d.displayName, icon: icon, detail: detail, dirty: d.isDirty, missing: d.checkDiskStatusCached,
                            tooltip: d.url?.path ?? d.displayName)
         }
@@ -216,6 +236,11 @@ final class EditorGroup: NSObject, TabBarDelegate {
 
     func refreshAccessories() {
         let markdown = activeEditor?.isMarkdown == true
+        let commit = activeEditor?.hasCommitOverview == true
+        overviewButton.isHidden = !commit
+        patchButton.isHidden = !commit
+        overviewButton.isOn = activeEditor?.showsCommitOverview == true
+        patchButton.isOn = commit && activeEditor?.showsCommitOverview == false
         previewButton.isHidden = !markdown
         splitPreviewButton.isHidden = !markdown
         previewButton.isOn = activeEditor?.previewMode == .full
@@ -226,7 +251,7 @@ final class EditorGroup: NSObject, TabBarDelegate {
         compareButton.isHidden = !compare
         compareButton.isOn = e?.isComparing == true
         compareButton.toolTip = e?.comparisonLabel.map { "Comparing with \($0)\nClick or press ⎋ to stop." } ?? EditorGroup.compareTip
-        tabBar.trailingInset = (markdown ? 68 : 8) + (compare ? 28 : 0)
+        tabBar.trailingInset = (markdown || commit ? 68 : 8) + (compare ? 28 : 0)
         layout()
     }
 

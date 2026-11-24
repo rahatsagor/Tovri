@@ -84,14 +84,16 @@ aligned cleanly. Click one to see the removed and added lines or revert them.
 and the status bar counts changed files: click it to list them with the lines
 each one adds and removes. Ideal for checking what a coding agent touched.
 The sidebar has a **Git** tab. Its Changes list lets you filter, sort, stage,
-unstage and discard; its History shows the commit graph, searches commits, and
-expands one to open a file with its changes marked, as a patch or as it was.
-**File History** (⇧⌥⌘H) compares a file with any earlier commit. Click the
-branch in the status bar, or choose **Go → Switch Branch…**, to switch to
-another branch or create one. Every Git feature can be turned off in
-**Settings → Git**. You can also compare a file with its saved version, Local
-History, the clipboard or another file, and use **File → Restore This
-Version** to bring a compared version back as one undoable edit.
+unstage and discard. Its History shows the commit graph and searches commits;
+click a commit, or move through them with the arrow keys, to open it in a tab
+with an overview of its message and changed files. Switch the tab to Patch to
+read every change, click a file to jump to it, or open a file with its changes
+marked inline or as it was. **File History** (⇧⌥⌘H) compares a file with any
+earlier commit. Click the branch in the status bar, or choose **Go →
+Switch Branch…**, to switch to another branch or create one. Every Git feature
+can be turned off in **Settings → Git**. You can also compare a file with its
+saved version, Local History, the clipboard or another file, and use **File →
+Restore This Version** to bring a compared version back as one undoable edit.
 
 </td>
 </tr>

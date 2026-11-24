@@ -62,6 +62,8 @@ final class Document: NSObject, NSTextStorageDelegate {
     var revisionKey: String?
     /// A History tab a single click reuses, until it is opened pinned.
     var isHistoryPreview = false
+    /// For a commit tab, what its overview shows; the document's text is the commit's patch.
+    var commitOverview: CommitOverviewModel?
     var isFindResults: Bool { language === LanguageRegistry.shared.findResults }
     /// The file's identity, modification time and size when Tovri last read or wrote it.
     private var diskStamp: DiskStamp?

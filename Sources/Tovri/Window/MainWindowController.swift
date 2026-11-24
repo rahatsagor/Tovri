@@ -827,6 +827,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, EditorVi
     private var sidebarGitNeedsFullRefresh = false
     private var ignoredGeneration = 0
     var historyOpenGeneration = 0
+    var commitDetailCache = CommitDetailCache()
     var isSwitchingBranch = false
     private(set) var changedFileCount = 0
 

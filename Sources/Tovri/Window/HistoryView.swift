@@ -7,7 +7,7 @@ enum CommitFileView { case changes, patch, file }
 enum HistoryAction {
     case openFile(GitRepository.CommitFile, CommitFileView, pinned: Bool)
     case compareWithCurrent(GitRepository.CommitFile)
-    case openCommitPatch(pinned: Bool)
+    case openCommit(pinned: Bool)
 }
 
 /// What the History cells share: the graph's colors and how wide its column is.
@@ -21,30 +21,95 @@ final class HistoryStyle {
     var showsGraph = false
 
     var graphWidth: CGFloat { showsGraph ? CGFloat(min(laneCount, HistoryStyle.maxLanes)) * HistoryStyle.laneWidth + HistoryStyle.padding + 4 : 0 }
-    /// Where text starts in commit rows and, under them, in the rows of an expanded commit.
+    /// Where text starts in commit rows.
     var textLeft: CGFloat { showsGraph ? graphWidth : 12 }
-    var childLeft: CGFloat { showsGraph ? graphWidth + 4 : 14 }
 
     func x(_ lane: Int) -> CGFloat {
         HistoryStyle.padding + (CGFloat(min(lane, HistoryStyle.maxLanes - 1)) + 0.5) * HistoryStyle.laneWidth
     }
 
     func color(_ lane: Int) -> NSColor { palette[lane % palette.count] }
+
+    /// Accent first, then the theme's git and token colors.
+    static func palette(for theme: Theme) -> [NSColor] {
+        [theme.accent, theme.color(.changed), theme.color(.inserted), theme.color(.function),
+         theme.color(.keyword), theme.color(.type), theme.color(.string), theme.color(.number)].compactMap { $0 }
+    }
 }
 
-/// One row of the History list: a commit, or a row under an expanded commit.
+/// Ref badges ("main", a tag, "origin/main"), drawn by the History list and the commit card.
+enum RefBadges {
+    static let font = NSFont.systemFont(ofSize: 10, weight: .medium)
+    static let maxBadges = 3
+
+    /// Draws one badge with its top at `y` (in a flipped view) and returns its width.
+    @discardableResult
+    static func draw(_ ref: RefLabel, at x: CGFloat, y: CGFloat, right: CGFloat, theme: Theme) -> CGFloat {
+        let emphasized = ref.isCheckedOut
+        let tint: NSColor
+        let fill: NSColor
+        switch ref.kind {
+        case .branch, .detachedHead:
+            tint = emphasized ? theme.accent.mix(theme.foreground, 0.25) : theme.chromeForeground.withAlphaComponent(0.85)
+            fill = emphasized ? theme.accent.withAlphaComponent(0.24) : theme.chromeForeground.withAlphaComponent(0.1)
+        case .remoteBranch:
+            tint = theme.chromeSecondary
+            fill = theme.chromeForeground.withAlphaComponent(0.06)
+        case .tag:
+            let c = theme.color(.changed) ?? .systemOrange
+            tint = c
+            fill = c.withAlphaComponent(0.14)
+        }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: tint]
+        let name = ref.name as NSString
+        let glyph = ref.kind == .tag ? FileIcons.image("tag.fill", color: tint, size: 8.5) : nil
+        let glyphWidth = glyph.map { $0.size.width + 3 } ?? 0
+        let textWidth = min(ceil(name.size(withAttributes: attrs).width), 90, max(20, right - x - 14 - glyphWidth))
+        let width = textWidth + 10 + glyphWidth
+        let r = NSRect(x: x, y: y, width: width, height: 15)
+        fill.setFill()
+        NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
+        var tx = r.minX + 5
+        if let glyph {
+            glyph.draw(in: NSRect(x: tx, y: r.midY - glyph.size.height / 2, width: glyph.size.width, height: glyph.size.height),
+                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            tx += glyphWidth
+        }
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byTruncatingTail
+        var truncating = attrs
+        truncating[.paragraphStyle] = para
+        name.draw(with: NSRect(x: tx, y: r.minY + 1, width: textWidth, height: 13),
+                  options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: truncating)
+        return width
+    }
+
+    /// Draws up to `maxBadges` badges and a "+N" for the rest; returns where the next thing may start.
+    static func drawRow(_ refs: [RefLabel], at x0: CGFloat, y: CGFloat, right: CGFloat, theme: Theme) -> CGFloat {
+        var x = x0
+        let shown = refs.prefix(maxBadges)
+        for ref in shown where x < right - 40 {
+            x += draw(ref, at: x, y: y, right: right, theme: theme) + 4
+        }
+        if refs.count > shown.count {
+            let more = "+\(refs.count - shown.count)" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: theme.chromeSecondary]
+            more.draw(at: NSPoint(x: x, y: y + 1), withAttributes: attrs)
+            x += ceil(more.size(withAttributes: attrs).width) + 4
+        }
+        if !shown.isEmpty { x += 2 }
+        return x
+    }
+}
+
+/// One row of the History list: a commit, or a message such as "Loading more…".
 final class HistoryItem: NSObject {
-    enum Kind { case commit, info, summary, file, moreFiles }
+    enum Kind { case commit, info }
     let kind: Kind
     var commit: LogCommit?
     var graph: CommitGraph.Row?
     var text = ""
     var rowHeight: CGFloat = 24
-    var detail: GitRepository.CommitDetail?
-    var file: GitRepository.CommitFile?
-    var children: [HistoryItem] = []
-    weak var parent: HistoryItem?
-    var cachedHeight: (width: CGFloat, height: CGFloat)?
     lazy var relativeDate: String = commit.map { HistoryView.relativeDate($0.date) } ?? ""
 
     init(kind: Kind) { self.kind = kind }
@@ -57,18 +122,17 @@ final class HistoryItem: NSObject {
     }
 }
 
-/// The sidebar's History tab: the repository's commits with a branch graph, search, and each
-/// commit's files. Pages of commits are read as the list scrolls, and a commit's details only when
-/// it is expanded.
+/// The sidebar's History tab: the repository's commits with a branch graph and search. Pages of
+/// commits are read as the list scrolls. Choosing a commit opens it in a tab.
 final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTextFieldDelegate {
     static let pageSize = 200
     static let maxCommits = 5_000
     static let prefetchRows = 30
-    static let detailCacheLimit = 32
+    static let keyboardOpenDelay: TimeInterval = 0.15
     static let searchDelay: TimeInterval = 0.25
     static let limitMessage = "Showing the latest 5,000 commits. Search to find older ones."
 
-    var onAction: ((LogCommit, GitRepository.CommitDetail?, HistoryAction) -> Void)?
+    var onAction: ((LogCommit, HistoryAction) -> Void)?
     private(set) var repository: GitRepository?
     let searchField = ThemedTextField(placeholder: "Search commits")
     private let scroll = OverlayScrollView(frame: .zero)
@@ -90,10 +154,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     private var loadedToken: String?
     private var needsReload = true
     private var searchDebounce: DispatchWorkItem?
-    private var lastWidth: CGFloat = 0
-
-    private var detailCache: [String: GitRepository.CommitDetail] = [:]
-    private var detailOrder: [String] = []
+    private var openDebounce: DispatchWorkItem?
 
     private static let toolbarHeight: CGFloat = 30
 
@@ -113,7 +174,6 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     static func absoluteDate(_ date: Date) -> String { absoluteFormatter.string(from: date) }
 
     var commits: [LogCommit] { commitItems.compactMap(\.commit) }
-    var cachedDetailCount: Int { detailCache.count }
     var isLoading: Bool { isLoadingPage }
     var emptyMessage: String? { empty.isHidden ? nil : empty.stringValue }
     var hasLoaded: Bool { !needsReload }
@@ -179,6 +239,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         NotificationCenter.default.removeObserver(self)
         inFlight?.cancel()
         searchDebounce?.cancel()
+        openDebounce?.cancel()
     }
 
     // MARK: Lifecycle
@@ -186,8 +247,6 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     func setRepository(_ new: GitRepository?) {
         guard new !== repository else { return }
         repository = new
-        detailCache = [:]
-        detailOrder = []
         loadedToken = nil
         needsReload = true
         dropRows()
@@ -197,9 +256,9 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     func teardown() {
         searchDebounce?.cancel()
         searchDebounce = nil
+        openDebounce?.cancel()
+        openDebounce = nil
         dropRows()
-        detailCache = [:]
-        detailOrder = []
         onAction = nil
     }
 
@@ -215,6 +274,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
     }
 
     private func dropRows() {
+        openDebounce?.cancel()
         inFlight?.cancel()
         inFlight = nil
         generation += 1
@@ -338,13 +398,8 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
 
     private func refreshVisibleCells() {
         list.enumerateAvailableRowViews { rowView, _ in
-            rowView.needsDisplay = true
             for case let cell as HistoryCommitCell in rowView.subviews { cell.needsDisplay = true }
-            for case let cell as HistorySummaryCell in rowView.subviews { cell.needsDisplay = true }
-            for case let cell as HistoryInfoCell in rowView.subviews { cell.needsDisplay = true }
-            for case let cell as ChangeCell in rowView.subviews { cell.leadingInset = self.style.childLeft - 12; cell.needsLayout = true }
         }
-        invalidateSummaryHeights()
     }
 
     // MARK: Search
@@ -399,9 +454,7 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
 
     func applyTheme() {
         let theme = ThemeManager.shared.active
-        let colors = [theme.accent, theme.color(.changed), theme.color(.inserted), theme.color(.function),
-                      theme.color(.keyword), theme.color(.type), theme.color(.string), theme.color(.number)]
-        style.palette = colors.compactMap { $0 }
+        style.palette = HistoryStyle.palette(for: theme)
         searchField.applyTheme()
         empty.textColor = theme.chromeSecondary
         list.reloadData()
@@ -414,106 +467,20 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         scroll.frame = NSRect(x: 0, y: bar + 2, width: bounds.width, height: max(0, bounds.height - bar - 2))
         list.tableColumns.first?.width = scroll.contentSize.width - 4
         empty.frame = NSRect(x: 10, y: bar + 24, width: bounds.width - 20, height: 18)
-        if abs(bounds.width - lastWidth) > 0.5 {
-            lastWidth = bounds.width
-            invalidateSummaryHeights()
-        }
-    }
-
-    /// Summary rows wrap their text to the row's width, so a change of width changes their height.
-    private func invalidateSummaryHeights() {
-        var changed = IndexSet()
-        for item in commitItems where list.isItemExpanded(item) {
-            for child in item.children where child.kind == .summary {
-                child.cachedHeight = nil
-                let row = list.row(forItem: child)
-                if row >= 0 { changed.insert(row) }
-            }
-        }
-        if !changed.isEmpty { list.noteHeightOfRows(withIndexesChanged: changed) }
-    }
-
-    // MARK: Details
-
-    private func cachedDetail(_ sha: String) -> GitRepository.CommitDetail? {
-        guard let d = detailCache[sha] else { return nil }
-        if let i = detailOrder.firstIndex(of: sha) { detailOrder.remove(at: i) }
-        detailOrder.append(sha)
-        return d
-    }
-
-    private func store(_ detail: GitRepository.CommitDetail) {
-        detailCache[detail.sha] = detail
-        if let i = detailOrder.firstIndex(of: detail.sha) { detailOrder.remove(at: i) }
-        detailOrder.append(detail.sha)
-        while detailOrder.count > HistoryView.detailCacheLimit { detailCache[detailOrder.removeFirst()] = nil }
-    }
-
-    private func setChildren(of item: HistoryItem, from detail: GitRepository.CommitDetail) {
-        let summary = HistoryItem(kind: .summary)
-        summary.detail = detail
-        var children = [summary]
-        for file in detail.files {
-            let child = HistoryItem(kind: .file)
-            child.file = file
-            children.append(child)
-        }
-        if detail.hiddenFileCount > 0 {
-            let more = HistoryItem(kind: .moreFiles)
-            more.text = "\(detail.hiddenFileCount) more files. Open the commit as a patch to see all."
-            children.append(more)
-        }
-        for c in children { c.parent = item }
-        item.children = children
-    }
-
-    private func loadDetail(for item: HistoryItem) {
-        guard let repo = repository, let commit = item.commit else { return }
-        if let d = cachedDetail(commit.sha) {
-            setChildren(of: item, from: d)
-            return
-        }
-        let loading = HistoryItem.info("Loading…")
-        loading.parent = item
-        item.children = [loading]
-        let generation = generation
-        repo.commitDetail(sha: commit.sha, parents: commit.parents) { [weak self, weak item] detail in
-            guard let self, let item, generation == self.generation else { return }
-            if let detail {
-                self.store(detail)
-                self.setChildren(of: item, from: detail)
-            } else {
-                let failed = HistoryItem.info("Couldn’t read this commit")
-                failed.parent = item
-                item.children = [failed]
-            }
-            if self.list.isItemExpanded(item) { self.list.reloadItem(item, reloadChildren: true) }
-        }
     }
 
     // MARK: Actions
 
-    private func toggle(_ item: HistoryItem) {
-        if list.isItemExpanded(item) { list.collapseItem(item) } else { list.expandItem(item) }
-    }
-
-    private func commit(of item: HistoryItem) -> LogCommit? { item.commit ?? item.parent?.commit }
-
     private func send(_ item: HistoryItem, _ action: HistoryAction) {
-        guard let commit = commit(of: item) else { return }
-        onAction?(commit, detailCache[commit.sha], action)
+        guard let commit = item.commit else { return }
+        onAction?(commit, action)
     }
 
-    /// What a click or Return does to `item`: commits expand, files open.
-    func activate(_ item: HistoryItem, pinned: Bool) {
-        switch item.kind {
-        case .commit:
-            if pinned { send(item, .openCommitPatch(pinned: true)) } else { toggle(item) }
-        case .file:
-            if let file = item.file { send(item, .openFile(file, .changes, pinned: pinned)) }
-        default:
-            break
-        }
+    /// Opens the commit in the window's preview tab, or in a tab of its own when `pinned`.
+    func open(_ item: HistoryItem, pinned: Bool) {
+        openDebounce?.cancel()
+        guard item.kind == .commit else { return }
+        send(item, .openCommit(pinned: pinned))
     }
 
     private func clickedItem() -> HistoryItem? {
@@ -525,51 +492,49 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         guard NSApp.currentEvent?.clickCount != 2, let item = clickedItem() else { return }
         let flags = NSApp.currentEvent?.modifierFlags ?? []
         guard !flags.contains(.command), !flags.contains(.shift) else { return }
-        activate(item, pinned: false)
+        open(item, pinned: false)
     }
 
     @objc private func doubleClicked() {
         guard let item = clickedItem() else { return }
-        activate(item, pinned: true)
+        open(item, pinned: true)
     }
 
     private func returnPressed() {
         let row = list.selectedRow
         guard row >= 0, let item = list.item(atRow: row) as? HistoryItem else { return }
-        if item.kind == .commit { toggle(item) } else { activate(item, pinned: true) }
+        open(item, pinned: true)
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        selectionChanged(fromKeyboard: NSApp.currentEvent?.type == .keyDown)
+    }
+
+    /// Moving through the list with the arrow keys opens the commit where the selection stops.
+    func selectionChanged(fromKeyboard: Bool) {
+        guard fromKeyboard else { return }
+        openDebounce?.cancel()
+        let row = list.selectedRow
+        guard row >= 0, let item = list.item(atRow: row) as? HistoryItem, item.kind == .commit else { return }
+        let work = DispatchWorkItem { [weak self, weak item] in
+            guard let self, let item else { return }
+            self.open(item, pinned: false)
+        }
+        openDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + HistoryView.keyboardOpenDelay, execute: work)
     }
 
     // MARK: Menus
 
     private func menu(row: Int) -> NSMenu? {
-        guard row >= 0, let item = list.item(atRow: row) as? HistoryItem else { return nil }
+        guard row >= 0, let item = list.item(atRow: row) as? HistoryItem, item.kind == .commit else { return nil }
         let m = NSMenu()
-        func add(_ title: String, _ sel: Selector, enabled: Bool = true) {
-            let mi = m.addItem(withTitle: title, action: enabled ? sel : nil, keyEquivalent: "")
+        list.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        for (title, sel) in [("Open in New Tab", #selector(menuOpenInNewTab(_:))), ("Copy Commit SHA", #selector(menuCopySHA(_:))),
+                             ("Copy Message", #selector(menuCopyMessage(_:)))] {
+            let mi = m.addItem(withTitle: title, action: sel, keyEquivalent: "")
             mi.target = self
             mi.representedObject = item
-        }
-        switch item.kind {
-        case .commit:
-            list.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            add("Open Commit as Patch", #selector(menuCommitPatch(_:)))
-            add("Copy Commit SHA", #selector(menuCopySHA(_:)))
-            add("Copy Message", #selector(menuCopyMessage(_:)))
-            m.addItem(.separator())
-            add(list.isItemExpanded(item) ? "Collapse" : "Expand", #selector(menuToggle(_:)))
-        case .file:
-            guard let file = item.file else { return nil }
-            list.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            let inWorkTree = repository.map { FileManager.default.fileExists(atPath: $0.root.appendingPathComponent(file.path).path) } ?? false
-            add("Open Changes", #selector(menuOpenChanges(_:)))
-            add("Open Changes in New Tab", #selector(menuOpenChangesPinned(_:)))
-            add("Open as Patch", #selector(menuOpenPatch(_:)))
-            add("Open File at This Commit", #selector(menuOpenFile(_:)), enabled: file.status != .deleted)
-            add("Compare with Current File", #selector(menuCompareCurrent(_:)), enabled: inWorkTree)
-            m.addItem(.separator())
-            add("Copy Path", #selector(menuCopyPath(_:)))
-        default:
-            return nil
         }
         return m
     }
@@ -581,164 +546,58 @@ final class HistoryView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate,
         AppRuntime.pasteboard.setString(text, forType: .string)
     }
 
-    @objc private func menuCommitPatch(_ sender: Any?) { menuItem(sender).map { send($0, .openCommitPatch(pinned: true)) } }
+    @objc private func menuOpenInNewTab(_ sender: Any?) { menuItem(sender).map { open($0, pinned: true) } }
     @objc private func menuCopySHA(_ sender: Any?) { menuItem(sender)?.commit.map { copy($0.sha) } }
-    @objc private func menuToggle(_ sender: Any?) { menuItem(sender).map(toggle) }
 
     @objc private func menuCopyMessage(_ sender: Any?) {
         guard let commit = menuItem(sender)?.commit else { return }
-        if let d = cachedDetail(commit.sha) { copy(d.message); return }
         repository?.commitDetail(sha: commit.sha, parents: commit.parents) { [weak self] detail in
-            guard let self, let detail else { return }
-            self.store(detail)
-            self.copy(detail.message)
+            guard let detail else { return }
+            self?.copy(detail.message)
         }
     }
-
-    private func openFile(_ sender: Any?, _ view: CommitFileView, pinned: Bool) {
-        guard let item = menuItem(sender), let file = item.file else { return }
-        send(item, .openFile(file, view, pinned: pinned))
-    }
-
-    @objc private func menuOpenChanges(_ sender: Any?) { openFile(sender, .changes, pinned: false) }
-    @objc private func menuOpenChangesPinned(_ sender: Any?) { openFile(sender, .changes, pinned: true) }
-    @objc private func menuOpenPatch(_ sender: Any?) { openFile(sender, .patch, pinned: true) }
-    @objc private func menuOpenFile(_ sender: Any?) { openFile(sender, .file, pinned: true) }
-    @objc private func menuCompareCurrent(_ sender: Any?) {
-        guard let item = menuItem(sender), let file = item.file else { return }
-        send(item, .compareWithCurrent(file))
-    }
-    @objc private func menuCopyPath(_ sender: Any?) { menuItem(sender)?.file.map { copy($0.path) } }
 
     // MARK: Outline
 
     private var rootCount: Int { commitItems.count + (trailing == nil ? 0 : 1) }
 
-    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-        guard let item = item as? HistoryItem else { return rootCount }
-        return item.children.count
-    }
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int { item == nil ? rootCount : 0 }
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-        guard let item = item as? HistoryItem else { return index < commitItems.count ? commitItems[index] : trailing as Any }
-        return item.children[index]
+        index < commitItems.count ? commitItems[index] : trailing as Any
     }
 
-    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool { (item as? HistoryItem)?.kind == .commit }
-
-    func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
-        guard let item = item as? HistoryItem, item.kind == .commit else { return false }
-        loadDetail(for: item)
-        return true
-    }
-
-    func outlineViewItemDidCollapse(_ notification: Notification) {
-        (notification.userInfo?["NSObject"] as? HistoryItem)?.children = []
-    }
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool { false }
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
-        guard let item = item as? HistoryItem else { return 24 }
-        switch item.kind {
-        case .file: return 24
-        case .summary: return summaryHeight(item)
-        default: return item.rowHeight
-        }
+        (item as? HistoryItem)?.rowHeight ?? 24
     }
 
     func outlineView(_ outlineView: NSOutlineView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
-        proposed.filteredIndexSet { row in
-            guard let item = list.item(atRow: row) as? HistoryItem else { return false }
-            return item.kind == .commit || item.kind == .file
-        }
+        proposed.filteredIndexSet { (list.item(atRow: $0) as? HistoryItem)?.kind == .commit }
     }
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
         let id = NSUserInterfaceItemIdentifier("historyRow")
-        let view = (outlineView.makeView(withIdentifier: id, owner: nil) as? HistoryRowView) ?? HistoryRowView()
+        let view = (outlineView.makeView(withIdentifier: id, owner: nil) as? HoverRowView) ?? HoverRowView()
         view.identifier = id
-        view.style = style
-        view.lanes = []
-        if let item = item as? HistoryItem, item.kind != .commit, style.showsGraph, let graph = item.parent?.graph {
-            view.lanes = graph.continuing
-        }
         return view
-    }
-
-    private func textWidth() -> CGFloat {
-        max(40, (list.tableColumns.first?.width ?? bounds.width) - style.childLeft - 10)
-    }
-
-    private func summaryHeight(_ item: HistoryItem) -> CGFloat {
-        let width = textWidth()
-        if let c = item.cachedHeight, c.width == width { return c.height }
-        var height: CGFloat = 8 + 16
-        let body = item.detail.map(HistorySummaryCell.body) ?? ""
-        if !body.isEmpty {
-            let font = HistorySummaryCell.bodyFont
-            let measured = ceil((body as NSString).boundingRect(with: NSSize(width: width, height: .greatestFiniteMagnitude),
-                                                               options: [.usesLineFragmentOrigin], attributes: [.font: font]).height)
-            height += 4 + min(measured, HistorySummaryCell.lineHeight * CGFloat(HistorySummaryCell.maxBodyLines))
-        }
-        item.cachedHeight = (width, height)
-        return height
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let item = item as? HistoryItem else { return nil }
-        switch item.kind {
-        case .commit:
+        if item.kind == .commit {
             let id = NSUserInterfaceItemIdentifier("historyCommit")
             let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? HistoryCommitCell) ?? HistoryCommitCell()
             cell.identifier = id
             cell.configure(item, style: style)
             return cell
-        case .file:
-            guard let file = item.file else { return nil }
-            let id = NSUserInterfaceItemIdentifier("historyFile")
-            let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? ChangeCell) ?? ChangeCell()
-            cell.identifier = id
-            cell.leadingInset = style.childLeft - 12
-            cell.configure(file.changedFile)
-            return cell
-        case .summary:
-            let id = NSUserInterfaceItemIdentifier("historySummary")
-            let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? HistorySummaryCell) ?? HistorySummaryCell()
-            cell.identifier = id
-            if let detail = item.detail { cell.configure(detail, style: style) }
-            return cell
-        case .info, .moreFiles:
-            let id = NSUserInterfaceItemIdentifier("historyInfo")
-            let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? HistoryInfoCell) ?? HistoryInfoCell()
-            cell.identifier = id
-            cell.configure(item.text, style: style, isChild: item.parent != nil)
-            return cell
         }
-    }
-}
-
-/// Draws the lanes that carry on past an expanded commit, behind the rows under it.
-final class HistoryRowView: HoverRowView {
-    weak var style: HistoryStyle?
-    var lanes: [Int] = []
-
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        hovered = false
-        lanes = []
-    }
-
-    override func drawBackground(in dirtyRect: NSRect) {
-        super.drawBackground(in: dirtyRect)
-        guard let style, !lanes.isEmpty else { return }
-        for lane in lanes {
-            let x = style.x(lane)
-            let path = NSBezierPath()
-            path.lineWidth = 1.5
-            path.move(to: NSPoint(x: x, y: bounds.minY))
-            path.line(to: NSPoint(x: x, y: bounds.maxY))
-            style.color(lane).withAlphaComponent(0.85).setStroke()
-            path.stroke()
-        }
+        let id = NSUserInterfaceItemIdentifier("historyInfo")
+        let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? HistoryInfoCell) ?? HistoryInfoCell()
+        cell.identifier = id
+        cell.configure(item.text, left: 12)
+        return cell
     }
 }
 
@@ -751,9 +610,7 @@ final class HistoryCommitCell: NSTableCellView {
 
     private static let subjectFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
     private static let shaFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
-    private static let badgeFont = NSFont.systemFont(ofSize: 10, weight: .medium)
     private static let metaFont = NSFont.systemFont(ofSize: 11)
-    private static let maxBadges = 3
 
     override var isFlipped: Bool { true }
 
@@ -797,61 +654,10 @@ final class HistoryCommitCell: NSTableCellView {
                      options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
                      attributes: [.font: HistoryCommitCell.subjectFont, .foregroundColor: theme.chromeForeground, .paragraphStyle: para])
 
-        var x = left
-        let shown = commit.refs.prefix(HistoryCommitCell.maxBadges)
-        for ref in shown where x < right - 40 {
-            x += drawBadge(ref, at: x, right: right, theme: theme) + 4
-        }
-        if commit.refs.count > shown.count {
-            let more = "+\(commit.refs.count - shown.count)" as NSString
-            let attrs: [NSAttributedString.Key: Any] = [.font: HistoryCommitCell.badgeFont, .foregroundColor: theme.chromeSecondary]
-            more.draw(at: NSPoint(x: x, y: 23), withAttributes: attrs)
-            x += ceil(more.size(withAttributes: attrs).width) + 4
-        }
-        if !shown.isEmpty { x += 2 }
+        let x = RefBadges.drawRow(commit.refs, at: left, y: 22, right: right, theme: theme)
         (meta as NSString).draw(with: NSRect(x: x, y: 22, width: max(0, right - x), height: 15),
                                 options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
                                 attributes: [.font: HistoryCommitCell.metaFont, .foregroundColor: theme.chromeSecondary, .paragraphStyle: para])
-    }
-
-    private func drawBadge(_ ref: RefLabel, at x: CGFloat, right: CGFloat, theme: Theme) -> CGFloat {
-        let emphasized = ref.isCheckedOut
-        let tint: NSColor
-        let fill: NSColor
-        switch ref.kind {
-        case .branch, .detachedHead:
-            tint = emphasized ? theme.accent.mix(theme.foreground, 0.25) : theme.chromeForeground.withAlphaComponent(0.85)
-            fill = emphasized ? theme.accent.withAlphaComponent(0.24) : theme.chromeForeground.withAlphaComponent(0.1)
-        case .remoteBranch:
-            tint = theme.chromeSecondary
-            fill = theme.chromeForeground.withAlphaComponent(0.06)
-        case .tag:
-            let c = theme.color(.changed) ?? .systemOrange
-            tint = c
-            fill = c.withAlphaComponent(0.14)
-        }
-        let attrs: [NSAttributedString.Key: Any] = [.font: HistoryCommitCell.badgeFont, .foregroundColor: tint]
-        let name = ref.name as NSString
-        let glyph = ref.kind == .tag ? FileIcons.image("tag.fill", color: tint, size: 8.5) : nil
-        let glyphWidth = glyph.map { $0.size.width + 3 } ?? 0
-        let textWidth = min(ceil(name.size(withAttributes: attrs).width), 90, max(20, right - x - 14 - glyphWidth))
-        let width = textWidth + 10 + glyphWidth
-        let r = NSRect(x: x, y: 22, width: width, height: 15)
-        fill.setFill()
-        NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
-        var tx = r.minX + 5
-        if let glyph {
-            glyph.draw(in: NSRect(x: tx, y: r.midY - glyph.size.height / 2, width: glyph.size.width, height: glyph.size.height),
-                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-            tx += glyphWidth
-        }
-        let para = NSMutableParagraphStyle()
-        para.lineBreakMode = .byTruncatingTail
-        var truncating = attrs
-        truncating[.paragraphStyle] = para
-        name.draw(with: NSRect(x: tx, y: r.minY + 1, width: textWidth, height: 13),
-                  options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: truncating)
-        return width
     }
 
     private func drawGraph(_ row: CommitGraph.Row, theme: Theme) {
@@ -888,79 +694,10 @@ final class HistoryCommitCell: NSTableCellView {
     }
 }
 
-/// "3 files changed  +12 −4", then the commit message's body under it.
-final class HistorySummaryCell: NSTableCellView {
-    static let bodyFont = NSFont.systemFont(ofSize: 12)
-    static let lineHeight: CGFloat = 15
-    static let maxBodyLines = 12
-    private var summary = NSAttributedString()
-    private var body = ""
-    private var style = HistoryStyle()
-    private var left: CGFloat { style.childLeft }
-
-    override var isFlipped: Bool { true }
-
-    init() {
-        super.init(frame: .zero)
-        setAccessibilityElement(true)
-        setAccessibilityRole(.cell)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-    override func accessibilityChildren() -> [Any]? { nil }
-
-    /// What follows the subject in a commit message.
-    static func body(_ detail: GitRepository.CommitDetail) -> String {
-        guard let newline = detail.message.firstIndex(of: "\n") else { return "" }
-        return detail.message[newline...].trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static func summary(_ detail: GitRepository.CommitDetail, theme: Theme) -> NSAttributedString {
-        let total = detail.files.count + detail.hiddenFileCount
-        let added = detail.files.reduce(0) { $0 + ($1.added ?? 0) }
-        let removed = detail.files.reduce(0) { $0 + ($1.removed ?? 0) }
-        let font = NSFont.systemFont(ofSize: 11.5)
-        let digits = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
-        let out = NSMutableAttributedString(string: "\(total) \(total == 1 ? "file" : "files") changed  ",
-                                            attributes: [.font: font, .foregroundColor: theme.chromeSecondary])
-        out.append(NSAttributedString(string: "+\(added)", attributes: [.font: digits, .foregroundColor: theme.color(.inserted) ?? .systemGreen]))
-        out.append(NSAttributedString(string: " −\(removed)", attributes: [.font: digits, .foregroundColor: theme.color(.deleted) ?? .systemRed]))
-        if detail.parents.count > 1 {
-            out.append(NSAttributedString(string: " · merge, compared with the first parent",
-                                          attributes: [.font: font, .foregroundColor: theme.chromeSecondary]))
-        }
-        return out
-    }
-
-    func configure(_ detail: GitRepository.CommitDetail, style: HistoryStyle) {
-        self.style = style
-        summary = HistorySummaryCell.summary(detail, theme: ThemeManager.shared.active)
-        body = HistorySummaryCell.body(detail)
-        toolTip = detail.message
-        setAccessibilityLabel(summary.string + (body.isEmpty ? "" : ". " + body))
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let width = max(0, bounds.width - left - 10)
-        summary.draw(with: NSRect(x: left, y: 4, width: width, height: 16), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
-        guard !body.isEmpty else { return }
-        let para = NSMutableParagraphStyle()
-        para.lineBreakMode = .byWordWrapping
-        let capped = HistorySummaryCell.lineHeight * CGFloat(HistorySummaryCell.maxBodyLines)
-        (body as NSString).draw(with: NSRect(x: left, y: 24, width: width, height: min(capped, max(0, bounds.height - 28))),
-                                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
-                                attributes: [.font: HistorySummaryCell.bodyFont, .foregroundColor: ThemeManager.shared.active.chromeSecondary,
-                                             .paragraphStyle: para])
-    }
-}
-
 /// A row with only a message: "Loading…", "Showing the latest 5,000 commits…".
 final class HistoryInfoCell: NSTableCellView {
     private var text = ""
-    private var style = HistoryStyle()
-    private var isChild = false
-    private var left: CGFloat { isChild ? style.childLeft : 12 }
+    private var left: CGFloat = 12
 
     override var isFlipped: Bool { true }
 
@@ -972,10 +709,9 @@ final class HistoryInfoCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(_ text: String, style: HistoryStyle, isChild: Bool) {
+    func configure(_ text: String, left: CGFloat) {
         self.text = text
-        self.style = style
-        self.isChild = isChild
+        self.left = left
         setAccessibilityLabel(text)
         needsDisplay = true
     }

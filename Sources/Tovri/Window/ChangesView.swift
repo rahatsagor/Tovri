@@ -700,9 +700,10 @@ private final class ChangeSectionCell: NSTableCellView {
     }
 }
 
-final class ChangeCell: NSTableCellView {
-    /// Room kept free at the left, e.g. for the History graph column.
+class ChangeCell: NSTableCellView {
+    /// Room kept free at the left and right, e.g. to line rows up with a centered column.
     var leadingInset: CGFloat = 0
+    var trailingInset: CGFloat = 0
     private let icon = NSImageView()
     private let name = NSTextField(labelWithString: "")
     private let dir = NSTextField(labelWithString: "")
@@ -755,7 +756,7 @@ final class ChangeCell: NSTableCellView {
         icon.frame = NSRect(x: 12 + leadingInset, y: (h - 16) / 2, width: 16, height: 16)
         // Labels inset their text slightly, so a frame of exactly the text's width cuts off the end.
         let cw = ceil(counts.attributedStringValue.size().width) + 8
-        counts.frame = NSRect(x: bounds.width - 10 - cw, y: (h - 15) / 2, width: cw, height: 15)
+        counts.frame = NSRect(x: bounds.width - 10 - trailingInset - cw, y: (h - 15) / 2, width: cw, height: 15)
         let right = counts.frame.minX - 8
         let nw = min(ceil(name.attributedStringValue.size().width) + 4, max(0, right - 33 - leadingInset))
         name.frame = NSRect(x: 33 + leadingInset, y: (h - 17) / 2, width: nw, height: 17)

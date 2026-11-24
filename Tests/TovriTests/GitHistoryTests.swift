@@ -502,12 +502,26 @@ final class GitHistoryTests: XCTestCase {
         try XCTUnwrap(items(view).first { $0.kind == .commit && $0.commit?.subject == subject })
     }
 
-    /// Expands the commit and returns its file rows.
-    private func expand(_ view: HistoryView, _ subject: String) throws -> [HistoryItem] {
-        let item = try commitItem(view, subject)
-        view.activate(item, pinned: false)
-        spin { self.items(view).contains { $0.kind == .file || $0.kind == .moreFiles } }
-        return items(view).filter { $0.kind == .file }
+    /// Opens the commit as the History list does and returns its tab's overview.
+    @discardableResult
+    private func openCommit(_ c: MainWindowController, _ view: HistoryView, _ subject: String, pinned: Bool = false) throws -> CommitOverviewView {
+        view.open(try commitItem(view, subject), pinned: pinned)
+        spin { c.activeDocument?.commitOverview?.commit.subject == subject && c.activeEditor?.commitOverview != nil }
+        XCTAssertEqual(c.activeDocument?.commitOverview?.commit.subject, subject)
+        return try XCTUnwrap(c.activeEditor?.commitOverview)
+    }
+
+    private func fileIndex(_ ov: CommitOverviewView, _ path: String) throws -> Int {
+        try XCTUnwrap(ov.model.detail.files.firstIndex { $0.path == path }, path)
+    }
+
+    private func toolButton(_ c: MainWindowController, startingWith title: String) -> ToolButton? {
+        c.activeGroup.container.subviews.compactMap { $0 as? ToolButton }.first { $0.toolTip?.hasPrefix(title) == true }
+    }
+
+    private func thirdCommitWithABody() throws {
+        try write("third\n", "third.txt")
+        try shell("git add -A && \(commit) -m 'Third change' -m 'First paragraph of the body.' -m 'Second paragraph.'")
     }
 
     private func tabNames(_ c: MainWindowController) -> [String] { c.groups.flatMap { $0.tabs.map { $0.document.displayName } } }
@@ -696,132 +710,242 @@ final class GitHistoryTests: XCTestCase {
         }
     }
 
-    func testExpandingACommitListsItsFilesAndCachesTheDetail() throws {
+    func testClickingACommitOpensItsOverviewInThePreviewTab() throws {
         try historyWithRenameBinaryAndDelete()
+        try thirdCommitWithABody()
         try withWindow { c in
-            let view = try showHistory(c, commits: 2)
-            let files = try expand(view, "rename and more")
-            XCTAssertTrue(files.map { $0.file?.path ?? "" }.contains("new.txt"))
-            let summary = try XCTUnwrap(items(view).first { $0.kind == .summary })
-            XCTAssertEqual(summary.detail?.message, "rename and more")
-            XCTAssertEqual(view.cachedDetailCount, 1)
-            let commit = try commitItem(view, "rename and more")
-            // Collapsing releases the rows but not the cached detail.
-            view.activate(commit, pinned: false)
-            XCTAssertTrue(items(view).allSatisfy { $0.kind == .commit })
-            view.activate(commit, pinned: false)
-            spin { self.items(view).contains { $0.kind == .file } }
-            XCTAssertEqual(view.cachedDetailCount, 1)
-        }
-    }
-
-    func testOpeningAFilesChangesShowsAReadOnlyTransientComparison() throws {
-        try historyWithRenameBinaryAndDelete()
-        try withWindow { c in
-            let view = try showHistory(c, commits: 2)
-            let files = try expand(view, "rename and more")
-            let renamed = try XCTUnwrap(files.first { $0.file?.path == "new.txt" })
-            view.activate(renamed, pinned: false)
-            spin { c.activeEditor?.comparisonLabel != nil && c.activeEditor?.inlineDiff != nil }
-            let doc = try XCTUnwrap(c.activeDocument)
-            XCTAssertTrue(doc.isReadOnly && doc.isTransient && doc.isHistoryPreview)
-            XCTAssertTrue(doc.displayName.hasPrefix("new.txt @ "), doc.displayName)
-            XCTAssertEqual(doc.revisionKey?.hasSuffix(":new.txt:changes"), true)
-            let editor = try XCTUnwrap(c.activeEditor)
-            XCTAssertTrue(editor.isComparing)
-            XCTAssertEqual(editor.comparisonSource, .commit)
-            XCTAssertEqual(editor.inlineDiff?.added, 1)
-            XCTAssertEqual(editor.inlineDiff?.deleted, 1)
-            XCTAssertTrue((doc.string as String).contains("line five"))
-            XCTAssertTrue(c.statusBar.flashText?.contains("+1 −1 in new.txt") == true, c.statusBar.flashText ?? "")
-
-            // Restore This Version stays off for a read-only document.
-            let restore = NSMenuItem(title: "Restore", action: #selector(MainWindowController.restoreComparedVersion(_:)), keyEquivalent: "")
-            XCTAssertEqual(c.validateComparisonItem(restore), false)
-            c.restoreComparedVersion(nil)
-            XCTAssertTrue((doc.string as String).contains("line five"))
-        }
-    }
-
-    func testSingleClicksShareOnePreviewTabAndPinnedTabsStay() throws {
-        try historyWithRenameBinaryAndDelete()
-        try withWindow { c in
-            let view = try showHistory(c, commits: 2)
-            let files = try expand(view, "rename and more")
-            let byPath = Dictionary(uniqueKeysWithValues: files.compactMap { i in i.file.map { ($0.path, i) } })
+            let view = try showHistory(c, commits: 3)
             let start = c.activeGroup.tabs.count
-            view.activate(try XCTUnwrap(byPath["new.txt"]), pinned: false)
-            spin { c.activeGroup.tabs.count == start + 1 && c.activeEditor?.inlineDiff != nil }
+            let ov = try openCommit(c, view, "rename and more")
+            let doc = try XCTUnwrap(c.activeDocument)
+            let commit = ov.model.commit
+            XCTAssertTrue(doc.isReadOnly && doc.isTransient && doc.isHistoryPreview)
+            XCTAssertEqual(doc.revisionKey, "\(commit.sha)::commit")
+            XCTAssertEqual(doc.language.id, "diff")
+            XCTAssertEqual(c.activeEditor?.showsCommitOverview, true)
             XCTAssertEqual(c.activeGroup.tabs.count, start + 1)
-            view.activate(try XCTUnwrap(byPath["keep.txt"] ?? byPath["with space.txt"]), pinned: false)
-            spin { c.activeDocument?.displayName.hasPrefix("with space.txt") == true || c.activeDocument?.displayName.hasPrefix("keep.txt") == true }
-            XCTAssertEqual(c.activeGroup.tabs.count, start + 1, "a second click must replace the preview, not add a tab")
-            XCTAssertEqual(c.activeDocument?.displayName.hasPrefix("with space.txt"), true)
-            XCTAssertEqual(tabNames(c).filter { $0.contains(" @ ") }.count, 1)
+            XCTAssertEqual(ov.rows.count, 2 + ov.model.detail.files.count)
+            XCTAssertTrue((doc.string as String).hasPrefix("commit \(commit.sha)\nAuthor: t <t@example.com>\nDate:   "))
+            XCTAssertTrue((doc.string as String).contains("diff --git a/old.txt b/new.txt"))
+            XCTAssertEqual(ov.model.patchLines.count, ov.model.detail.files.count)
+            XCTAssertFalse(ov.model.patchTooLarge)
+            let tab = try XCTUnwrap(c.activeGroup.tabBar.items.first { $0.title == doc.displayName })
+            XCTAssertTrue(tab.tooltip.hasPrefix(commit.sha) && tab.tooltip.hasSuffix("rename and more"), tab.tooltip)
 
-            // Pinned keeps its tab, and the next click gets a new preview.
-            view.activate(try XCTUnwrap(byPath["ünï.txt"]), pinned: true)
-            spin { c.activeDocument?.displayName.hasPrefix("ünï.txt") == true }
+            // The card shows the author and message; a long body makes it taller.
+            let card = try XCTUnwrap(ov.table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? CommitCardCell)
+            XCTAssertTrue(card.accessibilityLabel()?.contains("rename and more, t,") == true, card.accessibilityLabel() ?? "")
+            XCTAssertTrue(card.accessibilityLabel()?.hasSuffix("commit \(commit.shortSHA)") == true)
+            let short = CommitCardCell.layout(for: ov.model, width: 700).total
+            let third = try openCommit(c, view, "Third change")
+            XCTAssertEqual(CommitCardCell.messageBody(third.model.detail), "First paragraph of the body.\n\nSecond paragraph.")
+            XCTAssertGreaterThan(CommitCardCell.layout(for: third.model, width: 700).total, short)
+        }
+    }
+
+    func testAnotherClickReplacesThePreviewAndPinningKeepsATab() throws {
+        try historyWithRenameBinaryAndDelete()
+        try thirdCommitWithABody()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 3)
+            let start = c.activeGroup.tabs.count
+            let first = try openCommit(c, view, "rename and more")
+            let firstDoc = try XCTUnwrap(c.activeDocument)
+            try openCommit(c, view, "Third change")
+            XCTAssertEqual(c.activeGroup.tabs.count, start + 1, "the second click replaces the preview")
+            XCTAssertFalse(c.groups.flatMap { $0.tabs }.contains { $0.document === firstDoc })
+            _ = first
+
+            // Double-click or Return pins and focuses the list in the tab.
+            try openCommit(c, view, "root", pinned: true)
             let pinned = try XCTUnwrap(c.activeDocument)
             XCTAssertFalse(pinned.isHistoryPreview)
-            XCTAssertEqual(c.activeGroup.tabs.count, start + 2, "a pinned open adds a tab and leaves the preview alone")
-            view.activate(try XCTUnwrap(byPath["[ab].txt"]), pinned: false)
-            spin { c.activeDocument?.displayName.hasPrefix("[ab].txt") == true }
-            XCTAssertEqual(c.activeGroup.tabs.count, start + 2, "the next click replaces the preview and keeps the pinned tab")
+            XCTAssertEqual(c.activeGroup.tabs.count, start + 2)
+            XCTAssertTrue(c.window?.firstResponder === c.activeEditor?.commitOverview?.table, "the overview's list should have focus")
+            try openCommit(c, view, "rename and more")
+            XCTAssertEqual(c.activeGroup.tabs.count, start + 2, "the preview is reused beside the pinned tab")
             XCTAssertTrue(c.groups.flatMap { $0.tabs }.contains { $0.document === pinned })
-            XCTAssertFalse(tabNames(c).contains { $0.hasPrefix("with space.txt") })
 
-            // Opening again selects the tab that has it.
-            view.activate(try XCTUnwrap(byPath["ünï.txt"]), pinned: false)
-            spin { c.activeDocument === pinned }
+            // Opening a commit that has a tab selects it.
+            try openCommit(c, view, "root")
             XCTAssertTrue(c.activeDocument === pinned)
             XCTAssertEqual(c.activeGroup.tabs.count, start + 2)
         }
     }
 
-    func testDeletedAddedAndBinaryFilesOpenAsTheirChanges() throws {
+    func testArrowKeysOpenTheCommitWhereTheSelectionStops() throws {
+        try historyWithRenameBinaryAndDelete()
+        try thirdCommitWithABody()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 3)
+            let start = c.activeGroup.tabs.count
+            for row in [0, 1, 2] {
+                view.list.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                view.selectionChanged(fromKeyboard: true)
+            }
+            XCTAssertEqual(c.activeGroup.tabs.count, start, "nothing opens while the arrow key is still moving")
+            spin { c.activeDocument?.commitOverview != nil }
+            XCTAssertEqual(c.activeDocument?.commitOverview?.commit.subject, "root")
+            spin(1) { false }
+            XCTAssertEqual(c.activeGroup.tabs.count, start + 1, "only the commit where it stopped opened")
+
+            // Choosing from the mouse is not delayed, and a selection from the mouse never schedules one.
+            view.list.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            view.selectionChanged(fromKeyboard: false)
+            spin(1) { false }
+            XCTAssertEqual(c.activeDocument?.commitOverview?.commit.subject, "root")
+        }
+    }
+
+    func testEverySectionLineStartsTheFileItNames() throws {
         try historyWithRenameBinaryAndDelete()
         try withWindow { c in
             let view = try showHistory(c, commits: 2)
-            let files = try expand(view, "rename and more")
-            let byPath = Dictionary(uniqueKeysWithValues: files.compactMap { i in i.file.map { ($0.path, i) } })
+            let ov = try openCommit(c, view, "rename and more")
+            let doc = try XCTUnwrap(c.activeDocument)
+            for (i, file) in ov.model.detail.files.enumerated() {
+                let range = doc.lines.range(of: ov.model.patchLines[i], textLength: doc.length)
+                let line = (doc.string as NSString).substring(with: range)
+                XCTAssertTrue(line.hasPrefix("diff --git "), line)
+                // Git quotes and escapes names with tabs or non-ASCII characters in this header.
+                XCTAssertTrue(line.contains(file.path) || line.hasPrefix("diff --git \"a/"), "\(line) should name \(file.path)")
+            }
+        }
+    }
 
-            view.activate(try XCTUnwrap(byPath["del.txt"]), pinned: false)
+    func testClickingAFileShowsItsSectionOfThePatchAtTheTop() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            let editor = try XCTUnwrap(c.activeEditor)
+            let doc = try XCTUnwrap(c.activeDocument)
+            let index = 2
+            ov.selectFile(index)
+            XCTAssertEqual(ov.selectedFileIndex, index)
+            ov.table.onReturn?(false)
+            XCTAssertFalse(editor.showsCommitOverview)
+            XCTAssertTrue(ov.isHidden)
+            let start = doc.lines.start(of: ov.model.patchLines[index])
+            XCTAssertTrue(NSLocationInRange(start, editor.textView.visibleCharacterRange), "the file's section should be on screen")
+            XCTAssertLessThanOrEqual(editor.textView.visibleCharacterRange.location, start)
+            XCTAssertEqual(editor.topVisibleLine, ov.model.patchLines[index], accuracy: 1)
+            // The tab bar's Overview button goes back.
+            toolButton(c, startingWith: "Overview")?.onClick?()
+            XCTAssertTrue(editor.showsCommitOverview)
+        }
+    }
+
+    func testTheAccessoryButtonsSwitchBetweenOverviewAndPatch() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            try openCommit(c, view, "rename and more")
+            let overview = try XCTUnwrap(toolButton(c, startingWith: "Overview"))
+            let patch = try XCTUnwrap(toolButton(c, startingWith: "Patch"))
+            XCTAssertFalse(overview.isHidden || patch.isHidden)
+            XCTAssertEqual(overview.toolTip, "Overview\nThe commit’s message and changed files.")
+            XCTAssertEqual(patch.toolTip, "Patch\nEvery change in this commit. Find and copy work here.")
+            XCTAssertTrue(overview.isOn && !patch.isOn)
+            patch.onClick?()
+            XCTAssertEqual(c.activeEditor?.showsCommitOverview, false)
+            XCTAssertTrue(patch.isOn && !overview.isOn)
+            overview.onClick?()
+            XCTAssertEqual(c.activeEditor?.showsCommitOverview, true)
+            XCTAssertTrue(overview.isOn && !patch.isOn)
+            // Plain files show neither.
+            _ = c.open(url: dir.appendingPathComponent("keep.txt"))
+            XCTAssertTrue(toolButton(c, startingWith: "Overview")?.isHidden == true)
+        }
+    }
+
+    func testFindAndGoToLineSwitchTheOverviewToThePatch() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            try openCommit(c, view, "rename and more")
+            let editor = try XCTUnwrap(c.activeEditor)
+            editor.showFindBar(replace: false)
+            XCTAssertFalse(editor.showsCommitOverview)
+            XCTAssertEqual(editor.findBar?.isHidden, false)
+            editor.setShowsCommitOverview(true)
+            XCTAssertTrue(editor.findBar?.isHidden ?? true, "the find bar closes with the overview")
+            editor.goTo(line: 3)
+            XCTAssertFalse(editor.showsCommitOverview)
+        }
+    }
+
+    func testOpeningAFilesChangesFromTheOverviewPinsTheCommitTab() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let start = c.activeGroup.tabs.count
+            let ov = try openCommit(c, view, "rename and more")
+            let commitDoc = try XCTUnwrap(c.activeDocument)
+            XCTAssertTrue(commitDoc.isHistoryPreview)
+            ov.selectFile(try fileIndex(ov, "new.txt"))
+            ov.table.onReturn?(true)
+            spin { c.activeEditor?.comparisonLabel != nil && c.activeEditor?.inlineDiff != nil }
+            let doc = try XCTUnwrap(c.activeDocument)
+            XCTAssertTrue(doc.isReadOnly && doc.isTransient && doc.isHistoryPreview)
+            XCTAssertEqual(doc.revisionKey?.hasSuffix(":new.txt:changes"), true)
+            XCTAssertFalse(commitDoc.isHistoryPreview, "using the commit tab keeps it")
+            XCTAssertEqual(c.activeGroup.tabs.count, start + 2)
+            XCTAssertTrue(c.groups.flatMap { $0.tabs }.contains { $0.document === commitDoc })
+            let editor = try XCTUnwrap(c.activeEditor)
+            XCTAssertEqual(editor.comparisonSource, .commit)
+            XCTAssertEqual(editor.inlineDiff?.added, 1)
+            XCTAssertEqual(editor.inlineDiff?.deleted, 1)
+            XCTAssertTrue(c.statusBar.flashText?.contains("+1 −1 in new.txt") == true, c.statusBar.flashText ?? "")
+            // Restore This Version stays off for a read-only document.
+            let restore = NSMenuItem(title: "Restore", action: #selector(MainWindowController.restoreComparedVersion(_:)), keyEquivalent: "")
+            XCTAssertEqual(c.validateComparisonItem(restore), false)
+        }
+    }
+
+    func testDeletedAddedAndBinaryFilesOpenFromTheOverview() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            func open(_ path: String) throws {
+                ov.onAction?(.openFile(ov.model.detail.files[try fileIndex(ov, path)], .changes, pinned: false))
+            }
+            try open("del.txt")
             spin { c.activeEditor?.inlineDiff != nil && c.activeDocument?.displayName.hasSuffix("(deleted)") == true }
             XCTAssertTrue(c.activeDocument?.displayName.hasSuffix("(deleted)") == true, c.activeDocument?.displayName ?? "")
             XCTAssertEqual(c.activeDocument?.length, 0)
             XCTAssertEqual(c.activeEditor?.inlineDiff?.deleted, 1)
             XCTAssertEqual(c.activeEditor?.inlineDiff?.added, 0)
 
-            view.activate(try XCTUnwrap(byPath["with space.txt"]), pinned: false)
+            try open("with space.txt")
             spin { c.activeDocument?.displayName.hasPrefix("with space.txt") == true && c.activeEditor?.inlineDiff?.added == 1 }
             XCTAssertEqual(c.activeEditor?.inlineDiff?.added, 1)
             XCTAssertEqual(c.activeEditor?.inlineDiff?.deleted, 0)
 
             let tabs = c.activeGroup.tabs.count
-            view.activate(try XCTUnwrap(byPath["bin.dat"]), pinned: false)
+            try open("bin.dat")
             spin { c.statusBar.flashText?.contains("isn’t a text file") == true }
             XCTAssertEqual(c.statusBar.flashText, "“bin.dat” isn’t a text file")
             XCTAssertEqual(c.activeGroup.tabs.count, tabs)
-            XCTAssertTrue(c.activeDocument?.displayName.hasPrefix("with space.txt") == true)
         }
     }
 
-    func testOpeningAFileAsAPatchAndAsItWas() throws {
+    func testOpeningAFileAsAPatchAndAsItWasFromTheOverview() throws {
         try historyWithRenameBinaryAndDelete()
         try withWindow { c in
             let view = try showHistory(c, commits: 2)
-            let files = try expand(view, "rename and more")
-            let renamed = try XCTUnwrap(files.first { $0.file?.path == "new.txt" }?.file)
-            let log = view.commits.first { $0.subject == "rename and more" }!
-            c.sidebar(c.sidebar, commit: log, detail: nil, action: .openFile(renamed, .patch, pinned: true))
+            let ov = try openCommit(c, view, "rename and more")
+            let renamed = ov.model.detail.files[try fileIndex(ov, "new.txt")]
+            let log = ov.model.commit
+            ov.onAction?(.openFile(renamed, .patch, pinned: true))
             spin { c.activeDocument?.displayName == "new.txt @ \(log.shortSHA) — Patch" }
             let doc = try XCTUnwrap(c.activeDocument)
             XCTAssertEqual(doc.language.id, "diff")
             XCTAssertTrue((doc.string as String).contains("rename from old.txt"))
             XCTAssertTrue(doc.isReadOnly && !doc.isHistoryPreview)
 
-            c.sidebar(c.sidebar, commit: log, detail: nil, action: .openFile(renamed, .file, pinned: true))
+            ov.onAction?(.openFile(renamed, .file, pinned: true))
             spin { c.activeDocument?.displayName == "new.txt @ \(log.shortSHA)" }
             XCTAssertEqual(c.activeDocument?.revisionKey, "\(log.sha):new.txt:file")
             XCTAssertTrue((c.activeDocument?.string as String?)?.contains("line five") == true)
@@ -829,37 +953,130 @@ final class GitHistoryTests: XCTestCase {
         }
     }
 
-    func testOpeningACommitAsAPatchShowsItsHeaderAndDiff() throws {
-        try historyWithRenameBinaryAndDelete()
-        try withWindow { c in
-            let view = try showHistory(c, commits: 2)
-            let item = try commitItem(view, "rename and more")
-            let commit = try XCTUnwrap(item.commit)
-            view.activate(item, pinned: true)
-            spin { c.activeDocument?.revisionKey == "\(commit.sha)::patch" }
-            let doc = try XCTUnwrap(c.activeDocument)
-            let text = doc.string as String
-            XCTAssertTrue(text.hasPrefix("commit \(commit.sha)\nAuthor: t <t@example.com>\nDate:   "), String(text.prefix(120)))
-            XCTAssertTrue(text.contains("\n\n    rename and more\n"))
-            XCTAssertTrue(text.contains("diff --git a/old.txt b/new.txt"))
-            XCTAssertEqual(doc.language.id, "diff")
-            XCTAssertTrue(doc.displayName.hasPrefix("\(commit.shortSHA) — rename and more"))
-            XCTAssertTrue(doc.isReadOnly && doc.isTransient && !doc.isHistoryPreview)
-        }
-    }
-
-    func testCompareWithCurrentFileComparesTheWorkingFileWithTheCommit() throws {
+    func testCompareWithCurrentFileWorksFromTheOverview() throws {
         try historyWithRenameBinaryAndDelete()
         try write("line 1\nchanged now\n", "keep.txt")
         try withWindow { c in
             let view = try showHistory(c, commits: 2)
-            let log = try XCTUnwrap(view.commits.last)
-            let file = GitRepository.CommitFile(path: "keep.txt", originalPath: nil, status: .added, added: 1, removed: 0)
-            c.sidebar(c.sidebar, commit: log, detail: nil, action: .compareWithCurrent(file))
+            let ov = try openCommit(c, view, "root")
+            ov.onAction?(.compareWithCurrent(ov.model.detail.files[try fileIndex(ov, "keep.txt")]))
             spin { c.activeEditor?.comparisonSource != nil }
             XCTAssertEqual(c.activeEditor?.comparisonSource, .commit)
             XCTAssertEqual(c.activeDocument?.url?.lastPathComponent, "keep.txt")
         }
+    }
+
+    func testAParentLinkOpensTheParentCommit() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            let doc = try XCTUnwrap(c.activeDocument)
+            let parent = try XCTUnwrap(ov.model.commit.parents.first)
+            ov.onOpenParent?(parent)
+            spin { c.activeDocument?.commitOverview?.commit.sha == parent }
+            XCTAssertEqual(c.activeDocument?.commitOverview?.commit.subject, "root")
+            XCTAssertFalse(doc.isHistoryPreview, "following a link keeps the tab it came from")
+            XCTAssertTrue(c.groups.flatMap { $0.tabs }.contains { $0.document === doc })
+        }
+    }
+
+    func testAMergeCommitsOverviewNamesBothParents() throws {
+        try historyWithRenameBinaryAndDelete()
+        try shell("git switch -q -c side HEAD~1 && echo side > side.txt && git add -A && \(commit) -m side")
+        try shell("git switch -q main && echo main > main.txt && git add -A && \(commit) -m mainline")
+        try shell("git merge -q --no-ff side -m 'Merge side'")
+        try withWindow { c in
+            let view = try showHistory(c, commits: 5)
+            let ov = try openCommit(c, view, "Merge side")
+            XCTAssertEqual(ov.model.commit.parents.count, 2)
+            XCTAssertTrue((c.activeDocument?.string as String?)?.contains("\nMerge: ") == true)
+            XCTAssertTrue(ov.model.detail.files.contains { $0.path == "side.txt" })
+        }
+    }
+
+    func testAnOversizedPatchStillListsTheFiles() throws {
+        try historyWithRenameBinaryAndDelete()
+        let repo = try repo()
+        let all = log(repo)
+        let d = try XCTUnwrap(detail(repo, all[0]))
+        let built = MainWindowController.commitText(detail: d, patch: nil)
+        XCTAssertTrue(built.tooLarge)
+        XCTAssertEqual(built.patchLines, [])
+        XCTAssertTrue(built.text.hasSuffix("The patch for this commit is too large to show here (over 20 MB).\n"), built.text)
+        let model = CommitOverviewModel(repoRoot: repo.root, commit: all[0], detail: d, patchLines: built.patchLines, patchTooLarge: built.tooLarge)
+        let view = CommitOverviewView(model: model)
+        view.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(view.rows.count, 2 + d.files.count)
+        var shown: Int?
+        view.onShowPatch = { shown = $0 }
+        view.selectFile(1)
+        view.table.onReturn?(false)
+        XCTAssertEqual(shown, 1)
+    }
+
+    func testACommitTabMovedToAnotherGroupStillShowsItsOverview() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            try openCommit(c, view, "rename and more", pinned: true)
+            c.splitTabRight(nil)
+            c.rootView.layoutSubtreeIfNeeded()
+            XCTAssertEqual(c.groups.count, 2)
+            let editor = try XCTUnwrap(c.activeEditor)
+            XCTAssertTrue(editor.hasCommitOverview && editor.showsCommitOverview)
+            XCTAssertEqual(c.activeDocument?.commitOverview?.commit.subject, "rename and more")
+            XCTAssertGreaterThan(editor.commitOverview?.table.numberOfRows ?? 0, 2)
+        }
+    }
+
+    func testAThemeChangeRestylesTheOverview() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            let ov = try openCommit(c, view, "rename and more")
+            let rows = ov.table.numberOfRows
+            for name in ["Tovri Day", "Tovri Dark"] {
+                ThemeManager.shared.preview(try XCTUnwrap(ThemeManager.shared.theme(named: name)))
+                c.rootView.layoutSubtreeIfNeeded()
+                XCTAssertEqual(ov.table.numberOfRows, rows)
+                XCTAssertNotNil(ov.table.view(atColumn: 0, row: 0, makeIfNecessary: true))
+            }
+            ThemeManager.shared.preview(nil)
+        }
+    }
+
+    func testTheSidebarListHasNoExpandedRowsAndItsMenuOffersCommitActions() throws {
+        try historyWithRenameBinaryAndDelete()
+        try withWindow { c in
+            let view = try showHistory(c, commits: 2)
+            XCTAssertEqual(view.list.numberOfRows, 2)
+            XCTAssertTrue(items(view).allSatisfy { $0.kind == .commit })
+        }
+    }
+
+    func testCommitDetailCacheKeepsTheMostRecentlyUsed() {
+        var cache = CommitDetailCache()
+        func make(_ i: Int) -> GitRepository.CommitDetail {
+            GitRepository.CommitDetail(sha: "sha\(i)", parents: [], authorName: "", authorEmail: "", authorDate: Date(), committerName: "",
+                                       commitDate: Date(), message: "", files: [], hiddenFileCount: 0)
+        }
+        for i in 0..<CommitDetailCache.capacity { cache.insert(make(i)) }
+        XCTAssertNotNil(cache.detail(for: "sha0"))
+        cache.insert(make(1000))
+        XCTAssertEqual(cache.count, CommitDetailCache.capacity)
+        XCTAssertNotNil(cache.detail(for: "sha0"), "a recently read detail stays")
+        XCTAssertNil(cache.detail(for: "sha1"), "the least recently used one goes")
+    }
+
+    func testAvatarsAreStableAndTakeUpToTwoInitials() {
+        XCTAssertEqual(AvatarView.initials(name: "Rahat Sagor", email: "r@x"), "RS")
+        XCTAssertEqual(AvatarView.initials(name: "ann", email: "a@x"), "A")
+        XCTAssertEqual(AvatarView.initials(name: "Ann Marie Lee", email: "a@x"), "AM")
+        XCTAssertEqual(AvatarView.initials(name: "", email: "zed@x"), "Z")
+        XCTAssertEqual(AvatarView.stableIndex("Ann@X.com", count: 8), AvatarView.stableIndex("ann@x.com", count: 8))
+        XCTAssertTrue((0..<8).contains(AvatarView.stableIndex("whoever@example.com", count: 8)))
     }
 
     func testCommitPatchHeaderMarksMerges() {
@@ -963,6 +1180,22 @@ final class GitHistoryBenchmarkTests: XCTestCase {
             rows = CommitGraph.layout(five, state: &state)
         }
         XCTAssertEqual(rows.count, five.count)
+
+        try shell("mkdir many && for i in $(seq 1 1000); do echo $i > many/f$i.txt; done && git add -A && git -c user.email=t@example.com -c user.name=t -c core.hooksPath=/dev/null commit -q -m 'a thousand files'")
+        let big = page(repo, limit: 1, topo: false)[0]
+        let opened = CFAbsoluteTimeGetCurrent()
+        var detail: GitRepository.CommitDetail?
+        var patch: String?
+        let both = expectation(description: "open commit")
+        both.expectedFulfillmentCount = 2
+        repo.commitDetail(sha: big.sha, parents: big.parents) { detail = $0; both.fulfill() }
+        repo.commitPatch(sha: big.sha, parent: big.parents.first, paths: nil) { patch = $0; both.fulfill() }
+        wait(for: [both], timeout: 60)
+        let built = MainWindowController.commitText(detail: try XCTUnwrap(detail), patch: patch)
+        let model = CommitOverviewModel(repoRoot: repo.root, commit: big, detail: try XCTUnwrap(detail), patchLines: built.patchLines)
+        print(String(format: "[history-bench] open a 1,000-file commit tab (detail + patch + model): %.1f ms", (CFAbsoluteTimeGetCurrent() - opened) * 1000))
+        XCTAssertEqual(model.detail.files.count, 1_000)
+        XCTAssertEqual(model.patchLines.count, 1_000)
 
         let target = five[2_500]
         time("commitDetail") {

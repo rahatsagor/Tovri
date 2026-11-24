@@ -91,14 +91,14 @@ protocol SidebarDelegate: AnyObject {
     func sidebarDidShowFiles(_ sidebar: SidebarView)
     func sidebar(_ sidebar: SidebarView, change: GitRepository.ChangedFile, action: SidebarChangeAction)
     func sidebar(_ sidebar: SidebarView, changes: [GitRepository.ChangedFile], action: ChangeListAction)
-    /// A commit, or a file of one, was chosen in History. `detail` is nil until the commit was expanded.
-    func sidebar(_ sidebar: SidebarView, commit: LogCommit, detail: GitRepository.CommitDetail?, action: HistoryAction)
+    /// A commit was chosen in History.
+    func sidebar(_ sidebar: SidebarView, commit: LogCommit, action: HistoryAction)
 }
 
 extension SidebarDelegate {
     func sidebarChangesFilterDidChange(_ sidebar: SidebarView) {}
     func sidebarDidShowFiles(_ sidebar: SidebarView) {}
-    func sidebar(_ sidebar: SidebarView, commit: LogCommit, detail: GitRepository.CommitDetail?, action: HistoryAction) {}
+    func sidebar(_ sidebar: SidebarView, commit: LogCommit, action: HistoryAction) {}
 }
 
 final class SidebarOutlineView: NSOutlineView {
@@ -318,9 +318,9 @@ final class SidebarView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate 
         } else {
             if historyView == nil {
                 let v = HistoryView()
-                v.onAction = { [weak self] commit, detail, action in
+                v.onAction = { [weak self] commit, action in
                     guard let self else { return }
-                    self.delegate?.sidebar(self, commit: commit, detail: detail, action: action)
+                    self.delegate?.sidebar(self, commit: commit, action: action)
                 }
                 v.setRepository(repository)
                 addSubview(v)

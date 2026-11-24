@@ -7,15 +7,40 @@ extension MainWindowController {
     static let maxHistoryNewText = 3_000_000
     static let maxHistoryOldText = 12_000_000
 
-    func sidebar(_ sidebar: SidebarView, commit: LogCommit, detail: GitRepository.CommitDetail?, action: HistoryAction) {
+    func sidebar(_ sidebar: SidebarView, commit: LogCommit, action: HistoryAction) {
         guard Settings.shared.gitChangesAndHistory, let repo = sidebar.repository else { return }
+        performHistoryAction(action, on: commit, repo: repo)
+    }
+
+    private func performHistoryAction(_ action: HistoryAction, on commit: LogCommit, repo: GitRepository) {
         switch action {
         case .openFile(let file, let view, let pinned):
             openCommitFile(file, in: commit, view: view, pinned: pinned, repo: repo)
         case .compareWithCurrent(let file):
             compareCommitFileWithCurrent(file, in: commit, repo: repo)
-        case .openCommitPatch(let pinned):
-            openCommitPatch(commit, detail: detail, pinned: pinned, repo: repo)
+        case .openCommit(let pinned):
+            openCommit(commit, pinned: pinned, repo: repo)
+        }
+    }
+
+    // MARK: From a commit tab
+
+    /// Using anything inside a preview commit tab keeps it, so what opens next doesn't replace it.
+    private func pin(_ doc: Document) { doc.isHistoryPreview = false }
+
+    func editor(_ editor: EditorView, commit model: CommitOverviewModel, action: HistoryAction) {
+        pin(editor.document)
+        guard Settings.shared.gitChangesAndHistory, let repo = GitRepository.find(for: model.repoRoot) else { return }
+        performHistoryAction(action, on: model.commit, repo: repo)
+    }
+
+    func editor(_ editor: EditorView, openParent sha: String, of model: CommitOverviewModel) {
+        pin(editor.document)
+        guard Settings.shared.gitChangesAndHistory, let repo = GitRepository.find(for: model.repoRoot) else { return }
+        repo.logCommit(sha: sha) { [weak self] commit in
+            guard let self else { return }
+            guard let commit else { self.statusBar.flash("Couldn’t read commit \(sha.prefix(7))"); return }
+            self.openCommit(commit, pinned: false, repo: repo)
         }
     }
 
@@ -222,35 +247,49 @@ extension MainWindowController {
 
     // MARK: Commits
 
-    private func openCommitPatch(_ commit: LogCommit, detail: GitRepository.CommitDetail?, pinned: Bool, repo: GitRepository) {
-        let key = "\(commit.sha)::patch"
+    /// Opens the commit in a tab: an overview of its message and files, and its whole patch.
+    func openCommit(_ commit: LogCommit, pinned: Bool, repo: GitRepository) {
+        let key = "\(commit.sha)::commit"
         if selectHistoryTab(withKey: key, pinned: pinned) { return }
         let token = beginHistoryOpen(pinned: pinned)
-        guard let detail else {
-            repo.commitDetail(sha: commit.sha, parents: commit.parents) { [weak self] loaded in
-                guard let self, self.isCurrentHistoryOpen(token, pinned: pinned) else { return }
-                guard let loaded else { self.statusBar.flash("Couldn’t read commit \(commit.shortSHA)"); return }
-                self.loadCommitPatch(commit, detail: loaded, key: key, pinned: pinned, token: token, repo: repo)
-            }
-            return
+        var detail = commitDetailCache.detail(for: commit.sha)
+        var patch: String?
+        let group = DispatchGroup()
+        if detail == nil {
+            group.enter()
+            repo.commitDetail(sha: commit.sha, parents: commit.parents) { detail = $0; group.leave() }
         }
-        loadCommitPatch(commit, detail: detail, key: key, pinned: pinned, token: token, repo: repo)
+        group.enter()
+        repo.commitPatch(sha: commit.sha, parent: commit.parents.first, paths: nil) { patch = $0; group.leave() }
+        group.notify(queue: .main) { [weak self] in
+            guard let self, self.isCurrentHistoryOpen(token, pinned: pinned) else { return }
+            guard let detail else { self.statusBar.flash("Couldn’t read commit \(commit.shortSHA)"); return }
+            self.commitDetailCache.insert(detail)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let built = MainWindowController.commitText(detail: detail, patch: patch)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isCurrentHistoryOpen(token, pinned: pinned) else { return }
+                    let subject = commit.subject.count > 40 ? String(commit.subject.prefix(39)) + "…" : commit.subject
+                    let name = subject.isEmpty ? "\(commit.shortSHA) — Commit" : "\(commit.shortSHA) — \(subject)"
+                    let doc = self.makeHistoryDocument(built.text, name: name, key: key, language: self.diffLanguage)
+                    doc.commitOverview = CommitOverviewModel(repoRoot: repo.root, commit: commit, detail: detail,
+                                                             patchLines: built.patchLines, patchTooLarge: built.tooLarge)
+                    self.showHistoryDocument(doc, pinned: pinned)
+                }
+            }
+        }
     }
 
-    private func loadCommitPatch(_ commit: LogCommit, detail: GitRepository.CommitDetail, key: String, pinned: Bool, token: Int,
-                                 repo: GitRepository) {
-        repo.commitPatch(sha: commit.sha, parent: commit.parents.first, paths: nil) { [weak self] patch in
-            guard let self, self.isCurrentHistoryOpen(token, pinned: pinned) else { return }
-            guard let patch else {
-                self.statusBar.flash("The patch for commit \(commit.shortSHA) is too large to show (over \(GitRepository.maxBlobSize / 1_000_000) MB)")
-                return
-            }
-            let subject = commit.subject.count > 40 ? String(commit.subject.prefix(39)) + "…" : commit.subject
-            let name = subject.isEmpty ? "\(commit.shortSHA) — Patch" : "\(commit.shortSHA) — \(subject)"
-            let doc = self.makeHistoryDocument(MainWindowController.commitPatchHeader(detail) + patch, name: name, key: key,
-                                               language: self.diffLanguage)
-            self.showHistoryDocument(doc, pinned: pinned)
+    /// The commit tab's text: the `git show` header and the patch, or a notice when the patch is over
+    /// the size limit, and where each file's section starts.
+    static func commitText(detail: GitRepository.CommitDetail, patch: String?) -> (text: String, patchLines: [Int], tooLarge: Bool) {
+        let header = commitPatchHeader(detail)
+        guard let patch else {
+            let limit = GitRepository.maxBlobSize / 1_000_000
+            return (header + "The patch for this commit is too large to show here (over \(limit) MB).\n", [], true)
         }
+        let text = LineEnding.normalize(header + patch, rawData: nil).0
+        return (text, CommitOverviewModel.sectionLines(in: text), false)
     }
 
     /// The top of `git show`: the commit, its parents when it is a merge, the author, date and message.

@@ -6,6 +6,14 @@ protocol EditorViewDelegate: AnyObject {
     func editor(_ editor: EditorView, openFindResultPath path: String, line: Int)
     func editor(_ editor: EditorView, openFiles urls: [URL])
     func editorGitDiffDidChange(_ editor: EditorView)
+    /// Something in a commit tab's overview was used: open a file, compare, or open the commit.
+    func editor(_ editor: EditorView, commit: CommitOverviewModel, action: HistoryAction)
+    func editor(_ editor: EditorView, openParent sha: String, of commit: CommitOverviewModel)
+}
+
+extension EditorViewDelegate {
+    func editor(_ editor: EditorView, commit: CommitOverviewModel, action: HistoryAction) {}
+    func editor(_ editor: EditorView, openParent sha: String, of commit: CommitOverviewModel) {}
 }
 
 /// One editing surface for a document: gutter, scrollable text view, minimap and find bar.
@@ -65,6 +73,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         colorizer = Colorizer(document: document, layoutManager: layoutManager)
         colorizer.onNeedsCatchUp = { [weak self] line in self?.scheduleCatchUp(to: line) }
         document.addEditor(self)
+        if let model = document.commitOverview { installCommitOverview(model) }
 
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(scrolled), name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
@@ -94,6 +103,8 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         closeChangeCard()
         preview?.removeFromSuperview()
         preview = nil
+        commitOverview?.removeFromSuperview()
+        commitOverview = nil
         NotificationCenter.default.removeObserver(self)
         CompletionController.shared.hide()
         textView.delegate = nil
@@ -116,7 +127,57 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     // MARK: Layout
 
-    var showMinimap: Bool { Settings.shared.showMinimap && bounds.width > 500 && !document.isFindResults && previewMode == .off }
+    var showMinimap: Bool { Settings.shared.showMinimap && bounds.width > 500 && !document.isFindResults && previewMode == .off && !showsCommitOverview }
+
+    // MARK: Commit overview
+
+    private(set) var commitOverview: CommitOverviewView?
+    /// A commit tab starts on its overview; the patch is the document's own text.
+    private(set) var showsCommitOverview = false
+    var hasCommitOverview: Bool { commitOverview != nil }
+
+    private func installCommitOverview(_ model: CommitOverviewModel) {
+        let view = CommitOverviewView(model: model)
+        view.onAction = { [weak self] action in
+            guard let self else { return }
+            self.delegate?.editor(self, commit: model, action: action)
+        }
+        view.onOpenParent = { [weak self] sha in
+            guard let self else { return }
+            self.delegate?.editor(self, openParent: sha, of: model)
+        }
+        view.onShowPatch = { [weak self] index in self?.showPatch(ofFile: index) }
+        commitOverview = view
+        showsCommitOverview = true
+        addSubview(view)
+        gutter.isHidden = true
+        scrollView.isHidden = true
+    }
+
+    /// Switches a commit tab between its overview and its patch.
+    func setShowsCommitOverview(_ on: Bool) {
+        guard let view = commitOverview, on != showsCommitOverview else { return }
+        showsCommitOverview = on
+        view.isHidden = !on
+        gutter.isHidden = on
+        scrollView.isHidden = on
+        if on, let bar = findBar, !bar.isHidden { bar.dismiss() }
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        if on { view.focus() } else { focus() }
+        delegate?.editorSelectionDidChange(self)
+    }
+
+    /// The patch shows the text, so anything that needs the text switches to it first.
+    private func ensureTextVisible() {
+        if showsCommitOverview { setShowsCommitOverview(false) }
+    }
+
+    private func showPatch(ofFile index: Int) {
+        guard let model = document.commitOverview else { return }
+        setShowsCommitOverview(false)
+        if index < model.patchLines.count { scrollLineToTop(model.patchLines[index]) }
+    }
 
     // MARK: Markdown preview
 
@@ -197,6 +258,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func scrollLineToTop(_ line: Int) {
+        ensureTextVisible()
         let loc = document.lines.start(of: line)
         let range = NSRange(location: loc, length: 0)
         layoutManager.ensureLayout(forCharacterRange: NSRange(location: loc, length: min(1, document.length - loc)))
@@ -224,6 +286,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         scrollView.frame = NSRect(x: gw, y: 0, width: max(0, textWidth - gw), height: bounds.height)
         scrollView.tile()
         preview?.frame = NSRect(x: max(0, textWidth), y: 0, width: pw, height: bounds.height)
+        commitOverview?.frame = bounds
         topShadow.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 6)
         let vpWidth = max(1, scrollView.textViewportWidth)
         if wordWrap {
@@ -287,6 +350,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
         findBar?.applyTheme()
         minimap.needsDisplay = true
         gutter.needsDisplay = true
+        commitOverview?.applyTheme()
         if let p = preview {
             let line = previewMode == .full ? p.topLine : topVisibleLine
             p.loadShell(theme: theme, fontSize: document.font.pointSize)
@@ -803,6 +867,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     // MARK: Navigation
 
     func goTo(line: Int, column: Int = 0) {
+        ensureTextVisible()
         let lines = document.lines
         let l = min(max(0, line &- 1), lines.count - 1)
         let r = lines.range(of: l, textLength: document.length)
@@ -813,6 +878,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func select(_ range: NSRange, center: Bool = true) {
+        ensureTextVisible()
         revealFolds(containing: range)
         textView.setAllSelections([range], scroll: !center)
         if center { scrollToCenter(range) }
@@ -820,6 +886,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     /// Scrolls only if the range isn't already visible.
     func reveal(_ range: NSRange) {
+        ensureTextVisible()
         let vis = textView.visibleCharacterRange
         if range.location >= vis.location && NSMaxRange(range) <= NSMaxRange(vis) {
             let r = textView.rects(for: range).first ?? .zero
@@ -829,6 +896,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func scrollToCenter(_ range: NSRange) {
+        ensureTextVisible()
         layoutManager.ensureLayout(forCharacterRange: NSRange(location: range.location, length: min(range.length, 1)))
         textView.scrollRangeToVisible(range)
         centerOn(range)
@@ -857,6 +925,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
     }
 
     func focus() {
+        if showsCommitOverview, let commitOverview { commitOverview.focus(); return }
         if previewMode == .full, let preview { preview.focus() } else { window?.makeFirstResponder(textView) }
     }
 
@@ -864,6 +933,7 @@ final class EditorView: NSView, NSTextViewDelegate, DocumentEditor {
 
     func showFindBar(replace: Bool) {
         // Find works on the source, so bring it back beside the rendered view.
+        ensureTextVisible()
         if previewMode == .full { setPreviewMode(.split) }
         let wasHidden = findBar?.isHidden ?? true
         if findBar == nil {

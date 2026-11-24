@@ -117,12 +117,24 @@ struct HistoryQuery: Equatable {
 extension GitRepository {
     // MARK: Log
 
+    private static let logFormat = "--format=%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s"
+
+    /// One commit by SHA, for following a parent link. Completes on main with nil if it can't be read.
+    func logCommit(sha: String, _ completion: @escaping (LogCommit?) -> Void) {
+        let args = ["log", "-1", "--no-walk", "-z", "--no-show-signature", "--no-color", "--decorate=full",
+                    GitRepository.logFormat, sha, "--"]
+        GitRepository.runAsync {
+            let commit = self.run(args).flatMap { GitRepository.parseLog($0).first }
+            DispatchQueue.main.async { completion(commit) }
+        }
+    }
+
     /// One page of commits reachable from `tip`, newest first, matching `query`. `completion` runs
     /// on the main queue with nil if git failed or the request was cancelled.
     func log(from tip: String, query: HistoryQuery, skip: Int, limit: Int, topoOrder: Bool,
              cancellation: GitCancellation?, _ completion: @escaping ([LogCommit]?) -> Void) {
-        var args = ["log", "-z", "--no-show-signature", "--no-color", "--decorate=full",
-                    "--format=%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s", "-n", String(limit), "--skip=\(skip)"]
+        var args = ["log", "-z", "--no-show-signature", "--no-color", "--decorate=full", GitRepository.logFormat,
+                    "-n", String(limit), "--skip=\(skip)"]
         if topoOrder { args.append("--topo-order") }
         args += query.logArguments
         args.append(tip)
@@ -316,6 +328,70 @@ extension GitRepository {
             let text = data.map { String(decoding: $0, as: UTF8.self) }
             DispatchQueue.main.async { completion(text) }
         }
+    }
+}
+
+/// What a commit tab shows: the commit, its details, and where each file's section starts in the
+/// tab's patch text.
+final class CommitOverviewModel {
+    let repoRoot: URL
+    let commit: LogCommit
+    let detail: GitRepository.CommitDetail
+    /// The 0-based line of each file's `diff --git ` section, in the order of `detail.files`.
+    var patchLines: [Int]
+    var patchTooLarge: Bool
+
+    init(repoRoot: URL, commit: LogCommit, detail: GitRepository.CommitDetail, patchLines: [Int] = [], patchTooLarge: Bool = false) {
+        self.repoRoot = repoRoot
+        self.commit = commit
+        self.detail = detail
+        self.patchLines = patchLines
+        self.patchTooLarge = patchTooLarge
+    }
+
+    /// The 0-based lines of `diff --git ` at the start of a line in `text`.
+    static func sectionLines(in text: String) -> [Int] {
+        var lines: [Int] = []
+        var line = 0
+        let marker = Array("diff --git ".utf8)
+        var utf8 = text
+        utf8.withUTF8 { buf in
+            var i = 0
+            let n = buf.count
+            while i < n {
+                if i + marker.count <= n, buf[i] == marker[0], buf[i..<i + marker.count].elementsEqual(marker) { lines.append(line) }
+                while i < n, buf[i] != 0x0A { i += 1 }
+                i += 1
+                line += 1
+            }
+        }
+        return lines
+    }
+}
+
+/// Recently read commit details, so reopening a commit tab doesn't run git again. Commits never change.
+struct CommitDetailCache {
+    static let capacity = 64
+    private var store: [String: GitRepository.CommitDetail] = [:]
+    private var order: [String] = []
+
+    var count: Int { store.count }
+
+    mutating func detail(for sha: String) -> GitRepository.CommitDetail? {
+        guard let d = store[sha] else { return nil }
+        touch(sha)
+        return d
+    }
+
+    mutating func insert(_ detail: GitRepository.CommitDetail) {
+        store[detail.sha] = detail
+        touch(detail.sha)
+        while order.count > CommitDetailCache.capacity { store[order.removeFirst()] = nil }
+    }
+
+    private mutating func touch(_ sha: String) {
+        if let i = order.firstIndex(of: sha) { order.remove(at: i) }
+        order.append(sha)
     }
 }
 
