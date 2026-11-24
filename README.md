@@ -51,7 +51,7 @@ can use Tovri.
 <td width="33%" align="center" valign="top">
 
 **2. Read and review**<br />
-<sub>Colors for 128 languages, and every change since the last commit marked.</sub>
+<sub>Colors for 128 languages, every change since the last commit marked, and the repository's history.</sub>
 
 </td>
 <td width="33%" align="center" valign="top">
@@ -157,9 +157,11 @@ lines.
 <td valign="top">
 
 #### Safe with any folder
-Opening a file, previewing it or showing a repository's changes never runs
-code from it. No accounts, no analytics; the only outside connection is the
-update check. Read [SECURITY.md](SECURITY.md) for the details.
+Opening a file, previewing it or showing a repository's changes and history
+never runs code from it. Switching branches only happens when you ask, and is
+refused if it would replace your work. No accounts, no analytics; the only
+outside connection is the update check. Read [SECURITY.md](SECURITY.md) for
+the details.
 
 </td>
 </tr>
@@ -263,8 +265,9 @@ includes `/opt/homebrew/bin` or `/usr/local/bin` (`echo $PATH`).
 
 Tovri uses the Git installed on your Mac. Install the Xcode Command Line
 Tools with `xcode-select --install`, or `brew install git`. Check that
-**Settings → Git → Use Git** and **Changes in the editor** are on, and that the file is
-inside a Git repository.
+**Settings → Git → Use Git** and **Changes in the editor** are on, and that
+the file is inside a Git repository. For the Git tab, History and switching
+branches, turn on **Git tab, file history and branches** there too.
 
 </details>
 

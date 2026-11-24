@@ -75,12 +75,14 @@ to `-` to force ad-hoc signing.
 Sources/Tovri
 ├── App/        app delegate, main menu, updater, entry point
 ├── Core/       document model, line index, encodings, settings, session, fuzzy matcher,
-│               project index, Git, FSEvents watcher
+│               project index, Git (status and changes, history and commit graph,
+│               patch parsing, branches), FSEvents watcher
 ├── Syntax/     language model, 128 language definitions, lexers, incremental engine, themes
 ├── Editor/     text view (multi-cursor, commands), layout manager, colorizer, gutter,
 │               minimap, folding, find bar, completion, Markdown preview
-├── Window/     window controller, tab bar, editor groups, sidebar, palette, status bar,
-│               Find in Files, Quick Look
+├── Window/     window controller, tab bar, editor groups, sidebar (Files and the Git tab
+│               with Changes and History), commit tabs (overview and file diffs),
+│               palette, status bar, Find in Files, Quick Look
 └── Settings/   SwiftUI settings window
 ```
 
